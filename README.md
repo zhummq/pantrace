@@ -214,6 +214,8 @@ sqlite3 backend/data/analytics.db \
 
 点击行为记在埋点里，kind 是 `group`（show / close / copy_number / continue），看板流水里能看到。
 
+> **弹层的类名别用 `popup` / `modal` / `mask` / `overlay` / `dialog` 这类词。** 广告拦截器（uBlock、AdGuard 等）的“烦人元素”规则会按类名批量隐藏，命中的结果是**蒙层还在、卡片消失**——看起来像弹窗坏了，其实是 CSS 被注入的隐藏规则盖掉了。当前用的是 `pt-veil`（蒙层）+ `pt-panel`（卡片），前缀 `pt-` 是项目缩写，不含任何可疑词。2026-11 线上弹窗不显示就是 `.gg-mask` / `.gg-box` 被拦导致的。
+
 ## 已知问题
 
 - 上游单次查询耗时波动大：快的 2 秒，慢的接近 60 秒。后端超时设为 75 秒（官方要求 >60 秒，否则提前中断照样扣费）。

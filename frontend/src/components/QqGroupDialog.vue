@@ -81,21 +81,21 @@ function switchTab(i) {
 
 <template>
   <Teleport to="body">
-    <div v-if="open && config" class="gg-mask" @click.self="close">
-      <div class="gg-box" role="dialog" aria-modal="true">
-        <button class="gg-close" aria-label="关闭" @click="close">✕</button>
+    <div v-if="open && config" class="pt-veil" @click.self="close">
+      <div class="pt-panel" role="dialog" aria-modal="true">
+        <button class="pt-close" aria-label="关闭" @click="close">✕</button>
 
-        <div class="gg-head">
-          <p class="gg-kicker mono">{{ mode === 'acquire' ? 'GROUP / BEFORE OPEN' : 'GROUP / INVITE' }}</p>
-          <p class="gg-title">{{ config.title || '资源交流群' }}</p>
-          <p v-if="config.desc" class="gg-desc">{{ config.desc }}</p>
+        <div class="pt-head">
+          <p class="pt-kicker mono">{{ mode === 'acquire' ? 'GROUP / BEFORE OPEN' : 'GROUP / INVITE' }}</p>
+          <p class="pt-title">{{ config.title || '资源交流群' }}</p>
+          <p v-if="config.desc" class="pt-desc">{{ config.desc }}</p>
         </div>
 
-        <div v-if="showTabs" class="gg-tabs">
+        <div v-if="showTabs" class="pt-tabs">
           <button
             v-for="(g, i) in enabledGroups"
             :key="i"
-            class="gg-tab"
+            class="pt-tab"
             :class="{ on: i === activeIndex }"
             @click="switchTab(i)"
           >
@@ -103,28 +103,28 @@ function switchTab(i) {
           </button>
         </div>
 
-        <div v-if="active" class="gg-body">
-          <div class="gg-qr">
+        <div v-if="active" class="pt-body">
+          <div class="pt-qr">
             <img v-if="active.qr" :src="active.qr" alt="群二维码" />
-            <div v-else class="gg-qr-empty">暂无二维码</div>
+            <div v-else class="pt-qr-empty">暂无二维码</div>
           </div>
 
-          <div v-if="active.number" class="gg-number">
-            <span class="gg-num-label mono">{{ typeLabel }}</span>
-            <b class="gg-num mono">{{ active.number }}</b>
-            <button class="gg-copy" :class="{ done: copied }" @click="copyNumber">
+          <div v-if="active.number" class="pt-number">
+            <span class="pt-num-label mono">{{ typeLabel }}</span>
+            <b class="pt-num mono">{{ active.number }}</b>
+            <button class="pt-copy" :class="{ done: copied }" @click="copyNumber">
               {{ copied ? '已复制' : '复制' }}
             </button>
           </div>
 
-          <p class="gg-tip">{{ tipText }}</p>
+          <p class="pt-tip">{{ tipText }}</p>
 
-          <button v-if="active.link" class="gg-join" @click="openJoinLink">
+          <button v-if="active.link" class="pt-join" @click="openJoinLink">
             手机上点这里直接加群 →
           </button>
         </div>
 
-        <button v-if="mode === 'acquire'" class="gg-continue" @click="continueOpen">
+        <button v-if="mode === 'acquire'" class="pt-continue" @click="continueOpen">
           不进群了，直接打开资源
         </button>
       </div>
@@ -133,7 +133,7 @@ function switchTab(i) {
 </template>
 
 <style scoped>
-.gg-mask {
+.pt-veil {
   position: fixed;
   inset: 0;
   z-index: 90;
@@ -145,7 +145,7 @@ function switchTab(i) {
   -webkit-backdrop-filter: blur(6px);
 }
 
-.gg-box {
+.pt-panel {
   position: relative;
   width: 344px;
   max-width: 100%;
@@ -158,10 +158,10 @@ function switchTab(i) {
   border-radius: var(--radius, 9px);
   box-shadow: var(--shadow-lg, 0 30px 70px -30px rgba(11, 16, 23, 0.45));
   text-align: center;
-  animation: gg-in 0.18s ease-out;
+  animation: pt-in 0.18s ease-out;
 }
 
-@keyframes gg-in {
+@keyframes pt-in {
   from {
     opacity: 0;
     transform: translateY(8px);
@@ -172,7 +172,7 @@ function switchTab(i) {
   }
 }
 
-.gg-close {
+.pt-close {
   position: absolute;
   top: 10px;
   right: 10px;
@@ -188,23 +188,23 @@ function switchTab(i) {
   cursor: pointer;
 }
 
-.gg-close:hover {
+.pt-close:hover {
   background: var(--bg, #f5f7f9);
   color: var(--ink, #0b1017);
 }
 
-.gg-head {
+.pt-head {
   margin-bottom: 14px;
 }
 
-.gg-kicker {
+.pt-kicker {
   margin: 0 0 8px;
   font-size: 9px;
   letter-spacing: 0.18em;
   color: var(--faint, #96a1ad);
 }
 
-.gg-title {
+.pt-title {
   margin: 0 0 6px;
   font-size: 16.5px;
   font-weight: 650;
@@ -212,14 +212,14 @@ function switchTab(i) {
   color: var(--ink, #0b1017);
 }
 
-.gg-desc {
+.pt-desc {
   margin: 0;
   font-size: 12px;
   line-height: 1.6;
   color: var(--muted, #69747f);
 }
 
-.gg-tabs {
+.pt-tabs {
   display: flex;
   justify-content: center;
   gap: 6px;
@@ -227,7 +227,7 @@ function switchTab(i) {
   margin-bottom: 12px;
 }
 
-.gg-tab {
+.pt-tab {
   height: 27px;
   padding: 0 11px;
   border: 1px solid var(--line, #e4e8ee);
@@ -238,24 +238,24 @@ function switchTab(i) {
   cursor: pointer;
 }
 
-.gg-tab:hover {
+.pt-tab:hover {
   border-color: var(--line-2, #ccd4de);
 }
 
-.gg-tab.on {
+.pt-tab.on {
   background: var(--ink, #0b1017);
   border-color: var(--ink, #0b1017);
   color: #fff;
 }
 
-.gg-body {
+.pt-body {
   display: flex;
   flex-direction: column;
   align-items: center;
 }
 
 /* 二维码用取景框：四个角各一小段线，比投影更干净 */
-.gg-qr {
+.pt-qr {
   position: relative;
   width: 208px;
   height: 208px;
@@ -265,8 +265,8 @@ function switchTab(i) {
   background: #fff;
 }
 
-.gg-qr::before,
-.gg-qr::after {
+.pt-qr::before,
+.pt-qr::after {
   content: '';
   position: absolute;
   width: 12px;
@@ -274,27 +274,27 @@ function switchTab(i) {
   border: 1px solid var(--accent, #00a99d);
 }
 
-.gg-qr::before {
+.pt-qr::before {
   top: -1px;
   left: -1px;
   border-right: 0;
   border-bottom: 0;
 }
 
-.gg-qr::after {
+.pt-qr::after {
   right: -1px;
   bottom: -1px;
   border-left: 0;
   border-top: 0;
 }
 
-.gg-qr img {
+.pt-qr img {
   width: 100%;
   height: 100%;
   object-fit: contain;
 }
 
-.gg-qr-empty {
+.pt-qr-empty {
   display: grid;
   place-items: center;
   height: 100%;
@@ -302,7 +302,7 @@ function switchTab(i) {
   color: var(--muted, #69747f);
 }
 
-.gg-number {
+.pt-number {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -310,19 +310,19 @@ function switchTab(i) {
   font-size: 12.5px;
 }
 
-.gg-num-label {
+.pt-num-label {
   font-size: 10px;
   letter-spacing: 0.1em;
   color: var(--faint, #96a1ad);
 }
 
-.gg-num {
+.pt-num {
   font-size: 14px;
   letter-spacing: 0.08em;
   color: var(--ink, #0b1017);
 }
 
-.gg-copy {
+.pt-copy {
   height: 25px;
   padding: 0 10px;
   border: 1px solid var(--line-2, #ccd4de);
@@ -333,23 +333,23 @@ function switchTab(i) {
   cursor: pointer;
 }
 
-.gg-copy:hover {
+.pt-copy:hover {
   border-color: var(--ink-2, #2c3644);
 }
 
-.gg-copy.done {
+.pt-copy.done {
   border-color: rgba(0, 169, 157, 0.4);
   background: var(--accent-soft, #e7f6f4);
   color: var(--accent-deep, #07726b);
 }
 
-.gg-tip {
+.pt-tip {
   margin: 10px 0 0;
   font-size: 11.5px;
   color: var(--muted, #69747f);
 }
 
-.gg-join {
+.pt-join {
   height: 38px;
   margin-top: 12px;
   padding: 0 18px;
@@ -362,11 +362,11 @@ function switchTab(i) {
   cursor: pointer;
 }
 
-.gg-join:hover {
+.pt-join:hover {
   background: #1b2430;
 }
 
-.gg-continue {
+.pt-continue {
   width: 100%;
   height: 40px;
   margin-top: 14px;
@@ -378,18 +378,18 @@ function switchTab(i) {
   cursor: pointer;
 }
 
-.gg-continue:hover {
+.pt-continue:hover {
   border-color: var(--ink-2, #2c3644);
   color: var(--ink, #0b1017);
 }
 
 @media (max-width: 560px) {
-  .gg-mask {
+  .pt-veil {
     align-items: end;
     padding: 0;
   }
 
-  .gg-box {
+  .pt-panel {
     width: 100%;
     max-height: 90dvh;
     padding: 22px 20px calc(18px + env(safe-area-inset-bottom));
@@ -398,8 +398,8 @@ function switchTab(i) {
     border-radius: 14px 14px 0 0;
   }
 
-  .gg-join,
-  .gg-continue {
+  .pt-join,
+  .pt-continue {
     height: 44px;
   }
 }
