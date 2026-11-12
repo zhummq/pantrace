@@ -192,6 +192,21 @@ async function doSearch(targetPage = 1) {
   }
 }
 
+// 手机端 chip 用短名（夸克 / 百度 / 阿里…），避免"网盘"后缀把 14 个平台
+// 挤成四五行；桌面端空间够，仍显示全名。简称只改展示，不改提交给后端的 key。
+function shortPlatform(name) {
+  const full = (name || '').trim()
+  if (!full) return ''
+  // 直接按规则截断会得到"腾讯微"（腾讯微云），这类单独指定
+  const manual = { 腾讯微云: '微云' }
+  if (manual[full]) return manual[full]
+  const stripped = full.replace(/(网盘|云盘)$/, '')
+  if (stripped !== full && stripped.length >= 2) return stripped
+  // 微云这类去掉"云"只剩一个字的，保留原样
+  if (full.endsWith('云') && full.length > 2) return full.slice(0, -1)
+  return full
+}
+
 function pickPlatform(key) {
   if (activePlatform.value === key) return
   activePlatform.value = key
@@ -347,7 +362,8 @@ onBeforeUnmount(() => {
           @click="pickPlatform(p.key)"
         >
           <i class="chip-dot" :style="{ background: p.color }"></i>
-          {{ p.name }}
+          <span class="chip-full">{{ p.name }}</span>
+          <span class="chip-short">{{ shortPlatform(p.name) }}</span>
         </button>
       </div>
 
@@ -841,6 +857,11 @@ onBeforeUnmount(() => {
   border-radius: 1px;
 }
 
+/* 手机端才显示简称，桌面端沿用全名 */
+.chip-short {
+  display: none;
+}
+
 /* ---------- 结果头 ---------- */
 .result-head {
   display: flex;
@@ -1225,27 +1246,26 @@ onBeforeUnmount(() => {
   }
 
   .filters {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    margin: 0 -16px;
-    /* 右侧留出渐隐带的空间，最后一条 chip 也能滚进可视区 */
-    padding: 14px 44px 14px 16px;
-    scrollbar-width: none;
-    -webkit-overflow-scrolling: touch;
-    scroll-snap-type: x proximity;
-    /* 右缘渐隐：被裁切 ≠ 看起来坏了，而是"还有更多"的提示 */
-    mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 32px), transparent);
-    -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 32px), transparent);
-  }
-
-  .filters::-webkit-scrollbar {
-    display: none;
+    flex-wrap: wrap;
+    margin: 0;
+    padding: 12px 0 14px;
+    gap: 6px;
   }
 
   .chip {
     flex: 0 0 auto;
-    height: 32px;
-    scroll-snap-align: start;
+    height: 30px;
+    padding: 0 9px;
+    gap: 5px;
+    font-size: 12px;
+  }
+
+  .chip-full {
+    display: none;
+  }
+
+  .chip-short {
+    display: inline;
   }
 
   .content {
