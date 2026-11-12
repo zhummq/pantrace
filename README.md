@@ -172,20 +172,23 @@ sudo mkdir -p /opt/pantrace
 sudo chown -R pantrace:pantrace /opt/pantrace
 ```
 
-## 2. 上传代码
+## 2. 拉取代码
 
-推荐先在**本地构建前端**，服务器就不用装 Node：
-
-```bash
-cd frontend && npm run build
-```
-
-再上传（排除依赖目录，体积能小一个数量级）：
+代码托管在 GitHub（私有仓库 `zhummq/pantrace`），服务器直接 clone。前端产物 `frontend/dist` **已经入库**（构建只在本地做，服务器不用装 Node），所以拉下来就是完整的：
 
 ```bash
-rsync -av --exclude node_modules --exclude .venv --exclude __pycache__ --exclude '*.log' \
-  ./ user@your-server:/opt/pantrace/
+cd /opt
+sudo git clone git@github.com:zhummq/pantrace.git pantrace
+sudo chown -R pantrace:pantrace /opt/pantrace
 ```
+
+> 服务器 clone 私有仓库需要 deploy key：`ssh-keygen` 生成一对，公钥加到 GitHub 仓库的 Settings → Deploy keys（只读即可）。装 Nginx 前先 `sudo ./deploy/install-nginx.sh` 的前置检查会兜住大部分配置问题。
+
+clone 下来的东西**没有**（都不在 git 里，需要手动补）：
+
+- `backend/.env`——下一节自己建
+- `backend/.venv/`——按第 1 节建 venv 装依赖
+- `backend/data/`——埋点库，服务启动后自动生成
 
 ## 3. 配置
 
@@ -293,22 +296,26 @@ sudo ./deploy/install-nginx.sh --domain example.com --ssl --email you@mail.com
 
 ## 8. 更新代码
 
-前端、后端、配置，更新方式完全一样，一条命令流：
+本地和服务器两边流程：
 
 ```bash
-# 本地构建前端（改了前端代码才需要）
-cd frontend && npm run build
+# 本地：改代码 → 构建（改了前端才需要）→ 提交推送
+cd frontend && npm run build          # dist 已入库，build 完一起提交
+git add -A && git commit -m "..." && git push
 
-# 同步代码（dist 会一起传上去）
-rsync -av --exclude node_modules --exclude .venv ./ user@your-server:/opt/pantrace/
-
-# 重启后端——静态页面也是它托管的，所以前端改动同样靠这一步生效
+# 服务器：拉取 + 重启，完事
+cd /opt/pantrace && sudo -u pantrace git pull
 sudo systemctl restart pantrace
 ```
 
-只改后端或配置的话，前两步都不用，一条 `systemctl restart` 就够。
+后端、前端、配置的更新方式完全一样——静态页面由后端托管，`git pull` 带下来的新 dist 靠重启生效。
 
-> 记得先 `git commit` 再发版：本地仓库就是回滚的底气，改坏了 `git checkout` 找回上一版。
+两个注意：
+
+- **服务器上别手改代码**。本地改完 push，服务器 pull。服务器上的 `.env` 和 `data/` 不在 git 里，`git pull` 不会碰它们。
+- `git pull` 提示冲突，说明服务器上有本地改动没提交——先 `git status` 看是什么，确认没用就 `git checkout -- <文件>` 丢弃，别在服务器上做开发。
+
+> 记得先 push 再发版：GitHub 上的提交历史就是回滚的底气，改坏了 `git checkout <旧提交>` 找回上一版。
 
 ---
 

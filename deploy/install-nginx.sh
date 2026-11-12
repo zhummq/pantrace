@@ -4,7 +4,7 @@
 # 为什么不让 Nginx 托管前端文件（旧版会把 dist 同步到 /var/www）：
 # Nginx worker 读不了项目目录，只能把 dist 拷一份出去，于是前端每次改动
 # 都要多一步 "build + sync"。改成全部反代之后：
-#   - 部署只有一步：rsync 代码 -> systemctl restart pantrace
+#   - 部署只有一步：git pull -> systemctl restart pantrace
 #   - 前端产物只有 frontend/dist 一份，不存在两处不同步
 #   - 静态文件由 uvicorn 提供（JS 共 ~80KB gzip，单页应用，量级完全够）
 #
@@ -19,7 +19,7 @@
 #   sudo ./deploy/install-nginx.sh --print              # 只打印配置，不动系统
 #
 # 日常更新（前端或后端都一样，不再需要任何同步步骤）：
-#   rsync -av --exclude node_modules --exclude .venv ./ user@server:/opt/pantrace/
+#   cd /opt/pantrace && sudo -u pantrace git pull
 #   sudo systemctl restart pantrace
 set -euo pipefail
 
@@ -292,5 +292,5 @@ if [ "$SSL" = "1" ]; then
   echo "证书续期：systemctl status certbot.timer（装 certbot 时会自动启用，到期前 30 天自动续）"
 fi
 echo "以后更新（前端后端都一样，没有任何额外同步步骤）："
-echo "  rsync -av --exclude node_modules --exclude .venv ./ user@server:/opt/pantrace/"
+echo "  cd /opt/pantrace && sudo -u pantrace git pull"
 echo "  sudo systemctl restart pantrace"
