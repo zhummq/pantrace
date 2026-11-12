@@ -317,6 +317,45 @@ sudo systemctl restart pantrace
 
 > 记得先 push 再发版：GitHub 上的提交历史就是回滚的底气，改坏了 `git checkout <旧提交>` 找回上一版。
 
+## 9. 从旧部署迁移（一次性）
+
+服务器上跑的还是旧方案（Nginx 托管 /var/www、代码靠上传）时，按这个顺序收编：
+
+```bash
+cd /opt/pantrace
+
+# 1. 看现状：有没有在服务器上手改过的文件
+git status
+
+# 2. 丢弃服务器上的本地改动（.env 和 data/ 不在 git 里，不受影响）
+git checkout -- .
+
+# 3. 拉最新代码（dist 已入库，这一步连前端产物一起带下来）
+git pull origin master
+
+# 4. 核对 .env：SERVE_FRONTEND 必须是 true（或干脆没有这一行）；公网必须配 ADMIN_TOKEN
+grep -E 'SERVE_FRONTEND|ADMIN_TOKEN' backend/.env
+
+# 5. 重启后端并直连验证——此时静态页面已经改由后端托管
+sudo systemctl restart pantrace
+curl -s http://127.0.0.1:8000 | grep -o 盘迹 && curl -s http://127.0.0.1:8000/api/health
+
+# 6. 重写 Nginx 配置为纯反代（已有证书会自动跳过申请）
+sudo ./deploy/install-nginx.sh --domain 你的域名 --ssl --email 你的邮箱
+
+# 7. 关键：certbot 的续期配置里记着旧的 webroot 路径（/var/www/pantrace），
+#    不改的话证书到期会静默续期失败。改成新路径并验证：
+sudo sed -i 's#/var/www/pantrace#/var/www/letsencrypt-acme#g' /etc/letsencrypt/renewal/*.conf
+sudo certbot renew --dry-run     # 看到 "Congratulations" 或 "simulated renewal" 即成功
+
+# 8. 旧发布目录清掉
+sudo rm -rf /var/www/pantrace
+
+# 9. 公网自测：浏览器开 https://域名 、/admin 看板、搜一次真词
+```
+
+埋点库不用动：`backend/data/analytics.db` 留在原地，新版启动时会自动给旧表补 `bot` 列。
+
 ---
 
 ## Linux 上三个必须注意的点
