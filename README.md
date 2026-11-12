@@ -210,7 +210,7 @@ chmod 600 backend/.env    # 里面是钱和凭据，别人别读
 
 前端会把这个提示原样显示给用户，不会假装是网络问题。
 
-如果前端交给 Nginx 托管，把 `SERVE_FRONTEND` 改成 `false`，后端就只做 API。
+`SERVE_FRONTEND` 保持默认 `true`：Nginx 是纯反代，前端页面全靠后端托管（见第 6 节）。改成 false 页面就 404。
 
 ## 4. 先手动跑一遍
 
@@ -254,7 +254,7 @@ systemctl disable --now pantrace     # 停止并取消开机自启
 
 ## 6. Nginx
 
-用脚本装，别手工 cp——里面有几处不能漏（看板转发、超时、发布目录权限）：
+Nginx 是**纯反代**：所有请求（页面、静态资源、API、看板）都转给后端，前端静态文件由 FastAPI 直接托管（`SERVE_FRONTEND=true`，默认开着）。没有任何"前端产物拷到别的目录"的步骤。
 
 ```bash
 cd /opt/pantrace
@@ -265,25 +265,17 @@ sudo ./deploy/install-nginx.sh --domain example.com --ssl --email you@mail.com
 sudo ./deploy/install-nginx.sh --print              # 只看会写什么配置
 ```
 
-脚本做了五件事：把 `frontend/dist` 同步到 `/var/www/pantrace`、写 `/etc/nginx/conf.d/pantrace.conf`、`nginx -t` 校验（失败自动回滚）、reload 并自测三个路径；带 `--ssl` 时再向 Let's Encrypt 申请证书并把 HTTP 301 到 HTTPS。
+脚本做四件事：准备证书续期校验目录（`/var/www/letsencrypt-acme`，只装一次）、写 `/etc/nginx/conf.d/pantrace.conf`、`nginx -t` 校验（失败自动回滚）、reload 并自测三个路径；带 `--ssl` 时再向 Let's Encrypt 申请证书并把 HTTP 301 到 HTTPS。
 
 `--ssl` 的几个约束：域名必须已经解析到本机、80 端口能公网访问、不能是 IP（Let's Encrypt 不给 IP 签证书）。证书申请失败不会把站点搞挂——脚本会保留 HTTP 配置继续服务。证书续期由 certbot 装好时自动启用的 `certbot.timer` 负责，到期前 30 天自动续，不用管。
 
-**为什么不直接把 root 指到项目目录**：Nginx worker 以 `www-data`/`nginx` 身份跑，读不了 `/root`、`/home` 下的文件，指过去就是 403。脚本因此单独同步一份产物到 `/var/www`。
+**为什么不走"Nginx 托管静态文件"的常规做法**：Nginx worker 读不了项目目录（在 `/root`、`/home` 下就是 403），旧方案为此把 dist 拷一份到 `/var/www`，代价是前端每次改动都要多一步同步。现在这个站流量小、产物只有 80KB，全反代换来部署一步到位，值得。
 
-配置里有两条不能动：
+配置里一条不能动：
 
-- `location = /admin` 必须存在。少了它，`try_files` 会把 `/admin` 当静态路径处理，打开看到的是前端首页而不是看板。
 - `proxy_read_timeout 90s` 必须大于后端的 75 秒，否则上游还没返回 Nginx 先断，用户看到 504 但那笔已经扣费。
 
-**前端改了要同步产物**，否则 Nginx 发的还是旧的：
-
-```bash
-cd frontend && npm run build
-sudo ./deploy/install-nginx.sh --sync-only
-```
-
-> 上了 Nginx 之后 `SERVE_FRONTEND` 可以保持 `true` 不动。Nginx 正常时后端那份静态挂载根本不会被调用，留着是为了 Nginx 配置出错时还能用 `IP:8000` 兜底进去。真想收紧，把 systemd unit 里的 `--host 0.0.0.0` 改成 `127.0.0.1`，但那样 Nginx 一挂就彻底进不去了。
+**`SERVE_FRONTEND` 必须保持 `true`**（默认就是）。改成 false 后端只做 API，反代出来的页面全是 404——脚本会检测这种情况并拒绝安装。真想收紧安全面，把 systemd unit 里的 `--host 0.0.0.0` 改成 `127.0.0.1`，但那样 Nginx 一挂就彻底进不去了。
 
 ## 7. 防火墙与 HTTPS
 
@@ -301,16 +293,22 @@ sudo ./deploy/install-nginx.sh --domain example.com --ssl --email you@mail.com
 
 ## 8. 更新代码
 
-```bash
-# 改的是后端或配置
-rsync -av --exclude node_modules --exclude .venv ./ user@your-server:/opt/pantrace/
-sudo systemctl restart pantrace
+前端、后端、配置，更新方式完全一样，一条命令流：
 
-# 前端也改了（先在本地 npm run build，dist 会一起传上去）
-sudo ./deploy/install-nginx.sh --sync-only
+```bash
+# 本地构建前端（改了前端代码才需要）
+cd frontend && npm run build
+
+# 同步代码（dist 会一起传上去）
+rsync -av --exclude node_modules --exclude .venv ./ user@your-server:/opt/pantrace/
+
+# 重启后端——静态页面也是它托管的，所以前端改动同样靠这一步生效
+sudo systemctl restart pantrace
 ```
 
-只改后端的话一条 `systemctl restart` 就够了，前端产物不用动。
+只改后端或配置的话，前两步都不用，一条 `systemctl restart` 就够。
+
+> 记得先 `git commit` 再发版：本地仓库就是回滚的底气，改坏了 `git checkout` 找回上一版。
 
 ---
 

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# 用 Nginx 托管前端，把 /api 和 /admin 反代给后端。
+# Nginx 纯反代：所有请求（含前端静态页面）都交给后端。
 #
-# 为什么不直接把 root 指到项目目录：
-# Nginx 的 worker 进程以 www-data（Debian/Ubuntu）或 nginx（RHEL）身份跑，
-# 读不了 /root、/home 下的文件。项目放在这些目录里，root 指过去就是 403。
-# 所以这份脚本会把 frontend/dist 同步到一个公开可读的目录（默认 /var/www/pantrace）。
+# 为什么不让 Nginx 托管前端文件（旧版会把 dist 同步到 /var/www）：
+# Nginx worker 读不了项目目录，只能把 dist 拷一份出去，于是前端每次改动
+# 都要多一步 "build + sync"。改成全部反代之后：
+#   - 部署只有一步：rsync 代码 -> systemctl restart pantrace
+#   - 前端产物只有 frontend/dist 一份，不存在两处不同步
+#   - 静态文件由 uvicorn 提供（JS 共 ~80KB gzip，单页应用，量级完全够）
+#
+# 前提：backend/.env 里 SERVE_FRONTEND=true（默认就是）。
+# 改成 false 后端就只做 API，反代出来的页面会 404。
 #
 # 用法（在服务器上，项目根目录）：
 #   sudo ./deploy/install-nginx.sh                      # HTTP，装好并 reload
@@ -12,20 +17,17 @@
 #   sudo ./deploy/install-nginx.sh --domain panseek.xyz --ssl --email you@mail.com
 #                                                       # 申请 Let's Encrypt 证书 + 强制跳 HTTPS
 #   sudo ./deploy/install-nginx.sh --print              # 只打印配置，不动系统
-#   sudo ./deploy/install-nginx.sh --sync-only          # 前端重新 build 后只同步产物
 #
-# 前端改了之后的日常更新：
-#   cd frontend && npm run build
-#   sudo ./deploy/install-nginx.sh --sync-only
+# 日常更新（前端或后端都一样，不再需要任何同步步骤）：
+#   rsync -av --exclude node_modules --exclude .venv ./ user@server:/opt/pantrace/
+#   sudo systemctl restart pantrace
 set -euo pipefail
 
 SITE_NAME="pantrace"
 DOMAIN="_"
-PUBLISH_DIR=""
 BACKEND_PORT="8000"
 ROOT_ARG=""
 PRINT_ONLY=0
-SYNC_ONLY=0
 SSL=0
 EMAIL=""
 
@@ -37,11 +39,9 @@ usage() {
   --ssl            申请 Let's Encrypt 证书并把 HTTP 301 到 HTTPS
                    需要 --domain 是真实域名（不能是 IP），80 端口能公网访问
   --email MAIL     证书到期通知邮箱（--ssl 时建议填）
-  --name NAME      站点名，同时决定配置文件名和发布目录（默认 pantrace）
-  --target DIR     前端产物发布目录（默认 /var/www/<name>）
+  --name NAME      站点名，决定配置文件名（默认 pantrace）
   --port PORT      后端监听端口（默认 8000）
   --root DIR       项目根目录（默认：本脚本的上一级目录）
-  --sync-only      只同步前端产物并 reload，不改配置
   --print          只输出 nginx 配置到屏幕，不写入、不 reload
   -h, --help       显示本帮助
 EOF
@@ -49,16 +49,14 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --domain)    DOMAIN="${2:?--domain 需要参数}"; shift ;;
-    --ssl)       SSL=1 ;;
-    --email)     EMAIL="${2:?--email 需要参数}"; shift ;;
-    --name)      SITE_NAME="${2:?--name 需要参数}"; shift ;;
-    --target)    PUBLISH_DIR="${2:?--target 需要参数}"; shift ;;
-    --port)      BACKEND_PORT="${2:?--port 需要参数}"; shift ;;
-    --root)      ROOT_ARG="${2:?--root 需要参数}"; shift ;;
-    --sync-only) SYNC_ONLY=1 ;;
-    --print)     PRINT_ONLY=1 ;;
-    -h|--help)   usage; exit 0 ;;
+    --domain)  DOMAIN="${2:?--domain 需要参数}"; shift ;;
+    --ssl)     SSL=1 ;;
+    --email)   EMAIL="${2:?--email 需要参数}"; shift ;;
+    --name)    SITE_NAME="${2:?--name 需要参数}"; shift ;;
+    --port)    BACKEND_PORT="${2:?--port 需要参数}"; shift ;;
+    --root)    ROOT_ARG="${2:?--root 需要参数}"; shift ;;
+    --print)   PRINT_ONLY=1 ;;
+    -h|--help) usage; exit 0 ;;
     *) echo "未知参数: $1" >&2; usage; exit 1 ;;
   esac
   shift
@@ -66,10 +64,10 @@ done
 
 ROOT="${ROOT_ARG:-$(cd "$(dirname "$0")/.." && pwd)}"
 ROOT="$(cd "$ROOT" && pwd)"
-DIST="$ROOT/frontend/dist"
-PUBLISH_DIR="${PUBLISH_DIR:-/var/www/$SITE_NAME}"
 CONF="/etc/nginx/conf.d/$SITE_NAME.conf"
 LE_DIR="/etc/letsencrypt/live/$DOMAIN"
+# 证书续期的校验目录：只放 ACME 验证文件，和部署无关，装一次就不用再动
+ACME_DIR="/var/www/letsencrypt-acme"
 
 # 已经有证书就别在没带 --ssl 的时候把配置降级回 HTTP——那样 HTTPS 会静默失效
 if [ "$SSL" != "1" ] && [ "$DOMAIN" != "_" ] && [ -f "$LE_DIR/fullchain.pem" ]; then
@@ -79,17 +77,18 @@ fi
 
 # ---- 前置检查 ----
 [ -f "$ROOT/backend/app/main.py" ] || { echo "!! $ROOT/backend/app/main.py 不存在，--root 指错了？" >&2; exit 1; }
-[ -f "$DIST/index.html" ] || { echo "!! 缺少 $DIST/index.html
-   先在本地或服务器上构建：cd $ROOT/frontend && npm run build" >&2; exit 1; }
 
-# 发布目录是脚本自己管的，绝不能是 / 或空，否则下面 --delete 会清空系统
-case "$PUBLISH_DIR" in
-  ""|"/"|"/etc"|"/usr"|"/var") echo "!! 发布目录不安全：$PUBLISH_DIR" >&2; exit 1 ;;
-esac
+# 静态页面靠后端托管，SERVE_FRONTEND=false 会让反代出来的页面 404
+if [ -f "$ROOT/backend/.env" ] && grep -Eq '^SERVE_FRONTEND\s*=\s*false' "$ROOT/backend/.env"; then
+  echo "!! backend/.env 里 SERVE_FRONTEND=false。纯反代模式下后端必须托管前端静态文件，" >&2
+  echo "   请把它改回 true（或删掉这一行用默认值），否则页面打不开。" >&2
+  exit 1
+fi
 
 if [ "$SSL" = "1" ]; then
   if [ "$DOMAIN" = "_" ]; then
-    echo "!! --ssl 必须配 --domain，且是真实域名" >&2; exit 1
+    echo "!! --ssl 必须配 --domain，且是真实域名" >&2
+    exit 1
   fi
   # Let's Encrypt 不给 IP 签证书，写了也是白跑一趟
   if printf '%s' "$DOMAIN" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -99,34 +98,12 @@ if [ "$SSL" = "1" ]; then
   fi
 fi
 
-# ---- 站点通用部分：静态托管 + 两个反代 ----
+# ---- 站点配置：全部反代给后端 ----
 site_locations() {
   cat <<EOF
-    root $PUBLISH_DIR;
-    index index.html;
-    charset utf-8;
-
-    # 单页应用：找不到的路径一律回 index.html，交给前端路由
+    # 所有请求（页面、静态资源、API、看板）都交给后端。
+    # FastAPI 同时托管 API 和 frontend/dist 静态产物，见 backend/app/main.py。
     location / {
-        try_files \$uri \$uri/ /index.html;
-    }
-
-    location /assets/ {
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
-
-    # 看板是动态页面，必须回后端。
-    # 少了这一条会被上面的 try_files 吃掉，打开 /admin 看到的是前端首页。
-    location = /admin {
-        proxy_pass http://127.0.0.1:$BACKEND_PORT;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location /api/ {
         proxy_pass http://127.0.0.1:$BACKEND_PORT;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
@@ -176,9 +153,9 @@ server {
     listen 80;
     server_name $DOMAIN;
 
-    # 续期校验走这个路径，必须留在 80 上，不能被下面的 301 吃掉
+    # 续期校验走这个路径，必须留在 80 上直读本地目录，不能被下面的 301 吃掉
     location /.well-known/acme-challenge/ {
-        root $PUBLISH_DIR;
+        root $ACME_DIR;
     }
 
     location / {
@@ -229,37 +206,18 @@ install_conf() {
 
 reload_nginx() { systemctl reload nginx 2>/dev/null || nginx -s reload; }
 
-# ---- 1. 同步前端产物 ----
-echo "[1/4] 同步前端产物 -> $PUBLISH_DIR"
-install -d -m 755 "$PUBLISH_DIR"
-if command -v rsync >/dev/null 2>&1; then
-  rsync -a --delete "$DIST/" "$PUBLISH_DIR/"
-else
-  # 没有 rsync 就退回删了重拷。路径前面已经校验过，不会是危险目录
-  find "$PUBLISH_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
-  cp -r "$DIST/." "$PUBLISH_DIR/"
-fi
-chmod -R a+rX "$PUBLISH_DIR"
-
-# SELinux 开着的话，放在 /var/www 的静态文件会被拦（403）
-if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" = "Enforcing" ]; then
-  echo "      SELinux 处于 Enforcing，补一条文件上下文"
-  chcon -R -t httpd_sys_content_t "$PUBLISH_DIR" 2>/dev/null || true
-fi
+# ---- 1. ACME 校验目录（只装一次，与日常部署无关） ----
+echo "[1/3] 准备证书续期校验目录 $ACME_DIR"
+install -d -m 755 "$ACME_DIR"
 
 # ---- 2. 写配置 ----
-if [ "$SYNC_ONLY" = "1" ]; then
-  echo "[2/4] --sync-only：跳过配置写入"
-  [ -f "$CONF" ] || { echo "!! $CONF 不存在，先跑一次不带 --sync-only 的完整安装" >&2; exit 1; }
-else
-  echo "[2/4] 写入 $CONF（server_name: $DOMAIN）"
-  # 先落 HTTP 配置：即使下面申请证书失败，站点也还能用 http 访问
-  install_conf "$HTTP_CONF" || exit 1
-fi
+echo "[2/3] 写入 $CONF（server_name: $DOMAIN）"
+# 先落 HTTP 配置：即使下面申请证书失败，站点也还能用 http 访问
+install_conf "$HTTP_CONF" || exit 1
 
 # ---- 3. HTTPS ----
-if [ "$SSL" = "1" ] && [ "$SYNC_ONLY" != "1" ]; then
-  echo "[3/4] 配置 HTTPS"
+if [ "$SSL" = "1" ]; then
+  echo "[3/3] 配置 HTTPS"
   if [ -f "$LE_DIR/fullchain.pem" ]; then
     echo "      证书已存在，跳过申请（续期由 certbot.timer 负责）"
   else
@@ -276,7 +234,7 @@ if [ "$SSL" = "1" ] && [ "$SYNC_ONLY" != "1" ]; then
     EMAIL_ARG=(--register-unsafely-without-email)
     if [ -n "$EMAIL" ]; then EMAIL_ARG=(-m "$EMAIL"); fi
     echo "      向 Let's Encrypt 申请 $DOMAIN 的证书"
-    if ! certbot certonly --webroot -w "$PUBLISH_DIR" -d "$DOMAIN" \
+    if ! certbot certonly --webroot -w "$ACME_DIR" -d "$DOMAIN" \
          --non-interactive --agree-tos "${EMAIL_ARG[@]}" --keep-until-expiring; then
       echo "!! 证书申请失败，站点继续以 HTTP 提供服务" >&2
       echo "   常见原因：域名没解析到本机 / 80 端口被安全组挡住 / 已被签发过多次触发限流" >&2
@@ -286,11 +244,17 @@ if [ "$SSL" = "1" ] && [ "$SYNC_ONLY" != "1" ]; then
   fi
   install_conf "$(build_ssl_conf)" || exit 1
 else
-  echo "[3/4] 跳过 HTTPS"
+  echo "[3/3] 跳过 HTTPS"
 fi
 
-echo "[4/4] reload nginx"
 reload_nginx
+
+# 旧版部署留下的发布目录：现在已经没用了，提醒一声但不自动删（怕里面有你想留的东西）
+if [ -d /var/www/pantrace ] && [ "$SITE_NAME" = "pantrace" ]; then
+  echo
+  echo "注意：检测到旧版部署目录 /var/www/pantrace，纯反代模式下它已无用，"
+  echo "      确认不需要后可删除：sudo rm -rf /var/www/pantrace"
+fi
 
 # Ubuntu 自带的 default 站点会抢 80 端口：它是第一个 server 块，
 # 请求 Host 匹配不上任何 server_name 时就落到它身上，看到的是 Nginx 欢迎页。
@@ -320,12 +284,13 @@ body=$(curl -s --max-time 8 "$SCHEME://127.0.0.1/" || true)
 case "$body" in
   *盘迹*) echo "  首页内容：正常" ;;
   *"Welcome to nginx"*) echo "  首页内容：被 Nginx 默认站点接管了，按上面的提示删掉 default" >&2 ;;
-  *) echo "  首页内容：不像本站页面，检查 root 是否为 $PUBLISH_DIR" >&2 ;;
+  *) echo "  首页内容：不像本站页面——确认 pantrace 服务在跑、backend/.env 里 SERVE_FRONTEND=true" >&2 ;;
 esac
 
 echo
 if [ "$SSL" = "1" ]; then
   echo "证书续期：systemctl status certbot.timer（装 certbot 时会自动启用，到期前 30 天自动续）"
 fi
-echo "以后前端更新："
-echo "  cd $ROOT/frontend && npm run build && sudo $ROOT/deploy/install-nginx.sh --sync-only"
+echo "以后更新（前端后端都一样，没有任何额外同步步骤）："
+echo "  rsync -av --exclude node_modules --exclude .venv ./ user@server:/opt/pantrace/"
+echo "  sudo systemctl restart pantrace"
