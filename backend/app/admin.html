@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex,nofollow" />
+<title>盘迹 · 访问记录</title>
+<style>
+  :root {
+    --bg: #f4f6f9;
+    --surface: #ffffff;
+    --line: #e5eaf1;
+    --line-strong: #d3dbe6;
+    --ink: #101828;
+    --ink-2: #344054;
+    --muted: #667085;
+    --faint: #98a2b3;
+    --brand: #0b7a6b;
+    --brand-soft: #e8f5f1;
+    --blue-soft: #eaf1ff;
+    --blue: #1d4ed8;
+    --red: #d92d20;
+    --radius: 14px;
+    --shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 8px 24px -16px rgba(16, 24, 40, 0.18);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 26px 22px 60px; }
+
+  header.top {
+    display: flex; align-items: flex-end; justify-content: space-between;
+    gap: 18px; flex-wrap: wrap; margin-bottom: 16px;
+  }
+  h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: 0.3px; }
+  .sub { color: var(--muted); font-size: 12.5px; }
+  .sub b { color: var(--brand); font-weight: 600; }
+
+  .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .seg { display: inline-flex; background: #eaeff5; border-radius: 10px; padding: 3px; }
+  .seg button {
+    border: 0; background: transparent; color: var(--ink-2); font-size: 12.5px;
+    height: 28px; padding: 0 13px; border-radius: 8px; cursor: pointer; font-family: inherit;
+  }
+  .seg button.on { background: #fff; color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(16,24,40,.1); }
+  .ghost {
+    height: 34px; padding: 0 14px; border-radius: 9px; border: 1px solid var(--line-strong);
+    background: #fff; color: var(--ink-2); font-size: 12.5px; cursor: pointer; font-family: inherit;
+  }
+  .ghost:hover { border-color: #b7ddd5; color: var(--brand); }
+
+  /* 首屏三个大数字：每天必看 */
+  .overview {
+    display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 10px;
+  }
+  .overview .stat {
+    flex: 1; min-width: 180px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: var(--shadow); padding: 16px 18px;
+  }
+  .overview .k { font-size: 12px; color: var(--muted); }
+  .overview .v { font-size: 30px; font-weight: 700; letter-spacing: -0.4px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .overview .stat.hi .v { color: var(--brand); }
+  .overview .hint { font-size: 11.5px; color: var(--faint); margin-top: 3px; }
+
+  /* 次级小数字：PV/UV/点击数/停留 */
+  .substats { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .substats .stat {
+    flex: 1; min-width: 110px;
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    padding: 8px 12px;
+  }
+  .substats .k { font-size: 11.5px; color: var(--muted); }
+  .substats .v { font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* 折叠区：健康指标 / 决策参考 / 流水 */
+  details.panel {
+    background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+    box-shadow: var(--shadow); margin-bottom: 14px; overflow: hidden;
+  }
+  details.panel > summary {
+    cursor: pointer; list-style: none;
+    padding: 13px 16px; font-size: 13.5px; font-weight: 600;
+    display: flex; align-items: center; gap: 8px; user-select: none;
+  }
+  details.panel > summary::-webkit-details-marker { display: none; }
+  details.panel > summary .tag {
+    font-size: 10.5px; font-weight: 500; color: var(--faint);
+    border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px;
+  }
+  details.panel > summary .arrow { margin-left: auto; color: var(--faint); transition: transform .15s; font-size: 11px; }
+  details.panel[open] > summary .arrow { transform: rotate(180deg); }
+  details.panel > .body { padding: 2px 16px 16px; border-top: 1px solid var(--line); }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+  .grid2:first-child { margin-top: 8px; }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+
+  .rank h2 { margin: 0 0 10px; font-size: 13.5px; font-weight: 600; }
+  .rank h2 span { font-size: 11.5px; color: var(--faint); font-weight: 400; margin-left: 6px; }
+  .bar-row { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; font-size: 12.5px; }
+  .bar-row:last-child { margin-bottom: 0; }
+  .bar-row .name { flex: 1; min-width: 0; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar-row .track { width: 90px; flex-shrink: 0; height: 8px; background: #f0f4f8; border-radius: 5px; overflow: hidden; }
+  .bar-row .fill { height: 100%; border-radius: 5px; background: var(--brand); }
+  .bar-row .fill.alt { background: var(--blue); }
+  .bar-row .fill.warn { background: #e04f16; }
+  .bar-row .n { width: 40px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .empty { color: var(--faint); font-size: 13px; padding: 20px 0; text-align: center; }
+  .err { color: var(--red); font-size: 12.5px; padding: 10px 0; }
+
+  /* 24h 分布 */
+  .hours { display: flex; align-items: flex-end; gap: 3px; height: 70px; margin-top: 4px; }
+  .hours .col { flex: 1; background: var(--brand); border-radius: 3px 3px 0 0; min-height: 2px; opacity: .85; }
+  .hours-label { display: flex; gap: 3px; margin-top: 5px; }
+  .hours-label span { flex: 1; text-align: center; font-size: 10px; color: var(--faint); }
+
+  /* 最近流水 */
+  table.stream { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  table.stream th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 8px 6px; border-bottom: 1px solid var(--line); font-size: 11.5px; }
+  table.stream td { padding: 6px 8px; border-bottom: 1px solid var(--line); color: var(--ink-2); }
+  table.stream tr:last-child td { border-bottom: 0; }
+  table.stream td.t { color: var(--faint); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  table.stream td .kind { font-size: 11px; border-radius: 5px; padding: 1px 7px; background: #eef2f6; color: var(--ink-2); }
+  table.stream td .kind.click { background: var(--brand-soft); color: var(--brand); }
+  table.stream td .kind.search { background: var(--blue-soft); color: var(--blue); }
+  table.stream td .kind.fail { background: #fdecea; color: var(--red); }
+  table.stream td.ellip { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .gate {
+    position: fixed; inset: 0; background: rgba(244, 246, 249, 0.94);
+    display: grid; place-items: center; z-index: 50; backdrop-filter: blur(4px);
+  }
+  .gate .box { background: #fff; border: 1px solid var(--line); border-radius: 16px; padding: 26px 28px; width: 320px; box-shadow: 0 20px 60px -20px rgba(16,24,40,.3); }
+  .gate h3 { margin: 0 0 6px; font-size: 16px; }
+  .gate p { margin: 0 0 16px; font-size: 12.5px; color: var(--muted); }
+  .gate input {
+    width: 100%; height: 38px; border: 1px solid var(--line-strong); border-radius: 9px;
+    padding: 0 12px; font-size: 13px; font-family: inherit; margin-bottom: 10px; outline: none;
+  }
+  .gate input:focus { border-color: #8fc9bd; }
+  .gate button {
+    width: 100%; height: 38px; border: 0; border-radius: 9px; background: var(--ink);
+    color: #fff; font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>盘迹 · 访问记录</h1>
+      <div class="sub" id="meta">载入中…</div>
+    </div>
+    <div class="controls">
+      <div class="seg" id="range">
+        <button data-days="1">今日</button>
+        <button data-days="7" class="on">近 7 天</button>
+        <button data-days="30">近 30 天</button>
+      </div>
+      <button class="ghost" id="refresh">刷新</button>
+      <button class="ghost" id="logout">改口令</button>
+    </div>
+  </header>
+
+  <!-- 首层：每天必看的三个数 -->
+  <section class="overview" id="overview"></section>
+  <section class="substats" id="substats"></section>
+
+  <!-- 健康层：出问题才看 -->
+  <details class="panel">
+    <summary>健康指标 <span class="tag">出问题才看</span><span class="arrow">▾</span></summary>
+    <div class="body">
+      <div class="substats" id="health" style="margin-bottom:6px"></div>
+      <div class="rank">
+        <h2>24 小时搜索分布 <span>按本机时区</span></h2>
+        <div class="hours" id="hours"></div>
+        <div class="hours-label" id="hours-label"></div>
+      </div>
+    </div>
+  </details>
+
+  <!-- 决策层：要拍板才看 -->
+  <details class="panel">
+    <summary>决策参考 <span class="tag">补词 / 引流时看</span><span class="arrow">▾</span></summary>
+    <div class="body">
+      <div class="grid2">
+        <section class="rank">
+          <h2>搜索词 TOP <span id="kw-hint"></span></h2>
+          <div id="keywords"></div>
+        </section>
+        <section class="rank">
+          <h2>搜不到的词 <span>该补词库了</span></h2>
+          <div id="zero-keywords"></div>
+        </section>
+      </div>
+      <div class="grid2">
+        <section class="rank">
+          <h2>被点开最多的资源</h2>
+          <div id="targets"></div>
+        </section>
+        <section class="rank">
+          <h2>来源站 <span>从哪引流来的</span></h2>
+          <div id="referers"></div>
+        </section>
+      </div>
+      <div class="grid2">
+        <section class="rank">
+          <h2>平台分布 <span>按搜索次数</span></h2>
+          <div id="platforms"></div>
+        </section>
+        <section class="rank">
+          <h2>新客与回头客 <span>访客口径</span></h2>
+          <div id="visitors"></div>
+        </section>
+      </div>
+    </div>
+  </details>
+
+  <!-- 流水 -->
+  <details class="panel">
+    <summary>最近行为流水 <span class="tag">最新 30 条</span><span class="arrow">▾</span></summary>
+    <div class="body">
+      <div id="recent"></div>
+    </div>
+  </details>
+</div>
+
+<div class="gate hidden" id="gate">
+  <div class="box">
+    <h3>需要口令</h3>
+    <p>看板数据受保护，输入 ADMIN_TOKEN 后可见。</p>
+    <input id="token-input" type="password" placeholder="管理员口令" autocomplete="current-password" />
+    <button id="token-save">进入看板</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var TOKEN_KEY = 'pt_admin_token';
+  var days = 7;
+  var timer = null;
+
+  var PLATFORM_NAMES = {
+    quark: '夸克网盘', baidu: '百度网盘', ali: '阿里云盘', uc: 'UC网盘',
+    xunlei: '迅雷网盘', '115': '115网盘', '123': '123云盘', tianyi: '天翼云盘',
+    yidong: '移动云盘', wo: '联通云盘', guangya: '光鸭云盘', lanzou: '蓝奏云',
+    weiyun: '腾讯微云', ctfile: '城通网盘'
+  };
+  var KIND_NAMES = {
+    pv: '打开', leave: '离开', search: '搜索', click: '点开',
+    copy_pwd: '复制码', filter: '换平台', page: '翻页', retry: '重试'
+  };
+
+  function $(id) { return document.getElementById(id); }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (m) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m];
+    });
+  }
+
+  function platformName(key) {
+    if (!key) return '-';
+    return key.split(',').map(function (k) { return PLATFORM_NAMES[k] || k; }).join(' / ');
+  }
+
+  function pct(v) { return ((Number(v) || 0) * 100).toFixed(1) + '%'; }
+  function ms(v) {
+    v = Number(v) || 0;
+    if (v <= 0) return '-';
+    return v >= 1000 ? (v / 1000).toFixed(1) + ' s' : v + ' ms';
+  }
+  function hhmmss(ts) {
+    var d = new Date(ts * 1000);
+    function p(x) { return (x < 10 ? '0' : '') + x; }
+    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  // ---------------- 数据请求 ----------------
+  function token() {
+    try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; }
+  }
+
+  function load(silent) {
+    var q = '/api/admin/stats?days=' + days;
+    var headers = {};
+    var t = token();
+    if (t) headers['x-admin-token'] = t;
+
+    fetch(q, { headers: headers })
+      .then(function (res) {
+        return res.json().then(function (body) { return { status: res.status, body: body }; });
+      })
+      .then(function (r) {
+        if (r.status === 401) { showGate(); return; }
+        if (!r.body || r.body.code !== 0) {
+          if (!silent) $('meta').innerHTML = '<span class="err">读取失败：' + esc((r.body && r.body.msg) || '未知错误') + '</span>';
+          return;
+        }
+        hideGate();
+        render(r.body.data);
+      })
+      .catch(function (e) {
+        if (!silent) $('meta').innerHTML = '<span class="err">网络错误：' + esc(e.message) + '</span>';
+      });
+  }
+
+  function showGate() {
+    $('gate').classList.remove('hidden');
+    var input = $('token-input');
+    if (input) { input.focus(); }
+  }
+  function hideGate() { $('gate').classList.add('hidden'); }
+
+  // ---------------- 渲染 ----------------
+  function render(d) {
+    var o = d.overview || {};
+    var rangeText = d.days === 1 ? '今天' : '近 ' + d.days + ' 天';
+    $('meta').innerHTML = rangeText + ' · 自动刷新 60 秒 · 机器人流量已剔除';
+
+    function stat(label, value, cls, hint) {
+      return '<div class="stat ' + (cls || '') + '">' +
+        '<div class="k">' + esc(label) + '</div>' +
+        '<div class="v">' + value + '</div>' +
+        (hint ? '<div class="hint">' + esc(hint) + '</div>' : '') +
+        '</div>';
+    }
+    function small(label, value) {
+      return '<div class="stat"><div class="k">' + esc(label) + '</div>' +
+        '<div class="v">' + value + '</div></div>';
+    }
+
+    // 首层
+    $('overview').innerHTML =
+      stat('搜索次数', Number(o.searches) || 0, 'hi', '业务核心量') +
+      stat('点击转化率', pct(o.ctr), '', '点开资源 / 搜索次数') +
+      stat('零结果率', pct(o.zero_rate),
+           (Number(o.zero_rate) || 0) > 0.3 ? 'hi' : '',
+           '搜了但没结果 · 越低越好');
+    $('substats').innerHTML =
+      small('访问 PV', Number(o.pv) || 0) +
+      small('访客 UV', Number(o.uv) || 0) +
+      small('点击次数', Number(o.clicks) || 0) +
+      small('平均停留', ms(o.dwell_ms));
+
+    // 健康层
+    $('health').innerHTML =
+      small('失败率', pct(o.fail_rate)) +
+      small('上游耗时', ms(o.avg_ms)) +
+      small('缓存命中率', pct(o.cache_rate)) +
+      small('机器人搜索', Number(o.bot_searches) || 0);
+    renderHours(d.hourly || []);
+
+    // 决策层
+    renderKeywords(d.keywords || []);
+    renderZeroKeywords(d.zero_keywords || []);
+    renderTargets(d.targets || []);
+    renderReferers(d.referers || []);
+    renderPlatforms(d.platforms || []);
+    renderVisitors(o);
+
+    // 流水
+    renderRecent(d.recent || []);
+  }
+
+  function barRows(rows, fillCls) {
+    var max = 1;
+    rows.forEach(function (r) { if (r.n > max) max = r.n; });
+    var html = '';
+    rows.forEach(function (r) {
+      var w = Math.max(2, Math.round((r.n / max) * 100));
+      html += '<div class="bar-row">' +
+        '<span class="name" title="' + esc(r.label) + '">' + esc(r.label) + '</span>' +
+        '<span class="track"><span class="fill ' + (fillCls || '') + '" style="width:' + w + '%"></span></span>' +
+        '<span class="n">' + r.n + '</span></div>';
+    });
+    return html;
+  }
+
+  function renderKeywords(rows) {
+    var el = $('keywords');
+    $('kw-hint').textContent = rows.length ? '共 ' + rows.length + ' 个词' : '';
+    el.innerHTML = rows.length
+      ? barRows(rows.map(function (r) { return { label: r.q, n: r.n }; }))
+      : '<div class="empty">还没有搜索记录</div>';
+  }
+
+  function renderZeroKeywords(rows) {
+    $('zero-keywords').innerHTML = rows.length
+      ? barRows(rows.map(function (r) { return { label: r.q, n: r.n }; }), 'warn')
+      : '<div class="empty">这个区间没有搜不到的词，好事</div>';
+  }
+
+  function renderTargets(rows) {
+    $('targets').innerHTML = rows.length
+      ? barRows(rows.map(function (r) { return { label: r.t, n: r.n }; }), 'alt')
+      : '<div class="empty">还没有点击记录</div>';
+  }
+
+  function renderReferers(rows) {
+    $('referers').innerHTML = rows.length
+      ? barRows(rows.map(function (r) { return { label: r.r, n: r.n }; }))
+      : '<div class="empty">都是直接访问，没有来源站</div>';
+  }
+
+  function renderPlatforms(rows) {
+    $('platforms').innerHTML = rows.length
+      ? barRows(rows.map(function (r) { return { label: platformName(r.key), n: r.n }; }))
+      : '<div class="empty">还没有平台筛选记录</div>';
+  }
+
+  function renderVisitors(o) {
+    var nv = Number(o.new_visitors) || 0;
+    var rv = Number(o.returning_visitors) || 0;
+    var max = Math.max(nv, rv, 1);
+    function row(label, n) {
+      var w = Math.max(2, Math.round((n / max) * 100));
+      return '<div class="bar-row"><span class="name">' + label + '</span>' +
+        '<span class="track"><span class="fill" style="width:' + w + '%"></span></span>' +
+        '<span class="n">' + n + '</span></div>';
+    }
+    $('visitors').innerHTML = row('新客', nv) + row('回头客', rv);
+  }
+
+  function renderHours(hours) {
+    var max = 1;
+    hours.forEach(function (n) { if (n > max) max = n; });
+    var bars = '';
+    var labels = '';
+    for (var h = 0; h < 24; h++) {
+      var w = Math.max(2, Math.round(((hours[h] || 0) / max) * 100));
+      bars += '<div class="col" style="height:' + w + '%" title="' + h + ' 点：' + (hours[h] || 0) + ' 次"></div>';
+      labels += '<span>' + (h % 6 === 0 ? h : '') + '</span>';
+    }
+    $('hours').innerHTML = bars;
+    $('hours-label').innerHTML = labels;
+  }
+
+  function renderRecent(rows) {
+    var el = $('recent');
+    if (!rows.length) {
+      el.innerHTML = '<div class="empty">这个区间没有行为记录</div>';
+      return;
+    }
+    var html = '<table class="stream"><thead><tr>' +
+      '<th>时间</th><th>行为</th><th>内容</th><th>平台</th><th>设备</th><th>IP</th>' +
+      '</tr></thead><tbody>';
+    rows.forEach(function (r) {
+      var kind = KIND_NAMES[r.kind] || r.kind;
+      var cls = 'kind ' + r.kind;
+      if (r.kind === 'search' && !r.ok) cls = 'kind fail';
+      var content = r.kind === 'click' || r.kind === 'copy_pwd' ? (r.target || '-')
+        : r.kind === 'search' || r.kind === 'filter' || r.kind === 'page' || r.kind === 'retry'
+          ? (r.query || '-')
+          : '-';
+      html += '<tr>' +
+        '<td class="t">' + hhmmss(r.ts) + '</td>' +
+        '<td><span class="' + esc(cls) + '">' + esc(kind) + '</span></td>' +
+        '<td class="ellip" title="' + esc(content) + '">' + esc(content) + '</td>' +
+        '<td>' + esc(platformName(r.platform)) + '</td>' +
+        '<td>' + esc(r.device === 'mobile' ? '手机' : '桌面') + '</td>' +
+        '<td class="t">' + esc(r.ip || '-') + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table>';
+    el.innerHTML = html;
+  }
+
+  // ---------------- 交互 ----------------
+  Array.prototype.forEach.call($('range').querySelectorAll('button'), function (btn) {
+    btn.addEventListener('click', function () {
+      days = Number(btn.getAttribute('data-days')) || 7;
+      Array.prototype.forEach.call($('range').querySelectorAll('button'), function (b) {
+        b.classList.toggle('on', b === btn);
+      });
+      load();
+    });
+  });
+
+  $('refresh').addEventListener('click', function () { load(); });
+
+  $('logout').addEventListener('click', function () {
+    try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+    showGate();
+  });
+
+  $('token-save').addEventListener('click', function () {
+    var v = $('token-input').value.trim();
+    if (!v) return;
+    try { localStorage.setItem(TOKEN_KEY, v); } catch (e) {}
+    hideGate();
+    load();
+  });
+
+  $('token-input').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') $('token-save').click();
+  });
+
+  // 60 秒自动刷新，页面藏起来时停掉
+  function startTimer() {
+    stopTimer();
+    timer = setInterval(function () {
+      if (document.visibilityState === 'visible') load(true);
+    }, 60000);
+  }
+  function stopTimer() { if (timer) { clearInterval(timer); timer = null; } }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') load(true);
+  });
+
+  load();
+  startTimer();
+})();
+</script>
+</body>
+</html>

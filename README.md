@@ -1,0 +1,325 @@
+# 盘迹 PanTrace
+
+网盘资源聚合搜索。前端 Vue 3 + Vite，后端 FastAPI，数据来自套壳 API。
+
+## 结构
+
+```
+backend/
+  app/main.py         FastAPI 入口：/api/search /api/platforms /api/health
+  app/config.py       配置（从 .env 读）
+  .env                apikey 等敏感配置，已被 gitignore
+  requirements.txt
+frontend/
+  src/App.vue         搜索页、平台筛选、分页
+  src/components/ResultCard.vue
+  src/api.js          接口封装
+  vite.config.js      dev 时 /api 代理到 8000
+start.bat             生产模式：构建前端 + 单端口 8000
+start-dev.bat         开发模式：后端 8000 + 前端 5173
+```
+
+## 启动
+
+生产（单端口，浏览器开 http://127.0.0.1:8000）：
+
+```bat
+start.bat
+```
+
+开发（前后端分离，热更新，浏览器开 http://127.0.0.1:5173）：
+
+```bat
+start-dev.bat
+```
+
+手动方式：
+
+```bash
+# 后端
+cd backend
+.venv/Scripts/python.exe -m uvicorn app.main:app --reload --port 8000
+
+# 前端
+cd frontend
+npm run dev
+```
+
+首次跑之前确认 `backend/.env` 里 `API_KEY`、`IDR_SIGN`、`IDR_TIME` 三项都已填。
+
+## 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/search?q=关键词&platforms=quark,baidu&page=1&page_size=20` | 搜索 |
+| GET | `/api/platforms` | 平台列表（前端筛选用） |
+| GET | `/api/health` | 健康检查 |
+| POST | `/api/track` | 前端行为上报（内部用，见下节） |
+| GET | `/api/admin/stats?days=7` | 看板数据，需 `X-Admin-Token` |
+| GET | `/admin` | 用户行为看板（HTML） |
+| GET | `/docs` | FastAPI 自带接口文档 |
+
+前端只拿到清洗后的字段（`platform` / `title` / `shareUrl` / `sharePwd` / `fileCount` / `sizeBytes`），**拿不到 apikey，也拿不到上游的 `highlightedTitle`**（那是远端 HTML，直接渲染就是 XSS 口子；高亮由前端自己按关键词标记，且先转义）。
+
+## 上游实测踩到的坑（改代码前先看）
+
+这几个都不在文档里，是实际调出来的：
+
+1. **不带浏览器 UA → 403**。请求必须带 `User-Agent`。
+2. **`platforms: []` 空数组 → 参数错误**。没有平台筛选时必须整个字段省略。
+3. **apikey 的位置跟着协议走**：控制台 MAPI 是放在请求体的 `params.apikey` 里（外层还套一层 `{path, method, params}`），早期直连套壳时才是 query string。别凭印象改。
+4. **httpx 走本机代理读超时，requests 正常**。所以后端用 requests + `asyncio.to_thread`，别改回 httpx。
+5. **平台 key 与文档示例不一致**。实测到的是 `quark` / `baidu` / `ali` / `xunlei` / `guangya` / `yidong`，阿里云盘是 `ali` 不是 `aliyun`。平台中文名一律以上游返回的 `platformName` 为准。
+6. **上游对连续请求极敏感**，同一 query 紧接第二次会挂到 120 秒超时。后端做了串行排队（最小间隔 2 秒）+ 5 分钟结果缓存，这是可用性底线，不要去掉。
+7. **鉴权只认 `x-idr-sign`**。拆变量验证过：只带 `sid` 通，带 `sid`+`cf_clearance` 但去掉签名报 `1004`，完全不带 cookie 只有签名也通。所以后端不需要维护浏览器会话，也不需要存 `cf_clearance`。
+8. **签名会过期**，过期返回 `code 1004`。这条必须报给用户看，不要当成网络错误含糊过去。
+
+## 用户行为埋点
+
+站点没有登录体系，所以做的是**匿名行为统计**：谁来过（随机访客号）、搜了什么、点了什么、从哪来、几点来。
+
+打开 `http://你的域名/admin` 就是看板。没配 `ADMIN_TOKEN` 时只有本机 `127.0.0.1` 能访问，**公网部署必须配一个口令**：
+
+```bash
+python -c "import secrets;print(secrets.token_urlsafe(18))"   # 生成
+# 写进 backend/.env 的 ADMIN_TOKEN=，重启服务
+```
+
+### 采了什么
+
+| 事件 | 来源 | 记录内容 |
+|---|---|---|
+| `pv` / `leave` | 前端 | 进页面、停留时长、来源 referer、设备类型 |
+| `search` | **后端** | 关键词、平台筛选、页码、结果数、耗时、是否缓存、失败原因 |
+| `click` | 前端 | 点开了哪条资源（标题 + 平台），带 `sendBeacon` 保证跳转前发出 |
+| `copy_pwd` | 前端 | 复制了提取码 |
+| `filter` / `page` / `retry` | 前端 | 换平台、翻页、失败重试 |
+
+搜索走服务端记录，不怕广告拦截插件；点击这类动作必须前端报，所以用 `navigator.sendBeacon`，页面跳走也能发出去。
+
+**机器人过滤**：按 UA 识别已知爬虫/脚本（curl、python-requests、spider 等），事件落库时打 `bot=1` 标记。识别只打标不拦截——误伤真人比多记几行代价大。看板汇总一律剔除 bot 行，机器人搜索量单独显示一个数。
+
+### 看板里能看到
+
+分三层，避免一屏全是数字：
+
+- **首屏（每天必看）**：搜索次数、**点击转化率**、**零结果率**；下面一行小字是 PV/UV、点击次数、平均停留时长。
+- **健康指标（出问题才看，折叠）**：失败率、上游平均耗时、缓存命中率、机器人搜索量、24 小时搜索分布。
+- **决策参考（要拍板才看，折叠）**：关键词榜（带次数）、**搜不到的词**（这个词库缺什么，最有用）、被点开最多的资源、来源站、平台分布、新客与回头客；另有最近 30 条行为流水。
+
+几个口径记一下：
+
+- **UV** = 去重访客号。访客号是 `localStorage` 里的随机 UUID，清缓存就是新访客，所以 UV 偏大属于正常。
+- **点击转化率** = 点击次数 / 搜索次数。不是人数口径。
+- **零结果率** = 成功返回但 0 条的搜索 / 成功的搜索。这个数高说明要么关键词太偏，要么上游覆盖不够。看板上的"搜不到的词"榜直接列出这些词，补词库看它。
+- 所有汇总数字均排除机器人流量；机器人搜索量单独显示。
+- 会话 30 分钟无操作算断。
+
+### 数据在哪
+
+`backend/data/analytics.db`，SQLite 单文件，已在 `.gitignore` 里。默认留 180 天，每天自动清一次。
+
+```bash
+# 备份
+cp backend/data/analytics.db ~/pantrace-analytics-$(date +%F).db
+# 清空重来（服务停掉再删，否则 WAL 文件会留半条）
+systemctl stop pantrace && rm -f backend/data/analytics.db* && systemctl start pantrace
+```
+
+### 隐私边界
+
+- 不接任何第三方统计，数据不出服务器。
+- 不写 cookie、不取指纹、不存精确位置；只有 IP（用于去重和排障）和 UA。
+- 看板上 IP 一律脱敏成 `1.2.3.x` 再展示。
+- 关键词只存搜索词本身，不存用户身份信息——本来也没有。
+
+## 已知问题
+
+- 上游单次查询耗时波动大：快的 2 秒，慢的接近 60 秒。后端超时设为 75 秒（官方要求 >60 秒，否则提前中断照样扣费）。
+- `credits` 字段实测多次为 0，计费逻辑以上游账单为准，不要用这个字段估算成本。
+- **只有一条通道，没有降级**。签名过期时搜索直接失败并提示重新抓取。这是刻意的：以前挂过降级链，签名失效的请求会被悄悄转到慢通道，日志里只剩“慢”，看不出真因。
+
+## 上线前要做的
+
+- [ ] `backend/.env` 不要提交到任何仓库
+- [ ] 设 `ADMIN_TOKEN`，否则公网打不开 `/admin` 看板
+- [ ] 关掉 `--reload`，保持 `--workers 1`（多进程会让缓存和串行锁各自独立，详见下文 Linux 部署说明）
+- [ ] 前面挂 Nginx，加 HTTPS
+- [ ] 加访问频率限制，否则一个脚本就能把 apikey 的余额刷空
+- [ ] `CORS_ORIGINS` 改成正式域名，别留 localhost
+
+---
+
+# 部署到 Linux
+
+## 1. 服务器依赖
+
+需要 **Python 3.10+**（代码用了 `X | None` 语法）和 venv。
+
+```bash
+# Ubuntu / Debian
+sudo apt update && sudo apt install -y python3 python3-venv python3-pip nginx
+
+# Rocky / CentOS / Alma
+sudo dnf install -y python3 python3-pip nginx
+```
+
+建一个专用账号，别用 root 跑：
+
+```bash
+sudo useradd -r -s /sbin/nologin pantrace
+sudo mkdir -p /opt/pantrace
+sudo chown -R pantrace:pantrace /opt/pantrace
+```
+
+## 2. 上传代码
+
+推荐先在**本地构建前端**，服务器就不用装 Node：
+
+```bash
+cd frontend && npm run build
+```
+
+再上传（排除依赖目录，体积能小一个数量级）：
+
+```bash
+rsync -av --exclude node_modules --exclude .venv --exclude __pycache__ --exclude '*.log' \
+  ./ user@your-server:/opt/pantrace/
+```
+
+## 3. 配置
+
+```bash
+cd /opt/pantrace
+cp backend/.env.example backend/.env
+vim backend/.env          # 填 API_KEY、IDR_SIGN、IDR_TIME 三项
+chmod 600 backend/.env    # 里面是钱和凭据，别人别读
+```
+
+三个必填项：
+
+| 变量 | 说明 |
+|---|---|
+| `API_KEY` | `idr_` 开头的 36 位 key |
+| `IDR_SIGN` | `v1:` + 32 位十六进制，浏览器控制台抓的签名 |
+| `IDR_TIME` | 与签名同一次请求里的 `x-idr-time` |
+
+`IDR_SIGN` 会过期。过期后搜索会返回「IDR 签名已失效（1004）」，重新抓法：
+
+> 控制台随便搜一次 → F12 → Network → 找 `mapi` 请求 → 复制请求头 `x-idr-sign` 和 `x-idr-time` → 填进 `.env` → 重启服务
+
+前端会把这个提示原样显示给用户，不会假装是网络问题。
+
+如果前端交给 Nginx 托管，把 `SERVE_FRONTEND` 改成 `false`，后端就只做 API。
+
+## 4. 先手动跑一遍
+
+```bash
+cd /opt/pantrace
+chmod +x start.sh
+./start.sh
+```
+
+看到 `Uvicorn running on http://0.0.0.0:8000` 就正常，`Ctrl+C` 停掉，交给 systemd。
+
+## 5. systemd 守护（关掉 SSH 也不停）
+
+`./start.sh` 跑的是当前会话的前台进程，**关掉 SSH 窗口就会收到 SIGHUP 挂掉**。交给 systemd 才是正解：断线不受影响、崩溃自动重启、服务器重启自动拉起。
+
+用脚本装，路径和用户按实际情况自动生成（不写死 `/opt/pantrace`）：
+
+```bash
+cd /opt/pantrace
+sudo ./deploy/install-service.sh          # 装好并启动
+# 项目在别的目录就加 --root，端口不是 8000 就加 --port
+```
+
+脚本会先做前置检查（venv、依赖、`.env`、`frontend/dist`、端口占用），通过后写 `/etc/systemd/system/pantrace.service` 并 `enable`。装完自动打印状态和健康检查结果。
+
+```bash
+sudo ./deploy/install-service.sh --print   # 只想看会生成什么，不安装
+```
+
+日常命令：
+
+```bash
+systemctl status pantrace            # 看状态
+systemctl restart pantrace           # 改完代码/配置后重启
+journalctl -u pantrace -f            # 实时日志
+journalctl -u pantrace -n 100        # 最近 100 行
+systemctl disable --now pantrace     # 停止并取消开机自启
+```
+
+> 注意：装的路径如果在 `/root` 或 `/home` 下，脚本会自动把 `ProtectHome` 设为 `false`，否则 systemd 会屏蔽这些目录，服务读不到代码。手动改 unit 时别漏了这条。
+
+## 6. Nginx
+
+用脚本装，别手工 cp——里面有几处不能漏（看板转发、超时、发布目录权限）：
+
+```bash
+cd /opt/pantrace
+sudo ./deploy/install-nginx.sh                      # 默认 server_name _
+sudo ./deploy/install-nginx.sh --domain example.com # 绑域名
+sudo ./deploy/install-nginx.sh --domain example.com --ssl --email you@mail.com
+                                                    # 绑域名 + 申请证书 + 强制跳 HTTPS
+sudo ./deploy/install-nginx.sh --print              # 只看会写什么配置
+```
+
+脚本做了五件事：把 `frontend/dist` 同步到 `/var/www/pantrace`、写 `/etc/nginx/conf.d/pantrace.conf`、`nginx -t` 校验（失败自动回滚）、reload 并自测三个路径；带 `--ssl` 时再向 Let's Encrypt 申请证书并把 HTTP 301 到 HTTPS。
+
+`--ssl` 的几个约束：域名必须已经解析到本机、80 端口能公网访问、不能是 IP（Let's Encrypt 不给 IP 签证书）。证书申请失败不会把站点搞挂——脚本会保留 HTTP 配置继续服务。证书续期由 certbot 装好时自动启用的 `certbot.timer` 负责，到期前 30 天自动续，不用管。
+
+**为什么不直接把 root 指到项目目录**：Nginx worker 以 `www-data`/`nginx` 身份跑，读不了 `/root`、`/home` 下的文件，指过去就是 403。脚本因此单独同步一份产物到 `/var/www`。
+
+配置里有两条不能动：
+
+- `location = /admin` 必须存在。少了它，`try_files` 会把 `/admin` 当静态路径处理，打开看到的是前端首页而不是看板。
+- `proxy_read_timeout 90s` 必须大于后端的 75 秒，否则上游还没返回 Nginx 先断，用户看到 504 但那笔已经扣费。
+
+**前端改了要同步产物**，否则 Nginx 发的还是旧的：
+
+```bash
+cd frontend && npm run build
+sudo ./deploy/install-nginx.sh --sync-only
+```
+
+> 上了 Nginx 之后 `SERVE_FRONTEND` 可以保持 `true` 不动。Nginx 正常时后端那份静态挂载根本不会被调用，留着是为了 Nginx 配置出错时还能用 `IP:8000` 兜底进去。真想收紧，把 systemd unit 里的 `--host 0.0.0.0` 改成 `127.0.0.1`，但那样 Nginx 一挂就彻底进不去了。
+
+## 7. 防火墙与 HTTPS
+
+```bash
+sudo ufw allow 80,443/tcp          # 云服务器还要在控制台安全组放行 80 和 443
+```
+
+HTTPS 不用手工跑 certbot，直接用脚本（见上一节）：
+
+```bash
+sudo ./deploy/install-nginx.sh --domain example.com --ssl --email you@mail.com
+```
+
+> 只绑了域名没配证书时，浏览器敲域名会默认先试 HTTPS，443 没人监听就直接报"无法访问此网站"——手动敲 `http://` 前缀能进，但这不是长久方案，把证书配上。
+
+## 8. 更新代码
+
+```bash
+# 改的是后端或配置
+rsync -av --exclude node_modules --exclude .venv ./ user@your-server:/opt/pantrace/
+sudo systemctl restart pantrace
+
+# 前端也改了（先在本地 npm run build，dist 会一起传上去）
+sudo ./deploy/install-nginx.sh --sync-only
+```
+
+只改后端的话一条 `systemctl restart` 就够了，前端产物不用动。
+
+---
+
+## Linux 上三个必须注意的点
+
+| 点 | 说明 |
+|---|---|
+| **.env 用绝对路径读取** | 代码已按文件位置定位 `backend/.env`，不再依赖当前工作目录。如果你改了启动方式（比如 `cd /` 再起 uvicorn），也照样能读到。 |
+| **只能单 worker** | 缓存和上游串行锁都在进程内。`--workers 4` 会让四个进程各排各的队，等于没排队，上游立刻把你打到超时。要横向扩展必须先把这两样换成 Redis。 |
+| **Nginx 超时要大于 75 秒** | `proxy_read_timeout 90s`。Nginx 默认 60 秒，会在后端还没返回时先断，用户看到 504，但上游其实已经扣了费。 |
+
+另一个容易忽略的：**别在 `.env` 里开 `USE_ENV_PROXY=true`**，除非服务器确实只能通过代理出网。海外机器和大部分云主机都能直连，走代理反而慢。

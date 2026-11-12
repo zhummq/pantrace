@@ -1,0 +1,39 @@
+# 参考模板：生产部署（项目在 /opt/pantrace，独立 pantrace 用户，前面挂 Nginx）
+#
+# 一般不直接用这个文件，跑部署脚本即可（它会按实际路径和用户生成）：
+#     sudo ./deploy/install-service.sh
+#
+# 想手动用这份，先把下面三处改掉：User/Group、WorkingDirectory、ExecStart 里的路径。
+# 项目放在 /root 或 /home 下时，必须改成 ProtectHome=false，否则服务读不到代码。
+
+[Unit]
+Description=PanTrace netdisk search
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pantrace
+Group=pantrace
+WorkingDirectory=/opt/pantrace
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+# 必须单 worker：缓存与上游串行锁都在进程内，多进程会各自一套，串行保护失效
+# 用 python -m uvicorn 而非 bin/uvicorn，避免 venv 搬动后 shebang 路径失效
+ExecStart=/opt/pantrace/backend/.venv/bin/python -m uvicorn app.main:app --app-dir /opt/pantrace/backend --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+# 限制日志体积，避免长期跑把磁盘写满
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+
+# 基础加固（项目在 /root 或 /home 下时把 ProtectHome 改成 false）
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
