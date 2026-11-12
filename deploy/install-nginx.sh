@@ -98,6 +98,17 @@ if [ "$SSL" = "1" ]; then
   fi
 fi
 
+# server_name 与证书里的域名清单。主域名带 www 前缀且 www 已解析时，
+# 自动把 www 一起签进同一张证书——用户访问 www.xxx 和裸域都能对上。
+# www 没解析就不带，否则 certbot 会因授权失败整单被拒。
+SERVER_NAMES="$DOMAIN"
+CERT_NAME_ARGS=(-d "$DOMAIN")
+if [ "$SSL" = "1" ] && getent hosts "www.$DOMAIN" >/dev/null 2>&1; then
+  SERVER_NAMES="$DOMAIN www.$DOMAIN"
+  CERT_NAME_ARGS=(-d "$DOMAIN" -d "www.$DOMAIN")
+  echo "检测到 www.$DOMAIN 已解析，将与 $DOMAIN 签进同一张证书"
+fi
+
 # ---- 站点配置：全部反代给后端 ----
 site_locations() {
   cat <<EOF
@@ -127,7 +138,7 @@ EOF
 
 HTTP_CONF="server {
     listen 80;
-    server_name $DOMAIN;
+    server_name $SERVER_NAMES;
 
 $(site_locations)
 }"
@@ -151,7 +162,7 @@ build_ssl_conf() {
   cat <<EOF
 server {
     listen 80;
-    server_name $DOMAIN;
+    server_name $SERVER_NAMES;
 
     # 续期校验走这个路径，必须留在 80 上直读本地目录，不能被下面的 301 吃掉
     location /.well-known/acme-challenge/ {
@@ -165,7 +176,7 @@ server {
 
 server {
 $(http2_directive)
-    server_name $DOMAIN;
+    server_name $SERVER_NAMES;
 
     ssl_certificate $LE_DIR/fullchain.pem;
     ssl_certificate_key $LE_DIR/privkey.pem;
@@ -211,7 +222,7 @@ echo "[1/3] 准备证书续期校验目录 $ACME_DIR"
 install -d -m 755 "$ACME_DIR"
 
 # ---- 2. 写配置 ----
-echo "[2/3] 写入 $CONF（server_name: $DOMAIN）"
+echo "[2/3] 写入 $CONF（server_name: $SERVER_NAMES）"
 # 先落 HTTP 配置：即使下面申请证书失败，站点也还能用 http 访问
 install_conf "$HTTP_CONF" || exit 1
 
@@ -233,8 +244,8 @@ if [ "$SSL" = "1" ]; then
     }
     EMAIL_ARG=(--register-unsafely-without-email)
     if [ -n "$EMAIL" ]; then EMAIL_ARG=(-m "$EMAIL"); fi
-    echo "      向 Let's Encrypt 申请 $DOMAIN 的证书"
-    if ! certbot certonly --webroot -w "$ACME_DIR" -d "$DOMAIN" \
+    echo "      向 Let's Encrypt 申请证书：${CERT_NAME_ARGS[*]}"
+    if ! certbot certonly --webroot -w "$ACME_DIR" "${CERT_NAME_ARGS[@]}" \
          --non-interactive --agree-tos "${EMAIL_ARG[@]}" --keep-until-expiring; then
       echo "!! 证书申请失败，站点继续以 HTTP 提供服务" >&2
       echo "   常见原因：域名没解析到本机 / 80 端口被安全组挡住 / 已被签发过多次触发限流" >&2
