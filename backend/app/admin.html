@@ -771,8 +771,8 @@
     $('grp-enter').value = p.enter === false ? '0' : '1';
     $('grp-acquire').value = p.acquire === false ? '0' : '1';
     $('grp-once').value = p.once || 'session';
-    const d = Number(p.delay);
-    $('grp-delay').value = Number.isFinite(d) ? d : 800;
+    var dl = Number(p.delay);
+    $('grp-delay').value = Number.isFinite(dl) ? dl : 800;
     renderGrpItems(d.groups || []);
   }
 
