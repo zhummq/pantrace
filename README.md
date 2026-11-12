@@ -10,14 +10,16 @@ backend/
   app/config.py       配置（从 .env 读）
   app/analytics.py    访问埋点：事件表 + 看板聚合
   app/feedback.py     反馈/求资源：工单表、限流、去重、聚合
+  app/group.py        群入口配置：二维码/群号/弹窗策略（app_config 表）
   .env                apikey 等敏感配置，已被 gitignore
   requirements.txt
 frontend/
   src/App.vue         搜索页、平台筛选、分页、反馈入口
   src/components/ResultCard.vue
   src/components/FeedbackDialog.vue   反馈弹层（纠错 / 求资源 / 报错）
+  src/components/QqGroupDialog.vue    群入口弹层（进站 / 获取链接拦截）
   src/api.js          接口封装
-  vite.config.js      dev 时 /api 代理到 8000
+  vite.config.js      dev 时 /api、/uploads 代理到 8000
 start.bat             生产模式：构建前端 + 单端口 8000
 start-dev.bat         开发模式：后端 8000 + 前端 5173
 ```
@@ -59,6 +61,10 @@ npm run dev
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/track` | 前端行为上报（内部用，见下节） |
 | POST | `/api/feedback` | 提交反馈 / 求资源 |
+| GET | `/api/group` | 群入口配置（进站/获取链接弹窗用，公开） |
+| GET | `/api/admin/group` | 读群入口配置，需 `X-Admin-Token` |
+| POST | `/api/admin/group` | 保存群入口配置（整包提交），需 `X-Admin-Token` |
+| POST | `/api/admin/group/upload` | 上传二维码图片（裸字节流，≤2MB），需 `X-Admin-Token` |
 | GET | `/api/admin/feedback?days=30&status=new` | 反馈列表，需 `X-Admin-Token` |
 | POST | `/api/admin/feedback/{id}` | 标记反馈状态，body `{"status":"done"}` |
 | GET | `/api/admin/stats?days=7` | 看板数据，需 `X-Admin-Token` |
@@ -193,6 +199,20 @@ sqlite3 backend/data/analytics.db \
 ```
 
 `FEEDBACK_ENABLED=false` 可以单独关掉反馈，不影响埋点——统计和工单是两件事，不该互相绑死。
+
+## 群入口（进站 / 获取链接弹二维码）
+
+两个触发点，配置全在 `/admin` 看板的「群入口配置」面板里改，**改完即时生效，不用重启**：
+
+| 触发点 | 行为 |
+|---|---|
+| 进站 | 页面打开后延迟（默认 800ms）弹一次；默认每次打开都弹，频率设为「每天一次」时按天抑制 |
+| 点「打开链接」 | **每次点击都弹**，弹窗里有「不进群了，直接打开资源」兜底，该出口只管这一次，下一条链接仍会弹 |
+| 页脚「进群交流」 | 手动入口，随时能看 |
+
+配置存在同一个 SQLite（`app_config` 表），支持最多 4 个群（QQ / 微信 / 其他），每个群可传二维码（落到 `backend/data/uploads/`，通过 `/uploads/<文件名>` 访问）、填群号（弹窗里可复制）、填手机端一键加群链接。`GROUP_ENABLED=false` 是总闸。
+
+点击行为记在埋点里，kind 是 `group`（show / close / copy_number / continue），看板流水里能看到。
 
 ## 已知问题
 

@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     feedback_enabled: bool = True
     feedback_rate_per_10min: int = 5   # 单 IP 十分钟提交上限
 
+    # ---- 群入口（进站 / 获取链接时弹二维码）----
+    # 配置存在同一个 SQLite 里，/admin 看板可改，这个开关是总闸。
+    group_enabled: bool = True
+
     # ---- 看板口令 ----
     # 留空时 /admin 只允许本机访问（经 Nginx 反代后就是谁都不行），
     # 部署到公网必须设一个，否则看板打不开。

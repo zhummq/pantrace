@@ -36,6 +36,21 @@ export function fetchPlatforms() {
   return request('/api/platforms')
 }
 
+// 群入口配置（二维码 / 群号 / 弹窗策略）。拉不到不影响搜索，前端只当没有。
+export async function fetchGroup() {
+  const res = await fetch(`${BASE}/api/group`, { headers: trackHeaders() })
+  let data = {}
+  try {
+    data = await res.json()
+  } catch {
+    throw new Error('服务返回格式异常')
+  }
+  if (!res.ok || data.code !== 0) {
+    throw new Error(data.msg || `请求失败（${res.status}）`)
+  }
+  return data
+}
+
 // 反馈 / 求资源。和搜索不同，失败要把服务端的原话给用户看——
 // "提交太快了"和"缺少必要信息"是两种完全不同的处理方式。
 export async function submitFeedback(payload) {

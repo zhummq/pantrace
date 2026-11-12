@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import secrets
 import time
 from pathlib import Path
 
@@ -19,7 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, feedback, providers
+from . import analytics, feedback, group, providers
 from .config import get_settings
 from .providers import UpstreamError
 
@@ -79,6 +80,24 @@ else:
     log.info("反馈工单已关闭（FEEDBACK_ENABLED=false）")
 
 ADMIN_HTML = Path(__file__).resolve().parent / "admin.html"
+
+# ---- 群入口（二维码弹窗）----
+# 图片落 backend/data/uploads/，前端通过 /uploads/<文件名> 访问。
+# 挂载点必须在下面那个 "/" 静态目录之前注册，否则会被前端路由吃掉。
+UPLOADS_DIR = Path(settings.analytics_path).parent / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+GROUP_ON = settings.group_enabled
+if GROUP_ON:
+    try:
+        group.init(settings.analytics_path)
+        log.info("群入口已启用：%s（当前 %s 个群）",
+                 settings.analytics_path, len(group.store().load().get("groups") or []))
+    except Exception as exc:  # noqa: BLE001
+        GROUP_ON = False
+        log.error("群入口初始化失败，已关闭：%s", exc)
+else:
+    log.info("群入口已关闭（GROUP_ENABLED=false）")
 
 
 def client_ip(request: Request) -> str:
@@ -547,6 +566,87 @@ async def admin_feedback_update(fid: int, payload: FeedbackUpdate, request: Requ
     return {"code": 0, "msg": "已更新"}
 
 
+@app.get("/api/group", include_in_schema=False)
+async def group_config():
+    """前端进站拉群入口配置。没有敏感字段，结构在 group.py 里定义。"""
+    if not GROUP_ON:
+        return {"code": 0, "enabled": False, "groups": []}
+    return {"code": 0, **group.store().public()}
+
+
+def _check_image(data: bytes) -> str | None:
+    """按魔数认格式，返回扩展名；不认识的直接拒。"""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+@app.post("/api/admin/group/upload", include_in_schema=False)
+async def admin_group_upload(request: Request):
+    """上传二维码图片。存 backend/data/uploads/，文件名带时间戳，前端拿到就能用。
+
+    收裸字节流而不是 multipart：省一个 python-multipart 依赖，
+    前端直接把文件本体 POST 上来，Content-Type 就是图片自己的。
+    """
+    if not GROUP_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "群入口已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    data = await request.body()
+    if not data:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "没有收到文件"})
+    if len(data) > 2 * 1024 * 1024:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "图片超过 2MB"})
+    ext = _check_image(data)
+    if not ext:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "只支持 jpg / png / gif / webp"})
+    name = f"qr-{int(time.time())}-{secrets.token_hex(4)}.{ext}"
+    (UPLOADS_DIR / name).write_bytes(data)
+    log.info("group qr uploaded: %s (%sKB)", name, len(data) // 1024)
+    return {"code": 0, "url": f"/uploads/{name}"}
+
+
+class GroupConfigIn(BaseModel):
+    """整包保存。前端把整个表单序列化后一次提交，不做增量合并。"""
+
+    model_config = {"extra": "allow"}  # 原样透传，字段校验在 group._validate 里做
+    enabled: bool = True
+    title: str = ""
+    desc: str = ""
+    tip: str = ""
+    popup: dict = Field(default_factory=dict)
+    groups: list[dict] = Field(default_factory=list)
+
+
+@app.get("/api/admin/group", include_in_schema=False)
+async def admin_group_get(request: Request):
+    if not GROUP_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "群入口已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    return {"code": 0, "data": group.store().load()}
+
+
+@app.post("/api/admin/group", include_in_schema=False)
+async def admin_group_save(payload: GroupConfigIn, request: Request):
+    if not GROUP_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "群入口已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        saved = group.store().save(payload.model_dump())
+    except Exception as exc:  # noqa: BLE001
+        log.exception("群配置保存失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存失败：{exc}"})
+    return {"code": 0, "data": saved, "msg": "已保存"}
+
+
 @app.get("/admin", include_in_schema=False)
 async def admin_page(request: Request):
     """看板页面。数据本身在 /api/admin/stats 后面，页面公开也不泄露东西。"""
@@ -566,7 +666,10 @@ DIST = (
     else Path(__file__).resolve().parents[2] / "frontend" / "dist"
 )
 if settings.serve_frontend and DIST.is_dir():
+    # 上传的二维码先挂，再挂前端兜底路由，顺序不能反
+    app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
     app.mount("/", StaticFiles(directory=str(DIST), html=True), name="web")
     log.info("serving frontend from %s", DIST)
 else:
+    app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
     log.info("frontend static hosting disabled; API only")

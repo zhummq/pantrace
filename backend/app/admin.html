@@ -163,6 +163,48 @@
   }
   .fb-btn:hover { border-color: #b7ddd5; color: var(--brand); }
 
+  /* 群入口配置 */
+  .grp-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); margin-bottom: 12px; }
+  .grp-row input[type="checkbox"] { width: 15px; height: 15px; }
+  .grp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px; }
+  .grp-grid3 { display: grid; grid-template-columns: 90px 1fr 1fr; gap: 10px; margin-bottom: 10px; align-items: end; }
+  @media (max-width: 720px) { .grp-grid, .grp-grid3 { grid-template-columns: 1fr; } }
+  .grp-grid label, .grp-grid3 label, .grp-line label {
+    display: flex; flex-direction: column; gap: 4px;
+    font-size: 11.5px; color: var(--muted);
+  }
+  .grp-grid input, .grp-grid3 input, .grp-grid3 select,
+  .grp-line input, .grp-line select {
+    height: 32px; border: 1px solid var(--line-strong); border-radius: 8px;
+    padding: 0 10px; font-size: 13px; font-family: inherit; outline: none; background: #fff;
+  }
+  .grp-grid input:focus, .grp-grid3 input:focus, .grp-grid3 select:focus, .grp-line input:focus { border-color: #8fc9bd; }
+  .grp-item { border: 1px solid var(--line); border-radius: 10px; padding: 12px; margin-bottom: 10px; background: #fcfdfe; }
+  .grp-qr-row { display: flex; gap: 12px; align-items: flex-start; margin-top: 10px; flex-wrap: wrap; }
+  .grp-qr-prev {
+    width: 92px; height: 92px; border: 1px solid var(--line-strong); border-radius: 10px;
+    object-fit: cover; background: #fff; flex-shrink: 0;
+  }
+  .grp-qr-fields { flex: 1; min-width: 200px; display: flex; flex-direction: column; gap: 8px; }
+  .grp-line { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
+  .grp-line label { flex: 1; min-width: 140px; }
+  .grp-btn {
+    height: 30px; padding: 0 12px; font-size: 12px; border-radius: 8px;
+    border: 1px solid var(--line-strong); background: #fff; color: var(--ink-2);
+    cursor: pointer; font-family: inherit;
+  }
+  .grp-btn:hover { border-color: #b7ddd5; color: var(--brand); }
+  .grp-btn.danger:hover { border-color: #f0c2bd; color: var(--red); }
+  .grp-add { margin: 4px 0 14px; }
+  .grp-actions { display: flex; align-items: center; gap: 12px; }
+  .grp-save {
+    height: 36px; padding: 0 22px; border: 0; border-radius: 10px;
+    background: var(--ink); color: #fff; font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  .grp-save:hover { background: #1e293b; }
+  .grp-msg { font-size: 12.5px; color: var(--brand); }
+  .grp-msg.err { color: var(--red); }
+
   .gate {
     position: fixed; inset: 0; background: rgba(244, 246, 249, 0.94);
     display: grid; place-items: center; z-index: 50; backdrop-filter: blur(4px);
@@ -222,6 +264,41 @@
       <div class="rank" style="margin-top:16px">
         <h2>反馈明细 <span id="fb-hint"></span></h2>
         <div id="fb-list"></div>
+      </div>
+    </div>
+  </details>
+
+  <!-- 群入口：改二维码 / 群号 / 弹窗策略，保存后前端即时生效，不用重启 -->
+  <details class="panel" id="grp-panel">
+    <summary>群入口配置 <span class="tag">改二维码 / 群号 / 弹窗</span><span class="arrow">▾</span></summary>
+    <div class="body">
+      <label class="grp-row"><input type="checkbox" id="grp-enabled" /> 启用群入口（进站弹窗 + 获取链接拦截 + 页脚入口）</label>
+
+      <div class="grp-grid">
+        <label>弹窗标题<input id="grp-title" maxlength="40" /></label>
+        <label>一句说明（弹窗里的小字）<input id="grp-desc" maxlength="120" /></label>
+        <label>扫码提示语<input id="grp-tip" maxlength="80" /></label>
+        <div class="grp-grid3" style="margin-bottom:0">
+          <label>进站弹窗<select id="grp-enter"><option value="1">开</option><option value="0">关</option></select></label>
+          <label>获取链接时拦截<select id="grp-acquire"><option value="1">开</option><option value="0">关</option></select></label>
+          <label>进站弹窗频率<select id="grp-once">
+            <option value="session">每次打开页面一次</option>
+            <option value="day">每天一次</option>
+            <option value="always">每次都弹</option>
+          </select></label>
+        </div>
+      </div>
+      <div class="grp-grid" style="grid-template-columns:1fr">
+        <label>进站延迟（毫秒，进站后多久弹）<input id="grp-delay" type="number" min="0" max="10000" step="100" /></label>
+      </div>
+
+      <h2 style="margin:14px 0 10px;font-size:13.5px;font-weight:600">群列表 <span style="font-size:11.5px;color:var(--faint);font-weight:400;margin-left:6px">最多 4 个，可放 QQ 群 / 微信群</span></h2>
+      <div id="grp-groups"></div>
+      <button class="grp-btn grp-add" id="grp-add">＋ 加一个群</button>
+
+      <div class="grp-actions">
+        <button class="grp-save" id="grp-save">保存配置</button>
+        <span class="grp-msg" id="grp-msg"></span>
       </div>
     </div>
   </details>
@@ -310,7 +387,8 @@
   };
   var KIND_NAMES = {
     pv: '打开', leave: '离开', search: '搜索', click: '点开',
-    copy_pwd: '复制码', filter: '换平台', page: '翻页', retry: '重试'
+    copy_pwd: '复制码', filter: '换平台', page: '翻页', retry: '重试',
+    group: '进群'
   };
 
   function $(id) { return document.getElementById(id); }
@@ -654,6 +732,167 @@
     html += '</tbody></table>';
     el.innerHTML = html;
   }
+
+  // ---------------- 群入口配置 ----------------
+  var GRP_TYPES = [['qq', 'QQ 群'], ['wechat', '微信群'], ['other', '其他']];
+  var grpLoaded = false;
+
+  function grpHeaders(json) {
+    var h = {};
+    var t = token();
+    if (t) h['x-admin-token'] = t;
+    if (json) h['content-type'] = 'application/json';
+    return h;
+  }
+
+  function grpMsg(text, isErr) {
+    var el = $('grp-msg');
+    el.textContent = text;
+    el.className = 'grp-msg' + (isErr ? ' err' : '');
+    if (text) setTimeout(function () { el.textContent = ''; }, 4000);
+  }
+
+  function loadGroup(silent) {
+    fetch('/api/admin/group', { headers: grpHeaders(false) })
+      .then(function (res) { return res.json(); })
+      .then(function (b) {
+        if (b && b.code === 0) { renderGroup(b.data || {}); grpLoaded = true; }
+        else if (!silent) grpMsg((b && b.msg) || '读取失败', true);
+      })
+      .catch(function (e) { if (!silent) grpMsg('读取失败：' + e.message, true); });
+  }
+
+  function renderGroup(d) {
+    $('grp-enabled').checked = d.enabled !== false;
+    $('grp-title').value = d.title || '';
+    $('grp-desc').value = d.desc || '';
+    $('grp-tip').value = d.tip || '';
+    var p = d.popup || {};
+    $('grp-enter').value = p.enter === false ? '0' : '1';
+    $('grp-acquire').value = p.acquire === false ? '0' : '1';
+    $('grp-once').value = p.once || 'session';
+    $('grp-delay').value = Number(p.delay) || 800;
+    renderGrpItems(d.groups || []);
+  }
+
+  function grpItemHtml(g) {
+    var opts = GRP_TYPES.map(function (t) {
+      return '<option value="' + t[0] + '"' + (g.type === t[0] ? ' selected' : '') + '>' + t[1] + '</option>';
+    }).join('');
+    return '<div class="grp-item">' +
+      '<div class="grp-grid3">' +
+      '<label>类型<select class="g-type">' + opts + '</select></label>' +
+      '<label>名称<input class="g-name" maxlength="40" value="' + esc(g.name || '') + '" /></label>' +
+      '<label>群号 / 微信号<input class="g-number" maxlength="40" value="' + esc(g.number || '') + '" /></label>' +
+      '</div>' +
+      '<div class="grp-qr-row">' +
+      '<img class="grp-qr-prev g-prev" src="' + esc(g.qr || '') + '" onerror="this.style.visibility=\'hidden\'" />' +
+      '<div class="grp-qr-fields">' +
+      '<div class="grp-line">' +
+      '<label>二维码图片地址<input class="g-qr" placeholder="/uploads/qr-xxx.png 或 https://…" value="' + esc(g.qr || '') + '" /></label>' +
+      '<label class="g-upload-label" style="flex:0 0 auto;justify-content:flex-end"><input type="file" class="g-upload" accept="image/*" hidden /><button type="button" class="grp-btn g-upload-btn">上传图片</button></label>' +
+      '</div>' +
+      '<div class="grp-line">' +
+      '<label>手机端一键加群链接（选填）<input class="g-link" placeholder="https://qm.qq.com/…" value="' + esc(g.link || '') + '" /></label>' +
+      '<label>备注（替换扫码提示语）<input class="g-note" maxlength="60" value="' + esc(g.note || '') + '" /></label>' +
+      '</div>' +
+      '<div class="grp-line">' +
+      '<label style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" class="g-on"' + (g.enabled !== false ? ' checked' : '') + ' /> 启用这个群</label>' +
+      '<button type="button" class="grp-btn danger g-del" style="margin-left:auto">删除这个群</button>' +
+      '</div>' +
+      '</div>' +
+      '</div>' +
+      '</div>';
+  }
+
+  function renderGrpItems(groups) {
+    var box = $('grp-groups');
+    box.innerHTML = groups.map(grpItemHtml).join('');
+    Array.prototype.forEach.call(box.querySelectorAll('.grp-item'), function (item) {
+      var file = item.querySelector('.g-upload');
+      item.querySelector('.g-upload-btn').addEventListener('click', function () { file.click(); });
+      file.addEventListener('change', function () {
+        if (!file.files || !file.files[0]) return;
+        grpMsg('上传中…');
+        // 直接 POST 文件本体（裸字节流），后端不依赖 multipart
+        fetch('/api/admin/group/upload', { method: 'POST', headers: grpHeaders(false), body: file.files[0] })
+          .then(function (res) { return res.json(); })
+          .then(function (b) {
+            if (b && b.code === 0) {
+              item.querySelector('.g-qr').value = b.url;
+              var prev = item.querySelector('.g-prev');
+              prev.src = b.url;
+              prev.style.visibility = 'visible';
+              grpMsg('上传成功，记得点保存');
+            } else {
+              grpMsg((b && b.msg) || '上传失败', true);
+            }
+          })
+          .catch(function (e) { grpMsg('上传失败：' + e.message, true); });
+      });
+      item.querySelector('.g-del').addEventListener('click', function () { item.remove(); });
+      var qrInput = item.querySelector('.g-qr');
+      qrInput.addEventListener('change', function () {
+        var prev = item.querySelector('.g-prev');
+        prev.src = qrInput.value;
+        prev.style.visibility = qrInput.value ? 'visible' : 'hidden';
+      });
+    });
+  }
+
+  $('grp-add').addEventListener('click', function () {
+    if ($('grp-groups').querySelectorAll('.grp-item').length >= 4) {
+      grpMsg('最多 4 个群', true);
+      return;
+    }
+    var tmp = document.createElement('div');
+    tmp.innerHTML = grpItemHtml({ type: 'qq', enabled: true });
+    $('grp-groups').appendChild(tmp.firstChild);
+    renderGrpItems(collectGroups()); // 重新绑定一遍事件，顺便保留已填内容
+  });
+
+  function collectGroups() {
+    return Array.prototype.map.call($('grp-groups').querySelectorAll('.grp-item'), function (item) {
+      return {
+        type: item.querySelector('.g-type').value,
+        name: item.querySelector('.g-name').value.trim(),
+        number: item.querySelector('.g-number').value.trim(),
+        qr: item.querySelector('.g-qr').value.trim(),
+        link: item.querySelector('.g-link').value.trim(),
+        note: item.querySelector('.g-note').value.trim(),
+        enabled: item.querySelector('.g-on').checked,
+      };
+    });
+  }
+
+  $('grp-save').addEventListener('click', function () {
+    var payload = {
+      enabled: $('grp-enabled').checked,
+      title: $('grp-title').value.trim(),
+      desc: $('grp-desc').value.trim(),
+      tip: $('grp-tip').value.trim(),
+      popup: {
+        enter: $('grp-enter').value === '1',
+        acquire: $('grp-acquire').value === '1',
+        once: $('grp-once').value,
+        delay: Number($('grp-delay').value) || 800,
+      },
+      groups: collectGroups(),
+    };
+    grpMsg('保存中…');
+    fetch('/api/admin/group', { method: 'POST', headers: grpHeaders(true), body: JSON.stringify(payload) })
+      .then(function (res) { return res.json(); })
+      .then(function (b) {
+        if (b && b.code === 0) { renderGroup(b.data || {}); grpMsg('已保存，前端下次进站生效'); }
+        else grpMsg((b && b.msg) || '保存失败', true);
+      })
+      .catch(function (e) { grpMsg('保存失败：' + e.message, true); });
+  });
+
+  // 群面板第一次展开时才拉配置，平时不浪费请求
+  $('grp-panel').addEventListener('toggle', function () {
+    if (this.open && !grpLoaded) loadGroup(true);
+  });
 
   // ---------------- 交互 ----------------
   Array.prototype.forEach.call($('range').querySelectorAll('button'), function (btn) {
