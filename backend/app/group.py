@@ -78,10 +78,15 @@ def _validate(cfg: dict) -> dict:
     }
     popup = cfg.get("popup") if isinstance(cfg.get("popup"), dict) else {}
     once = popup.get("once") or "session"
+    # 注意别写 `popup.get("delay") or 800`：填 0（立刻弹）会变成 800
+    try:
+        delay = int(popup.get("delay", 800))
+    except (TypeError, ValueError):
+        delay = 800
     out["popup"] = {
         "enter": bool(popup.get("enter", True)),
         "acquire": bool(popup.get("acquire", True)),
-        "delay": min(max(int(popup.get("delay") or 800), 0), 10000),
+        "delay": min(max(delay, 0), 10000),
         "once": once if once in ("session", "day", "always") else "session",
     }
 

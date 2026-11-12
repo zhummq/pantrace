@@ -244,31 +244,33 @@ onMounted(async () => {
   // 埋点先于一切初始化：页面打开就算一次访问，后面接口失败也不影响计数
   initTracking()
 
-  try {
-    const data = await fetchPlatforms()
-    platforms.value = data.platforms || []
-  } catch {
-    /* 平台列表拉不到不影响搜索，前端会自动使用返回里的 platformName */
-  }
+  // 平台列表与群配置并行拉：原先串行（先等平台列表返回才发群配置请求），
+  // 进站弹窗要白白多等一个 RTT，800ms 延迟叠上去就明显觉得"卡了一下"。
+  const [platformsData, groupData] = await Promise.all([
+    fetchPlatforms().catch(() => ({ platforms: [] })),
+    fetchGroup().catch(() => null),
+  ])
+  platforms.value = platformsData.platforms || []
 
   // 群配置：拉不到就当没有，不影响主流程
-  try {
-    const data = await fetchGroup()
-    if (data.enabled !== false && (data.groups || []).some((g) => g.enabled !== false)) {
-      groupCfg.value = data
-      const popup = data.popup || {}
-      // 进站弹窗：默认每次打开都弹；once=day 时才按天抑制。
-      // 点链接的拦截（acquire）不在这里，它每次点击都会弹。
-      if (popup.enter && !enterSeenRecently()) {
-        const delay = Math.min(Math.max(Number(popup.delay) || 800, 0), 10000)
-        setTimeout(() => {
-          // 用户可能在这零点几秒里已经点开弹窗了，别叠两个
-          if (!groupOpen.value && !fbOpen.value) openGroup('enter')
-        }, delay)
-      }
+  if (
+    groupData &&
+    groupData.enabled !== false &&
+    (groupData.groups || []).some((g) => g.enabled !== false)
+  ) {
+    groupCfg.value = groupData
+    const popup = groupData.popup || {}
+    // 进站弹窗：默认每次打开都弹；once=day 时才按天抑制。
+    // 点链接的拦截（acquire）不在这里，它每次点击都会弹。
+    if (popup.enter && !enterSeenRecently()) {
+      // 不能用 `Number(delay) || 800`：填 0（立刻弹）会被当成空值回退成 800
+      const raw = Number(popup.delay)
+      const delay = Math.min(Math.max(Number.isFinite(raw) ? raw : 800, 0), 10000)
+      setTimeout(() => {
+        // 用户可能在这零点几秒里已经点开弹窗了，别叠两个
+        if (!groupOpen.value && !fbOpen.value) openGroup('enter')
+      }, delay)
     }
-  } catch {
-    /* 群入口失败不影响搜索 */
   }
 
   const params = new URLSearchParams(location.search)

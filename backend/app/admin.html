@@ -771,7 +771,8 @@
     $('grp-enter').value = p.enter === false ? '0' : '1';
     $('grp-acquire').value = p.acquire === false ? '0' : '1';
     $('grp-once').value = p.once || 'session';
-    $('grp-delay').value = Number(p.delay) || 800;
+    const d = Number(p.delay);
+    $('grp-delay').value = Number.isFinite(d) ? d : 800;
     renderGrpItems(d.groups || []);
   }
 
@@ -875,7 +876,7 @@
         enter: $('grp-enter').value === '1',
         acquire: $('grp-acquire').value === '1',
         once: $('grp-once').value,
-        delay: Number($('grp-delay').value) || 800,
+        delay: (() => { const n = Number($('grp-delay').value); return Number.isFinite(n) ? n : 800 })(),
       },
       groups: collectGroups(),
     };
