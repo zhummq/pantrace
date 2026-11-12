@@ -1,8 +1,9 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import ResultCard from './components/ResultCard.vue'
 import FeedbackDialog from './components/FeedbackDialog.vue'
-import { fetchPlatforms, searchResources } from './api.js'
+import QqGroupDialog from './components/QqGroupDialog.vue'
+import { fetchPlatforms, fetchGroup, searchResources } from './api.js'
 import { initTracking, track } from './track.js'
 
 const PAGE_SIZE = 20
@@ -19,10 +20,19 @@ const total = ref(0)
 const tookMs = ref(0)
 
 const loading = ref(false)
+// 等 40 秒的时候，一个跳动的秒数比一句"加载中"有用得多
+const elapsed = ref(0)
+let elapsedTimer = null
+
 const error = ref('')
 const searched = ref(false)
 
 const showEmpty = computed(() => !loading.value && !error.value && searched.value && items.value.length === 0)
+const sourceCount = computed(() => platforms.value.length)
+
+const totalText = computed(() =>
+  total.value > 0 ? total.value.toLocaleString('zh-CN') : String(total.value)
+)
 
 // ---- 反馈 / 求资源 ----
 // 一个弹层三种形态，共用一个提交接口。上下文（当前关键词、这条结果）
@@ -41,6 +51,82 @@ function openFeedback(mode, payload = {}) {
 
 function closeFeedback() {
   fbOpen.value = false
+}
+
+// ---- 群入口（进站弹一次 / 点开链接时拦一次）----
+// 配置从 /api/group 拉，/admin 看板可改，前端不写死。
+// 「once」策略由后端下发：session=每会话一次 / day=每天一次 / always=每次都弹。
+const groupCfg = ref(null)
+const groupOpen = ref(false)
+const groupMode = ref('enter')
+const pendingUrl = ref('')
+
+const groupIntercept = computed(() => {
+  const cfg = groupCfg.value
+  return !!(cfg?.enabled && cfg?.popup?.acquire)
+})
+
+// 拦截弹窗（acquire）：每次点「打开链接」都弹，不做任何"看过了就放行"的记忆。
+// 早先这里按会话记标记，同一标签页点过一次之后连刷新都再也不弹，看起来跟坏了一样；
+// 而"本页只弹一次"又会让第二个链接被静默放行——两种都不对。宁可多点一次。
+// 想直接走的人，弹窗里一直有「不进群了，直接打开资源」的出口。
+
+// 进站弹窗的重复控制：session=每次打开页面弹（默认），day=每天只弹一次，
+// always=每次打开都弹。session 与 always 在"一个页面生命周期只挂载一次"的前提下等价，
+// 保留两个值只是为了不改动后台已存的配置。
+function enterSeenRecently() {
+  const once = groupCfg.value?.popup?.once || 'session'
+  if (once !== 'day') return false
+  try {
+    const t = Number(localStorage.getItem('pt_group_enter') || 0)
+    return Date.now() - t < 86400000
+  } catch {
+    return false
+  }
+}
+
+function markEnterSeen() {
+  if ((groupCfg.value?.popup?.once || 'session') !== 'day') return
+  try {
+    localStorage.setItem('pt_group_enter', String(Date.now()))
+  } catch {
+    /* 隐私模式拿不到 storage 就当没看过，多弹一次不是大事 */
+  }
+}
+
+function openGroup(mode, url = '') {
+  if (mode === 'enter') markEnterSeen()
+  groupMode.value = mode
+  pendingUrl.value = url
+  groupOpen.value = true
+  track('group', { meta: { action: 'show', mode } })
+}
+
+function closeGroup() {
+  groupOpen.value = false
+}
+
+function groupContinue() {
+  // 拦截弹窗里点了「直接打开资源」：补发跳转，弹窗关掉
+  const url = pendingUrl.value
+  groupOpen.value = false
+  pendingUrl.value = ''
+  if (url) window.open(url, '_blank', 'noopener')
+}
+
+function showGroupManual() {
+  openGroup('enter')
+}
+
+// 打开链接的拦截：每次都先看群，弹窗里可「不进群了，直接打开资源」放行这一次
+function handleOpen(item) {
+  const url = /^https?:\/\//i.test(item.shareUrl || '') ? item.shareUrl : ''
+  if (!url) return
+  if (groupIntercept.value) {
+    openGroup('acquire', url)
+    return
+  }
+  window.open(url, '_blank', 'noopener')
 }
 
 const pageWindow = computed(() => {
@@ -73,6 +159,12 @@ async function doSearch(targetPage = 1) {
   page.value = targetPage
   lastKeyword.value = q
 
+  elapsed.value = 0
+  if (elapsedTimer) clearInterval(elapsedTimer)
+  elapsedTimer = setInterval(() => {
+    elapsed.value += 1
+  }, 1000)
+
   try {
     const data = await searchResources({
       q,
@@ -93,6 +185,10 @@ async function doSearch(targetPage = 1) {
     error.value = e.message || '搜索失败，请稍后重试'
   } finally {
     loading.value = false
+    if (elapsedTimer) {
+      clearInterval(elapsedTimer)
+      elapsedTimer = null
+    }
   }
 }
 
@@ -122,6 +218,13 @@ function retry() {
   doSearch(page.value)
 }
 
+function resetHome() {
+  keyword.value = ''
+  searched.value = false
+  activePlatform.value = ''
+  history.replaceState(null, '', '/')
+}
+
 onMounted(async () => {
   // 埋点先于一切初始化：页面打开就算一次访问，后面接口失败也不影响计数
   initTracking()
@@ -133,6 +236,26 @@ onMounted(async () => {
     /* 平台列表拉不到不影响搜索，前端会自动使用返回里的 platformName */
   }
 
+  // 群配置：拉不到就当没有，不影响主流程
+  try {
+    const data = await fetchGroup()
+    if (data.enabled !== false && (data.groups || []).some((g) => g.enabled !== false)) {
+      groupCfg.value = data
+      const popup = data.popup || {}
+      // 进站弹窗：默认每次打开都弹；once=day 时才按天抑制。
+      // 点链接的拦截（acquire）不在这里，它每次点击都会弹。
+      if (popup.enter && !enterSeenRecently()) {
+        const delay = Math.min(Math.max(Number(popup.delay) || 800, 0), 10000)
+        setTimeout(() => {
+          // 用户可能在这零点几秒里已经点开弹窗了，别叠两个
+          if (!groupOpen.value && !fbOpen.value) openGroup('enter')
+        }, delay)
+      }
+    }
+  } catch {
+    /* 群入口失败不影响搜索 */
+  }
+
   const params = new URLSearchParams(location.search)
   const q = params.get('q')
   if (q) {
@@ -141,35 +264,46 @@ onMounted(async () => {
     doSearch(Number(params.get('page')) || 1)
   }
 })
+
+onBeforeUnmount(() => {
+  if (elapsedTimer) clearInterval(elapsedTimer)
+})
 </script>
 
 <template>
   <div class="page">
     <header class="topbar">
       <div class="wrap topbar-inner">
-        <a class="brand" href="/" @click.prevent="keyword = ''; searched = false; activePlatform = ''; history.replaceState(null, '', '/')">
+        <a class="brand" href="/" @click.prevent="resetHome">
           <span class="logo">
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
               <circle cx="11" cy="11" r="7" />
               <path d="m20 20-3.6-3.6" />
             </svg>
           </span>
-          <span class="brand-text">盘迹<em>PanTrace</em></span>
+          <span class="brand-text">盘迹<em>PANTRACE</em></span>
         </a>
-        <nav class="nav">
-          <span class="nav-tag">PanTrace</span>
-        </nav>
+        <div class="topbar-right">
+          <span class="status mono">
+            <i class="status-dot"></i>
+            {{ sourceCount ? `${sourceCount} SOURCES` : 'SYNC' }}
+          </span>
+        </div>
       </div>
     </header>
 
     <section class="hero" :class="{ compact: searched }">
+      <div class="hero-deco" aria-hidden="true"></div>
       <div class="wrap hero-inner">
-        <h1 v-if="!searched" class="title">盘迹</h1>
-        <p v-if="!searched" class="subtitle">一次搜索，翻遍所有网盘</p>
+        <template v-if="!searched">
+          <p class="eyebrow mono"><span class="tick"></span>SEARCH / 全网网盘聚合</p>
+          <h1 class="title">盘迹</h1>
+          <p class="subtitle">一次搜索，翻遍所有网盘</p>
+        </template>
 
-        <form class="searchbar" @submit.prevent="doSearch(1)">
-          <span class="search-icon">
-            <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+        <form class="searchbar" :class="{ loading }" @submit.prevent="doSearch(1)">
+          <span class="search-icon" aria-hidden="true">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
               <circle cx="11" cy="11" r="7" />
               <path d="m20 20-3.6-3.6" />
             </svg>
@@ -177,19 +311,33 @@ onMounted(async () => {
           <input
             v-model="keyword"
             type="search"
-            placeholder="输入片名、剧名或资源关键词…"
+            placeholder="输入片名、剧名或资源关键词"
             autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+            enterkeyhint="search"
             maxlength="100"
+            aria-label="搜索关键词"
           />
+          <kbd class="kbd mono" aria-hidden="true">↵</kbd>
           <button type="submit" :disabled="loading || !keyword.trim()">
             {{ loading ? '搜索中' : '搜索' }}
           </button>
+          <span v-if="loading" class="scanline" aria-hidden="true"></span>
         </form>
+
+        <div v-if="!searched" class="hero-meta mono">
+          <span>{{ sourceCount ? `${sourceCount} 个来源` : '来源同步中' }}</span>
+          <i>/</i>
+          <span>首次查询 10–60s</span>
+          <i>/</i>
+          <span>结果实时聚合</span>
+        </div>
       </div>
     </section>
 
     <main class="wrap content">
-      <div class="filters">
+      <div class="filters" role="group" aria-label="平台筛选">
         <button class="chip" :class="{ on: activePlatform === '' }" @click="pickPlatform('')">全部平台</button>
         <button
           v-for="p in platforms"
@@ -203,11 +351,18 @@ onMounted(async () => {
         </button>
       </div>
 
-      <div v-if="loading" class="skeleton-list">
-        <p class="loading-hint">正在聚合各平台结果，首次查询可能需要 10–60 秒…</p>
-        <div v-for="i in 5" :key="i" class="skeleton">
-          <div class="sk-line w60"></div>
-          <div class="sk-line w30"></div>
+      <div v-if="loading" class="scan-state">
+        <div class="scan-head">
+          <span class="scan-label mono">SCANNING</span>
+          <span class="scan-count mono" v-if="elapsed">{{ elapsed }}s</span>
+        </div>
+        <p class="loading-hint">正在聚合各平台结果，首次查询可能需要 10–60 秒。</p>
+        <div class="scan-track" aria-hidden="true"><i></i></div>
+        <div class="skeleton-list">
+          <div v-for="i in 4" :key="i" class="skeleton">
+            <div class="sk-line w60"></div>
+            <div class="sk-line w30"></div>
+          </div>
         </div>
       </div>
 
@@ -233,12 +388,13 @@ onMounted(async () => {
       </div>
 
       <template v-else-if="items.length">
-        <div class="result-head">
-          <span>找到约 <b>{{ total }}</b> 条结果</span>
-          <span class="divider">·</span>
-          <span>{{ tookMs }} ms</span>
-          <span v-if="totalPages > 1" class="divider">·</span>
-          <span v-if="totalPages > 1">第 {{ page }} / {{ totalPages }} 页</span>
+        <div class="result-head mono">
+          <span class="rh-label">RESULT</span>
+          <span class="rh-num">{{ totalText }}</span>
+          <span class="rh-sep">/</span>
+          <span>{{ tookMs }}ms</span>
+          <span class="rh-sep">/</span>
+          <span>第 {{ page }} 页 · 共 {{ totalPages }} 页</span>
         </div>
 
         <div class="result-list">
@@ -247,7 +403,9 @@ onMounted(async () => {
             :key="item.hsid || item.shareUrl"
             :item="item"
             :keyword="lastKeyword"
+            :intercept="groupIntercept"
             @feedback="openFeedback('result', { item: $event })"
+            @open="handleOpen"
           />
         </div>
 
@@ -262,17 +420,17 @@ onMounted(async () => {
           >
             {{ p }}
           </button>
+          <span class="pg-info mono">{{ page }} / {{ totalPages }}</span>
           <button class="pg" :disabled="page >= totalPages" @click="goPage(page + 1)">下一页</button>
         </div>
       </template>
     </main>
 
     <footer class="footer">
-      <div class="wrap">
-        <span>盘迹 PanTrace</span>
-        <span class="dot"></span>
-        <span>资源均来自第三方分享，本站不存储任何文件</span>
+      <div class="wrap footer-inner">
+        <span class="footer-brand mono">PANTRACE · 资源均来自第三方分享，本站不存储任何文件</span>
         <span class="footer-links">
+          <button class="link" @click="showGroupManual">进群交流</button>
           <button class="link" @click="openFeedback('request')">求资源</button>
           <button class="link" @click="openFeedback('bug')">反馈问题</button>
         </span>
@@ -287,30 +445,40 @@ onMounted(async () => {
       :error-text="fbError"
       @close="closeFeedback"
     />
+
+    <QqGroupDialog
+      :open="groupOpen"
+      :mode="groupMode"
+      :config="groupCfg"
+      @close="closeGroup"
+      @continue="groupContinue"
+    />
   </div>
 </template>
 
 <style scoped>
 .page {
-  min-height: 100vh;
   display: flex;
   flex-direction: column;
+  min-height: 100vh;
+  min-height: 100dvh;
 }
 
 .wrap {
   width: 100%;
-  max-width: 920px;
+  max-width: 960px;
   margin: 0 auto;
   padding: 0 24px;
 }
 
-/* 顶栏 */
+/* ---------- 顶栏 ---------- */
 .topbar {
   position: sticky;
   top: 0;
-  z-index: 20;
-  background: rgba(245, 247, 249, 0.82);
-  backdrop-filter: blur(12px);
+  z-index: 30;
+  background: rgba(245, 247, 249, 0.88);
+  backdrop-filter: saturate(150%) blur(14px);
+  -webkit-backdrop-filter: saturate(150%) blur(14px);
   border-bottom: 1px solid var(--line);
 }
 
@@ -318,182 +486,347 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 12px;
   height: 60px;
 }
 
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 9px;
+  gap: 10px;
+  min-width: 0;
 }
 
 .logo {
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: var(--radius-sm);
   background: var(--ink);
   color: #fff;
 }
 
 .brand-text {
-  font-size: 16px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
 }
 
 .brand-text em {
+  font-family: var(--mono);
   font-style: normal;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 500;
-  color: var(--muted);
-  margin-left: 7px;
-  letter-spacing: 0.6px;
+  letter-spacing: 0.16em;
+  color: var(--faint);
+  margin-left: 9px;
 }
 
-.nav-tag {
-  font-size: 12px;
-  color: var(--muted);
-  border: 1px solid var(--line-strong);
-  padding: 3px 10px;
-  border-radius: 999px;
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
-/* Hero */
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 169, 157, 0.14);
+  animation: pulse 2.6s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ---------- 首屏 ---------- */
 .hero {
   position: relative;
-  padding: 96px 0 56px;
-  background:
-    radial-gradient(55% 70% at 50% 0%, rgba(11, 122, 107, 0.07), transparent 70%),
-    linear-gradient(var(--bg), var(--bg));
+  isolation: isolate;
+  padding: 88px 0 48px;
+  background: linear-gradient(180deg, #fbfcfd 0%, var(--bg) 100%);
+  border-bottom: 1px solid var(--line);
 }
 
-.hero.compact {
-  padding: 24px 0 16px;
+/* 网格刻度：只在首屏出现，向下淡出，像是仪器的底板 */
+.hero-deco {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-image:
+    linear-gradient(to right, rgba(11, 16, 23, 0.045) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(11, 16, 23, 0.045) 1px, transparent 1px);
+  background-size: 56px 56px;
+  -webkit-mask-image: radial-gradient(72% 94% at 50% 0%, #000 0%, transparent 76%);
+  mask-image: radial-gradient(72% 94% at 50% 0%, #000 0%, transparent 76%);
 }
 
 .hero-inner {
   text-align: center;
 }
 
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 18px;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--faint);
+  text-transform: uppercase;
+}
+
+.eyebrow .tick {
+  width: 22px;
+  height: 1px;
+  background: var(--line-2);
+}
+
 .title {
   margin: 0 0 14px;
-  font-size: 46px;
-  line-height: 1.2;
-  font-weight: 700;
-  letter-spacing: 6px;
-  text-indent: 6px; /* 视觉居中：抵消 letter-spacing 右侧多出的空隙 */
+  font-size: clamp(38px, 6vw, 52px);
+  line-height: 1.1;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-indent: 0.2em; /* 抵消字距在右侧多出的空隙，视觉居中 */
   color: var(--ink);
 }
 
 .subtitle {
-  margin: 0 auto 44px;
+  margin: 0 auto 38px;
   max-width: 520px;
-  font-size: 15px;
+  font-size: 14.5px;
   font-weight: 400;
-  letter-spacing: 0.4px;
+  letter-spacing: 0.06em;
   color: var(--muted);
 }
 
+/* 搜索条 */
 .searchbar {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
-  max-width: 620px;
+  max-width: 640px;
   margin: 0 auto;
-  padding: 6px 6px 6px 16px;
+  padding: 6px 6px 6px 14px;
   background: var(--surface);
-  border: 1px solid var(--line-strong);
-  border-radius: 14px;
-  box-shadow: var(--shadow-md);
-  transition: border-color 0.2s, box-shadow 0.2s;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+/* 四个角的定位标记：仪器取景框那味道，只在聚焦时亮 */
+.searchbar::before,
+.searchbar::after {
+  content: '';
+  position: absolute;
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--accent);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.searchbar::before {
+  top: -4px;
+  left: -4px;
+  border-right: 0;
+  border-bottom: 0;
+}
+
+.searchbar::after {
+  right: -4px;
+  bottom: -4px;
+  border-left: 0;
+  border-top: 0;
 }
 
 .searchbar:focus-within {
-  border-color: #8fc9bd;
-  box-shadow: 0 12px 36px -14px rgba(11, 122, 107, 0.28);
+  border-color: var(--ink-2);
+  box-shadow: 0 0 0 3px rgba(0, 169, 157, 0.1), var(--shadow-md);
+}
+
+.searchbar:focus-within::before,
+.searchbar:focus-within::after {
+  opacity: 1;
 }
 
 .search-icon {
   display: grid;
   place-items: center;
-  color: var(--muted);
   flex-shrink: 0;
+  color: var(--faint);
 }
 
 .searchbar input {
   flex: 1;
   min-width: 0;
+  padding: 9px 0;
   border: none;
   outline: none;
   background: transparent;
   font-size: 15px;
   color: var(--ink);
-  padding: 10px 0;
 }
 
 .searchbar input::placeholder {
-  color: #9aa8bb;
+  color: var(--faint);
 }
 
 .searchbar input::-webkit-search-cancel-button {
   cursor: pointer;
 }
 
+.kbd {
+  flex-shrink: 0;
+  padding: 1px 5px;
+  font-size: 10px;
+  color: var(--faint);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  line-height: 1.5;
+}
+
 .searchbar button {
   flex-shrink: 0;
-  height: 40px;
-  padding: 0 24px;
+  height: 38px;
+  padding: 0 22px;
   border: none;
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: var(--ink);
   color: #fff;
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 500;
-  letter-spacing: 0.3px;
-  transition: background 0.16s;
+  letter-spacing: 0.08em;
+  transition: background 0.16s ease, opacity 0.16s ease;
 }
 
 .searchbar button:hover:not(:disabled) {
-  background: #1e293b;
+  background: #1b2430;
 }
 
 .searchbar button:disabled {
-  opacity: 0.45;
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
-/* 内容区 */
+/* 搜索时沿下沿走的一道光，比转圈更安静 */
+.scanline {
+  position: absolute;
+  left: 8px;
+  bottom: -1px;
+  width: 34%;
+  height: 1.5px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: scan 1.5s linear infinite;
+}
+
+@keyframes scan {
+  0% {
+    transform: translateX(-30%);
+    opacity: 0;
+  }
+  20%,
+  80% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(240%);
+    opacity: 0;
+  }
+}
+
+.hero-meta {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--faint);
+}
+
+.hero-meta i {
+  font-style: normal;
+  color: var(--line-2);
+}
+
+/* 已搜索：搜索条吸顶，翻长列表随时能改词 */
+.hero.compact {
+  position: sticky;
+  top: 60px;
+  z-index: 20;
+  padding: 10px 0;
+  background: rgba(245, 247, 249, 0.92);
+  backdrop-filter: saturate(150%) blur(14px);
+  -webkit-backdrop-filter: saturate(150%) blur(14px);
+}
+
+.hero.compact .hero-deco {
+  display: none;
+}
+
+.hero.compact .searchbar {
+  max-width: none;
+}
+
+/* ---------- 内容区 ---------- */
 .content {
   flex: 1;
-  padding-bottom: 56px;
+  padding-bottom: 64px;
 }
 
 .filters {
   display: flex;
-  gap: 8px;
   flex-wrap: wrap;
-  padding: 8px 0 22px;
+  gap: 7px;
+  padding: 18px 0 20px;
 }
 
 .chip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 32px;
-  padding: 0 13px;
-  border-radius: 999px;
+  gap: 7px;
+  height: 30px;
+  padding: 0 11px;
   border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--ink-2);
-  font-size: 13px;
-  transition: all 0.16s;
+  font-size: 12.5px;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
 }
 
 .chip:hover {
-  border-color: var(--line-strong);
-  background: #fbfcfd;
+  border-color: var(--line-2);
+  background: var(--surface-2);
 }
 
 .chip.on {
@@ -503,71 +836,134 @@ onMounted(async () => {
 }
 
 .chip-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
+  width: 5px;
+  height: 5px;
+  border-radius: 1px;
 }
 
+/* ---------- 结果头 ---------- */
 .result-head {
   display: flex;
   align-items: center;
-  gap: 7px;
-  font-size: 12.5px;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
   color: var(--muted);
-  padding: 0 2px 12px;
 }
 
-.result-head b {
-  color: var(--ink-2);
+.rh-label {
+  color: var(--faint);
+  letter-spacing: 0.16em;
+}
+
+.rh-num {
+  color: var(--ink);
   font-weight: 600;
 }
 
-.divider {
-  color: var(--line-strong);
+.rh-sep {
+  color: var(--line-2);
 }
 
 .result-list {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
-/* 骨架 */
-.skeleton-list {
+/* ---------- 加载态 ---------- */
+.scan-state {
+  padding-top: 4px;
+}
+
+.scan-head {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.scan-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: var(--accent-deep);
+}
+
+.scan-label::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+.scan-count {
+  font-size: 10.5px;
+  color: var(--faint);
 }
 
 .loading-hint {
-  margin: 0 0 4px;
+  margin: 0 0 12px;
   font-size: 12.5px;
   color: var(--muted);
-  text-align: center;
+}
+
+.scan-track {
+  position: relative;
+  height: 1px;
+  margin-bottom: 18px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.scan-track i {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 28%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  animation: scan 1.6s ease-in-out infinite;
+}
+
+.skeleton-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .skeleton {
+  padding: 18px;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 20px 22px;
 }
 
 .sk-line {
-  height: 12px;
-  border-radius: 6px;
-  background: linear-gradient(90deg, #eef2f6 25%, #f6f8fa 37%, #eef2f6 63%);
+  height: 11px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #eef1f5 25%, #f7f9fb 37%, #eef1f5 63%);
   background-size: 400% 100%;
-  animation: shimmer 1.3s ease-in-out infinite;
+  animation: shimmer 1.4s ease-in-out infinite;
 }
 
 .sk-line + .sk-line {
-  margin-top: 12px;
+  margin-top: 11px;
 }
 
 .w60 {
   width: 60%;
 }
+
 .w30 {
   width: 26%;
 }
@@ -581,38 +977,41 @@ onMounted(async () => {
   }
 }
 
-/* 状态 */
+/* ---------- 空 / 错误 ---------- */
 .state {
-  text-align: center;
   padding: 64px 20px;
+  text-align: center;
 }
 
 .state-icon {
   display: inline-grid;
   place-items: center;
-  width: 46px;
-  height: 46px;
-  border-radius: 50%;
-  background: #eef2f6;
-  color: var(--muted);
-  font-size: 20px;
-  font-weight: 700;
+  width: 42px;
+  height: 42px;
   margin-bottom: 16px;
+  border: 1px solid var(--line-2);
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 18px;
+  font-weight: 600;
 }
 
 .state-icon.empty {
   font-weight: 400;
-  font-size: 24px;
+  color: var(--faint);
 }
 
 .error-state .state-icon {
-  background: #fdecea;
+  border-color: #efd2cd;
+  background: var(--danger-soft);
   color: var(--danger);
 }
 
 .state-title {
   margin: 0 0 6px;
-  font-size: 15.5px;
+  font-size: 15px;
   font-weight: 600;
   color: var(--ink);
 }
@@ -621,23 +1020,25 @@ onMounted(async () => {
   margin: 0 auto;
   max-width: 420px;
   font-size: 13.5px;
+  line-height: 1.65;
   color: var(--muted);
 }
 
 .retry {
-  margin-top: 18px;
   height: 34px;
-  padding: 0 18px;
-  border-radius: 9px;
-  border: 1px solid var(--line-strong);
+  margin-top: 18px;
+  padding: 0 16px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-sm);
   background: var(--surface);
   font-size: 13px;
   color: var(--ink-2);
+  transition: border-color 0.16s ease, color 0.16s ease;
 }
 
 .retry:hover {
-  border-color: #b7ddd5;
-  color: var(--brand-dark);
+  border-color: var(--ink-2);
+  color: var(--ink);
 }
 
 .state-actions {
@@ -664,110 +1065,220 @@ onMounted(async () => {
   border: none;
   background: none;
   font-size: inherit;
-  color: var(--brand);
+  color: var(--accent-deep);
   text-decoration: underline;
-  text-decoration-color: #b7ddd5;
+  text-decoration-color: rgba(0, 169, 157, 0.35);
   text-underline-offset: 3px;
 }
 
 .link:hover {
-  color: var(--brand-dark);
-  text-decoration-color: var(--brand);
+  color: var(--ink);
+  text-decoration-color: var(--ink);
 }
 
-.footer-links {
-  display: inline-flex;
-  align-items: center;
-  gap: 14px;
-  margin-left: auto;
-}
-
-/* 分页 */
+/* ---------- 分页 ---------- */
 .pager {
   display: flex;
-  justify-content: center;
   align-items: center;
-  gap: 6px;
-  margin-top: 30px;
+  justify-content: center;
+  gap: 5px;
   flex-wrap: wrap;
+  margin-top: 28px;
 }
 
 .pg {
   min-width: 34px;
   height: 34px;
   padding: 0 12px;
-  border-radius: 9px;
   border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
   background: var(--surface);
   color: var(--ink-2);
-  font-size: 13px;
-  transition: all 0.16s;
+  font-size: 12.5px;
+  transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
+}
+
+.pg.num {
+  font-family: var(--mono);
+  font-size: 12px;
 }
 
 .pg:hover:not(:disabled):not(.on) {
-  border-color: var(--line-strong);
+  border-color: var(--line-2);
 }
 
 .pg.on {
   background: var(--ink);
   border-color: var(--ink);
   color: #fff;
-  font-weight: 600;
 }
 
 .pg:disabled {
-  opacity: 0.45;
+  opacity: 0.4;
   cursor: not-allowed;
 }
 
-/* 页脚 */
-.footer {
-  border-top: 1px solid var(--line);
-  padding: 22px 0;
-  font-size: 12.5px;
+.pg-info {
+  display: none;
+  font-size: 11px;
+  letter-spacing: 0.06em;
   color: var(--muted);
 }
 
-.footer .wrap {
+/* ---------- 页脚 ---------- */
+.footer {
+  padding: 22px 0 28px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.footer-inner {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 12px;
   flex-wrap: wrap;
 }
 
-.footer .dot {
-  width: 3px;
-  height: 3px;
-  border-radius: 50%;
-  background: var(--line-strong);
+.footer-brand {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--faint);
 }
 
-@media (max-width: 720px) {
-  .title {
-    font-size: 32px;
-    letter-spacing: 4px;
-    text-indent: 4px;
-  }
+.footer-links {
+  display: inline-flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 12px;
+}
 
-  .hero {
-    padding: 56px 0 36px;
-  }
-
-  .subtitle {
-    margin-bottom: 32px;
-    font-size: 14px;
-  }
-
-  .searchbar button {
-    padding: 0 16px;
-  }
-
+/* ---------- 平板 ---------- */
+@media (max-width: 760px) {
   .wrap {
     padding: 0 16px;
   }
 
+  .topbar-inner {
+    height: 54px;
+  }
+
   .brand-text em {
     display: none;
+  }
+
+  .hero {
+    padding: 52px 0 32px;
+  }
+
+  .title {
+    font-size: 34px;
+    letter-spacing: 0.16em;
+    text-indent: 0.16em;
+  }
+
+  .subtitle {
+    margin-bottom: 28px;
+    font-size: 13.5px;
+  }
+
+  .eyebrow {
+    margin-bottom: 14px;
+    font-size: 9.5px;
+  }
+
+  /* iOS 输入框 <16px 会触发自动缩放，这条不能省 */
+  .searchbar input {
+    font-size: 16px;
+    padding: 10px 0;
+  }
+
+  .kbd {
+    display: none;
+  }
+
+  .searchbar button {
+    height: 40px;
+    padding: 0 18px;
+  }
+
+  .hero-meta {
+    margin-top: 14px;
+    font-size: 9.5px;
+    gap: 7px;
+  }
+
+  .hero.compact {
+    top: 54px;
+    padding: 8px 0;
+  }
+
+  .filters {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    margin: 0 -16px;
+    padding: 14px 16px 14px;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    scroll-snap-type: x proximity;
+  }
+
+  .filters::-webkit-scrollbar {
+    display: none;
+  }
+
+  .chip {
+    flex: 0 0 auto;
+    height: 32px;
+    scroll-snap-align: start;
+  }
+
+  .content {
+    padding-bottom: 48px;
+  }
+
+  .state {
+    padding: 48px 8px;
+  }
+
+  .result-head {
+    font-size: 10px;
+    gap: 6px;
+  }
+
+  /* 手机分页只留前后翻 + 页码读数，数字按钮排开太挤 */
+  .pg.num {
+    display: none;
+  }
+
+  .pg-info {
+    display: inline;
+    margin: 0 4px;
+  }
+
+  .pager {
+    gap: 8px;
+  }
+
+  .footer-inner {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 14px;
+  }
+
+  .footer-links {
+    gap: 20px;
+    font-size: 13px;
+  }
+}
+
+@media (max-width: 380px) {
+  .title {
+    font-size: 30px;
+  }
+
+  .searchbar button {
+    padding: 0 14px;
   }
 }
 </style>

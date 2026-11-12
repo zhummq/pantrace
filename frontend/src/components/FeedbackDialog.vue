@@ -159,6 +159,7 @@ async function submit() {
           <button v-show="!done" class="x" aria-label="关闭" @click="close">×</button>
 
           <template v-if="!done">
+            <p class="kicker mono">FEEDBACK / {{ mode === 'request' ? 'REQUEST' : mode === 'bug' ? 'BUG' : 'RESULT' }}</p>
             <h2>{{ title }}</h2>
             <p class="sub">{{ subtitle }}</p>
 
@@ -233,8 +234,9 @@ async function submit() {
   align-items: center;
   justify-content: center;
   padding: 20px;
-  background: rgba(15, 23, 42, 0.42);
-  backdrop-filter: blur(3px);
+  background: rgba(8, 12, 18, 0.44);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
 }
 
 .sheet {
@@ -242,56 +244,68 @@ async function submit() {
   width: 100%;
   max-width: 460px;
   max-height: 88vh;
+  max-height: 88dvh;
   overflow-y: auto;
-  padding: 26px 26px 22px;
+  padding: 24px 24px 20px;
   background: var(--surface);
-  border-radius: 16px;
-  box-shadow: 0 24px 70px -24px rgba(15, 23, 42, 0.4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+}
+
+.kicker {
+  margin: 0 0 10px;
+  font-size: 9.5px;
+  letter-spacing: 0.18em;
+  color: var(--faint);
 }
 
 .x {
   position: absolute;
-  top: 14px;
-  right: 14px;
-  width: 28px;
-  height: 28px;
+  top: 12px;
+  right: 12px;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--muted);
-  font-size: 19px;
+  color: var(--faint);
+  font-size: 18px;
   line-height: 1;
 }
 
 .x:hover {
-  background: #f1f5f9;
+  background: var(--bg);
   color: var(--ink);
 }
 
 h2 {
   margin: 0 0 6px;
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 650;
-  letter-spacing: 0.2px;
+  letter-spacing: 0.01em;
   color: var(--ink);
 }
 
 .sub {
   margin: 0 0 18px;
-  font-size: 13px;
-  line-height: 1.55;
+  font-size: 12.5px;
+  line-height: 1.6;
   color: var(--muted);
 }
 
 .target {
-  margin: -6px 0 14px;
-  padding: 9px 11px;
-  border-radius: 9px;
-  background: #f6f8fa;
-  border: 1px solid var(--line);
-  font-size: 12.5px;
-  color: var(--ink-2);
+  margin: -4px 0 14px;
+  padding: 8px 10px;
   overflow: hidden;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  background: var(--surface-2);
+  font-size: 12px;
+  color: var(--ink-2);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -299,7 +313,7 @@ h2 {
 .opts {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   margin-bottom: 16px;
 }
 
@@ -308,37 +322,37 @@ h2 {
   flex-direction: column;
   align-items: flex-start;
   gap: 1px;
-  padding: 10px 13px;
-  border: 1px solid var(--line-strong);
-  border-radius: 10px;
-  background: #fff;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
   text-align: left;
-  transition: all 0.15s;
+  transition: border-color 0.15s ease, background 0.15s ease;
 }
 
 .opt b {
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--ink);
 }
 
 .opt i {
   font-style: normal;
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--muted);
 }
 
 .opt:hover {
-  border-color: #b7ddd5;
+  border-color: var(--line-2);
 }
 
 .opt.on {
-  border-color: var(--brand);
-  background: var(--brand-soft);
+  border-color: rgba(0, 169, 157, 0.5);
+  background: var(--accent-soft);
 }
 
 .opt.on b {
-  color: var(--brand-dark);
+  color: var(--accent-deep);
 }
 
 .field {
@@ -348,99 +362,102 @@ h2 {
 .field label {
   display: block;
   margin-bottom: 5px;
-  font-size: 12px;
-  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--faint);
 }
 
 .field input,
 .field textarea {
   width: 100%;
-  padding: 9px 11px;
-  border: 1px solid var(--line-strong);
-  border-radius: 9px;
-  background: #fff;
+  padding: 9px 10px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
   font-size: 13.5px;
   color: var(--ink);
   outline: none;
   resize: vertical;
-  transition: border-color 0.15s;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .field input:focus,
 .field textarea:focus {
-  border-color: #8fc9bd;
-  box-shadow: 0 0 0 3px rgba(11, 122, 107, 0.08);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0, 169, 157, 0.1);
 }
 
 .field input::placeholder,
 .field textarea::placeholder {
-  color: #9aa8bb;
+  color: var(--faint);
 }
 
 .errbox {
-  margin-bottom: 12px;
-  padding: 10px 12px;
-  border-radius: 9px;
-  background: #fdf2f1;
-  border: 1px solid #f5d3d0;
-  color: var(--danger);
-  font-size: 12.5px;
-  line-height: 1.5;
-  word-break: break-word;
   max-height: 96px;
+  margin-bottom: 12px;
+  padding: 9px 11px;
   overflow-y: auto;
+  border: 1px solid #efd2cd;
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.55;
+  word-break: break-word;
 }
 
 .err {
   margin: 0 0 10px;
-  font-size: 12.5px;
+  font-size: 12px;
   color: var(--danger);
 }
 
 .submit {
   width: 100%;
-  height: 40px;
+  height: 42px;
   border: none;
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: var(--ink);
   color: #fff;
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 500;
-  letter-spacing: 0.3px;
-  transition: background 0.16s;
+  letter-spacing: 0.08em;
+  transition: background 0.16s ease, opacity 0.16s ease;
 }
 
 .submit:hover:not(:disabled) {
-  background: #1e293b;
+  background: #1b2430;
 }
 
 .submit:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
 
 .tip {
-  margin: 10px 0 0;
-  font-size: 11.5px;
-  color: var(--muted);
+  margin: 9px 0 0;
+  font-size: 11px;
+  color: var(--faint);
   text-align: center;
 }
 
 .ok {
-  padding: 8px 0 2px;
+  padding: 6px 0 2px;
   text-align: center;
 }
 
 .okicon {
   display: grid;
   place-items: center;
-  width: 46px;
-  height: 46px;
+  width: 42px;
+  height: 42px;
   margin: 0 auto 14px;
+  border: 1px solid rgba(0, 169, 157, 0.4);
   border-radius: 50%;
-  background: var(--brand-soft);
-  color: var(--brand);
-  font-size: 22px;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-size: 20px;
   font-weight: 600;
 }
 
@@ -465,7 +482,7 @@ h2 {
 
 .fb-enter-from .sheet,
 .fb-leave-to .sheet {
-  transform: translateY(10px) scale(0.985);
+  transform: translateY(10px);
   opacity: 0;
 }
 
@@ -477,9 +494,25 @@ h2 {
 
   .sheet {
     max-width: none;
-    max-height: 92vh;
-    padding: 22px 18px 18px;
-    border-radius: 18px 18px 0 0;
+    max-height: 92dvh;
+    padding: 22px 18px calc(18px + env(safe-area-inset-bottom));
+    border: none;
+    border-top: 1px solid var(--line-2);
+    border-radius: 14px 14px 0 0;
+  }
+
+  /* iOS 聚焦输入框会放大页面，16px 是底线 */
+  .field input,
+  .field textarea {
+    font-size: 16px;
+  }
+
+  .opt {
+    padding: 11px 12px;
+  }
+
+  .submit {
+    height: 46px;
   }
 }
 </style>
