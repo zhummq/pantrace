@@ -1213,14 +1213,29 @@ onBeforeUnmount(() => {
     padding: 8px 0;
   }
 
+  /* 手机端品牌栏不吸顶（滚走），只留搜索条贴顶——
+     双行吸顶要吃掉 130px+，长列表可视区太小 */
+  .topbar {
+    position: static;
+  }
+
+  .hero.compact {
+    top: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
   .filters {
     flex-wrap: nowrap;
     overflow-x: auto;
     margin: 0 -16px;
-    padding: 14px 16px 14px;
+    /* 右侧留出渐隐带的空间，最后一条 chip 也能滚进可视区 */
+    padding: 14px 44px 14px 16px;
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
     scroll-snap-type: x proximity;
+    /* 右缘渐隐：被裁切 ≠ 看起来坏了，而是"还有更多"的提示 */
+    mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 32px), transparent);
+    -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 32px), transparent);
   }
 
   .filters::-webkit-scrollbar {

@@ -101,11 +101,17 @@ a {
   font-feature-settings: 'tnum' 1;
 }
 
+/* 关键词高亮：完整的浅青底 + 圆角，明确是"记号笔"，
+   别用半高色带——小字号中文里像拖选出的选区，会被当成渲染 bug */
 mark.hl {
-  background: linear-gradient(180deg, transparent 58%, rgba(0, 169, 157, 0.28) 58%);
+  background: rgba(0, 169, 157, 0.16);
   color: inherit;
-  padding: 0 1px;
+  padding: 1px 3px;
+  margin: 0 -1px;
+  border-radius: 3px;
   font-weight: 600;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
 }
 
 @media (prefers-reduced-motion: reduce) {
