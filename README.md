@@ -391,6 +391,12 @@ sudo systemctl restart pantrace
 
 后端、前端、配置的更新方式完全一样——静态页面由后端托管，`git pull` 带下来的新 dist 靠重启生效。
 
+> **缓存策略由后端发头，不写在 nginx 里。** 站点是纯反代（`/docs`、`/openapi.json` 都能通），静态文件由 FastAPI 的 `StaticFiles` 托管，所以 `location = /index.html` 这种写法对用户实际访问的 `/` 是无效的，写错还会让首页 404。现在的规则在 `main.py` 的 `cache_control` 中间件里：
+> - `/assets/*` → `public, max-age=31536000, immutable`（文件名带内容 hash，内容永不变）
+> - `/` 与 `/index.html` → `no-cache`（每次带 ETag 回源，没变返回 304）
+>
+> 首页必须禁掉启发式缓存。否则浏览器按 `Last-Modified` 自行估算缓存时长，发版后老访客会继续跑旧 bundle，表现是“新功能没上线”——2026-11 群入口弹窗不出现就是这个原因。
+
 两个注意：
 
 - **服务器上别手改代码**。本地改完 push，服务器 pull。服务器上的 `.env` 和 `data/` 不在 git 里，`git pull` 不会碰它们。

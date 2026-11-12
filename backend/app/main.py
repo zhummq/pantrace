@@ -212,6 +212,31 @@ app.add_middleware(
 )
 
 
+# ---- 缓存策略 ----
+# 静态文件由本进程托管（见文件末尾的 StaticFiles 挂载），所以头加在这一层，
+# 不依赖 nginx 的 location 匹配——nginx 只做反代，`location = /index.html`
+# 对用户实际访问的 "/" 是无效的，写过反而容易让首页 404。
+#
+# 两条规则：
+# - /assets/ 下的文件名带内容 hash，内容永不变，长缓存 + immutable
+# - 首页 HTML 每次回源校验（no-cache 走 ETag，没变就 304，不费流量）。
+#   这里必须禁掉启发式缓存，否则发版后老访客会继续跑旧 bundle，
+#   表现就是"新功能上不了线"——群入口弹窗不出现就是这么踩的。
+_LONG_CACHE_PREFIX = "/assets/"
+_REVALIDATE_PATHS = ("/", "/index.html")
+
+
+@app.middleware("http")
+async def cache_control(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path.startswith(_LONG_CACHE_PREFIX):
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    elif path in _REVALIDATE_PATHS:
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 def _apply_hidden(body: dict) -> dict:
     """把被多个独立访客报"失效"的结果从返回里摘掉。
 
