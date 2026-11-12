@@ -8,11 +8,14 @@
 backend/
   app/main.py         FastAPI 入口：/api/search /api/platforms /api/health
   app/config.py       配置（从 .env 读）
+  app/analytics.py    访问埋点：事件表 + 看板聚合
+  app/feedback.py     反馈/求资源：工单表、限流、去重、聚合
   .env                apikey 等敏感配置，已被 gitignore
   requirements.txt
 frontend/
-  src/App.vue         搜索页、平台筛选、分页
+  src/App.vue         搜索页、平台筛选、分页、反馈入口
   src/components/ResultCard.vue
+  src/components/FeedbackDialog.vue   反馈弹层（纠错 / 求资源 / 报错）
   src/api.js          接口封装
   vite.config.js      dev 时 /api 代理到 8000
 start.bat             生产模式：构建前端 + 单端口 8000
@@ -55,6 +58,9 @@ npm run dev
 | GET | `/api/platforms` | 平台列表（前端筛选用） |
 | GET | `/api/health` | 健康检查 |
 | POST | `/api/track` | 前端行为上报（内部用，见下节） |
+| POST | `/api/feedback` | 提交反馈 / 求资源 |
+| GET | `/api/admin/feedback?days=30&status=new` | 反馈列表，需 `X-Admin-Token` |
+| POST | `/api/admin/feedback/{id}` | 标记反馈状态，body `{"status":"done"}` |
 | GET | `/api/admin/stats?days=7` | 看板数据，需 `X-Admin-Token` |
 | GET | `/admin` | 用户行为看板（HTML） |
 | GET | `/docs` | FastAPI 自带接口文档 |
@@ -132,6 +138,61 @@ systemctl stop pantrace && rm -f backend/data/analytics.db* && systemctl start p
 - 不写 cookie、不取指纹、不存精确位置；只有 IP（用于去重和排障）和 UA。
 - 看板上 IP 一律脱敏成 `1.2.3.x` 再展示。
 - 关键词只存搜索词本身，不存用户身份信息——本来也没有。
+
+## 用户反馈与求资源
+
+只有一个功能站，用户能反馈的其实很集中：链接失效、提取码不对、内容不符、页面报错，以及**搜不到**——最后这类本质上是在提交需求。所以反馈和求资源共用一张工单表，因为落地动作是同一个。
+
+### 入口
+
+四个触点，全部自动带上上下文，用户不用重复描述：
+
+| 位置 | 形态 | 带上什么 |
+|---|---|---|
+| 结果卡「这条有问题」 | 三选一，可以不打字 | 标题、平台、分享链接、当时的搜索词 |
+| 零结果页「告诉我你要找什么」 | 资源名 + 补充说明 | 关键词 |
+| 报错页「上报这个错误」 | 错误原文 + 一句说明 | 错误信息、关键词 |
+| 页脚「求资源 / 反馈问题」 | 兜底入口 | — |
+
+结果卡上那个最重要。用户判断"这条有问题"的时机只在他看结果的那一屏，放到页脚或者独立页面等于没有。
+
+### 类型（kind）
+
+`dead_link` 链接失效 · `pwd_wrong` 提取码不对 · `wrong_content` 内容不符 · `missing` 求资源 · `bug` 页面报错 · `other` 其他。
+
+固定枚举，不收自由文本分类：十条"打不开"没法聚合，十个 `dead_link` 能直接定位到一条该隐藏的链接。
+
+### 防滥用
+
+- 单 IP 10 分钟 5 条，**只对通过校验的提交计数**。用户忘填关键词不该消耗额度，重复点同一条也不该（同访客 + 同链接 24 小时内只存一条，重复提交直接返回成功）。
+- 链接只放行 `http/https`，`javascript:` 之类在入口就清空。
+- 字段统一截断：说明 500 字、关键词 100 字、联系方式 120 字。
+- 联系方式选填，只进库，前后端都不展示给第三方。
+
+### 自动闭环
+
+同一条链接被 **2 个不同访客** 报 `dead_link`，30 天内从搜索结果里隐藏。阈值取 2 而不是 3：这个站流量小，凑齐 3 个人可能永远等不到。
+
+隐藏列表在内存里缓存 60 秒。过滤只发生在响应出口，缓存里存的仍是上游原始结果，否则隐藏要等缓存过期（最长 5 分钟）才生效。`total` 保持上游原值——本地过滤和上游分页本来就对不齐，为了数字好看去改它只会让翻页出现空洞。
+
+看板顶部的「已被自动隐藏」区块会列出这批链接，自动隐藏误伤了能立刻看见。
+
+### 数据在哪
+
+和埋点同一个 SQLite 文件 `backend/data/analytics.db`，表名 `feedback`，备份一份就够。
+
+```bash
+# 看全部待办（本机装了 sqlite3 才需要）
+sqlite3 backend/data/analytics.db \
+  "select id, datetime(ts,'unixepoch','+8 hours'), kind, target, query \
+   from feedback where status='new' order by ts desc;"
+
+# 看某个词的求资源人数
+sqlite3 backend/data/analytics.db \
+  "select query, count(*) from feedback where kind='missing' group by query order by 2 desc;"
+```
+
+`FEEDBACK_ENABLED=false` 可以单独关掉反馈，不影响埋点——统计和工单是两件事，不该互相绑死。
 
 ## 已知问题
 

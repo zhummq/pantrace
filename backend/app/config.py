@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     analytics_retain_days: int = 180  # 保留天数，超期自动删
     analytics_rate_per_minute: int = 120  # 单 IP 每分钟上报事件上限，防刷
 
+    # ---- 反馈 / 求资源 ----
+    # 和埋点共用 backend/data/analytics.db，同一个文件备份一次就够。
+    # 关掉埋点不影响反馈：一个是统计，一个是工单，别互相绑死。
+    feedback_enabled: bool = True
+    feedback_rate_per_10min: int = 5   # 单 IP 十分钟提交上限
+
     # ---- 看板口令 ----
     # 留空时 /admin 只允许本机访问（经 Nginx 反代后就是谁都不行），
     # 部署到公网必须设一个，否则看板打不开。

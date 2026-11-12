@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
 import ResultCard from './components/ResultCard.vue'
+import FeedbackDialog from './components/FeedbackDialog.vue'
 import { fetchPlatforms, searchResources } from './api.js'
 import { initTracking, track } from './track.js'
 
@@ -22,6 +23,25 @@ const error = ref('')
 const searched = ref(false)
 
 const showEmpty = computed(() => !loading.value && !error.value && searched.value && items.value.length === 0)
+
+// ---- 反馈 / 求资源 ----
+// 一个弹层三种形态，共用一个提交接口。上下文（当前关键词、这条结果）
+// 由打开时带进去，用户不用再重复描述一遍。
+const fbOpen = ref(false)
+const fbMode = ref('request')
+const fbItem = ref(null)
+const fbError = ref('')
+
+function openFeedback(mode, payload = {}) {
+  fbMode.value = mode
+  fbItem.value = payload.item || null
+  fbError.value = payload.error || ''
+  fbOpen.value = true
+}
+
+function closeFeedback() {
+  fbOpen.value = false
+}
 
 const pageWindow = computed(() => {
   const tp = totalPages.value
@@ -195,7 +215,10 @@ onMounted(async () => {
         <div class="state-icon">!</div>
         <p class="state-title">这次没搜成</p>
         <p class="state-desc">{{ error }}</p>
-        <button class="retry" @click="retry">重试一次</button>
+        <div class="state-actions">
+          <button class="retry" @click="retry">重试一次</button>
+          <button class="link" @click="openFeedback('bug', { error })">上报这个错误</button>
+        </div>
       </div>
 
       <div v-else-if="showEmpty" class="state">
@@ -203,6 +226,10 @@ onMounted(async () => {
         <p class="state-title">没有找到「{{ lastKeyword }}」</p>
         <p class="state-desc">换个关键词试试，或者先取消平台筛选看看全部来源。</p>
         <button v-if="activePlatform" class="retry" @click="pickPlatform('')">搜索全部平台</button>
+        <p class="state-more">
+          都没有？
+          <button class="link" @click="openFeedback('request')">告诉我你要找什么</button>
+        </p>
       </div>
 
       <template v-else-if="items.length">
@@ -215,7 +242,13 @@ onMounted(async () => {
         </div>
 
         <div class="result-list">
-          <ResultCard v-for="item in items" :key="item.hsid || item.shareUrl" :item="item" :keyword="lastKeyword" />
+          <ResultCard
+            v-for="item in items"
+            :key="item.hsid || item.shareUrl"
+            :item="item"
+            :keyword="lastKeyword"
+            @feedback="openFeedback('result', { item: $event })"
+          />
         </div>
 
         <div v-if="totalPages > 1" class="pager">
@@ -239,8 +272,21 @@ onMounted(async () => {
         <span>盘迹 PanTrace</span>
         <span class="dot"></span>
         <span>资源均来自第三方分享，本站不存储任何文件</span>
+        <span class="footer-links">
+          <button class="link" @click="openFeedback('request')">求资源</button>
+          <button class="link" @click="openFeedback('bug')">反馈问题</button>
+        </span>
       </div>
     </footer>
+
+    <FeedbackDialog
+      :open="fbOpen"
+      :mode="fbMode"
+      :item="fbItem"
+      :keyword="lastKeyword || keyword"
+      :error-text="fbError"
+      @close="closeFeedback"
+    />
   </div>
 </template>
 
@@ -592,6 +638,48 @@ onMounted(async () => {
 .retry:hover {
   border-color: #b7ddd5;
   color: var(--brand-dark);
+}
+
+.state-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+}
+
+.state-actions .retry {
+  margin-top: 0;
+}
+
+.state-more {
+  margin: 16px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.link {
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: inherit;
+  color: var(--brand);
+  text-decoration: underline;
+  text-decoration-color: #b7ddd5;
+  text-underline-offset: 3px;
+}
+
+.link:hover {
+  color: var(--brand-dark);
+  text-decoration-color: var(--brand);
+}
+
+.footer-links {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  margin-left: auto;
 }
 
 /* 分页 */

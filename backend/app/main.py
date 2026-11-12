@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, providers
+from . import analytics, feedback, providers
 from .config import get_settings
 from .providers import UpstreamError
 
@@ -58,6 +58,25 @@ if ANALYTICS_ON:
         log.error("埋点初始化失败，已关闭：%s", exc)
 else:
     log.info("埋点已关闭（ANALYTICS_ENABLED=false）")
+
+# ---- 反馈 / 求资源 ----
+# 和埋点共用同一个 SQLite 文件，但开关独立：埋点是统计，反馈是待办工单，
+# 关掉统计不该把用户提交的入口一起关掉。
+FEEDBACK_ON = settings.feedback_enabled
+if FEEDBACK_ON:
+    try:
+        feedback.init(
+            settings.analytics_path,
+            tz_offset=settings.analytics_tz_offset,
+            rate_limit=settings.feedback_rate_per_10min,
+        )
+        log.info("反馈工单已启用：%s（每 IP 10 分钟 %s 条）",
+                 settings.analytics_path, settings.feedback_rate_per_10min)
+    except Exception as exc:  # noqa: BLE001
+        FEEDBACK_ON = False
+        log.error("反馈工单初始化失败，已关闭：%s", exc)
+else:
+    log.info("反馈工单已关闭（FEEDBACK_ENABLED=false）")
 
 ADMIN_HTML = Path(__file__).resolve().parent / "admin.html"
 
@@ -173,6 +192,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _apply_hidden(body: dict) -> dict:
+    """把被多个独立访客报"失效"的结果从返回里摘掉。
+
+    注意：过滤只发生在出口，缓存里存的仍是上游原始结果，
+    否则隐藏状态要等缓存过期才生效（最长 5 分钟）。
+    total 保持上游原值——本地过滤和上游分页本来就对不齐，
+    为了数字好看去改 total 反而会让翻页逻辑出现空洞。
+    """
+    if not FEEDBACK_ON:
+        return body
+    hidden = feedback.hidden_keys()
+    urls, titles = hidden["urls"], hidden["titles"]
+    if not urls and not titles:
+        return body
+    items = body.get("items") or []
+    kept = [
+        it for it in items
+        if it.get("shareUrl") not in urls and it.get("title") not in titles
+    ]
+    if len(kept) == len(items):
+        return body
+    out = dict(body)
+    out["items"] = kept
+    out["hidden"] = len(items) - len(kept)
+    return out
+
 # 界面用的平台列表。只放上游实测确认过的 key：
 # 传一个上游不认识的 key 会让整次搜索报 1001，所以宁缺勿滥。
 PLATFORMS = [
@@ -227,6 +273,7 @@ async def health():
         "cached": len(_cache),
         "failed": len(_fail_cache),
         "analytics": ANALYTICS_ON,
+        "feedback": FEEDBACK_ON,
     }
 
 
@@ -281,7 +328,7 @@ async def search(
                 result_count=len(body.get("items") or []),
                 cached=True,
             )
-        return body
+        return _apply_hidden(body)
 
     failed = _fail_cache.get(cache_key)
     if failed and now - failed[0] < FAIL_TTL:
@@ -367,7 +414,71 @@ async def search(
         "search q=%s page=%s items=%s %sms",
         query, page, len(body["items"]), upstream_ms,
     )
-    return body
+    return _apply_hidden(body)
+
+
+class FeedbackIn(BaseModel):
+    """反馈 / 求资源的入参。全部是字符串，长度在后端统一裁。"""
+
+    kind: str = ""
+    message: str = ""
+    query: str = ""
+    platform: str = ""
+    target: str = ""
+    url: str = ""
+    contact: str = ""
+    page: str = ""
+
+
+@app.post("/api/feedback")
+async def submit_feedback(payload: FeedbackIn, request: Request) -> JSONResponse:
+    """提交一条反馈或求资源。
+
+    校验和去重都在 feedback 模块里，这里只负责取 IP/访客号、
+    把 ValueError 转成 400。提交量很小，同步写库，不走后台任务——
+    用户点完要立刻看到"已收到"。
+    """
+    if not FEEDBACK_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "反馈功能暂不可用"})
+
+    ip = client_ip(request)
+    visitor, _, _ = _visitor_of(request)
+    try:
+        result = feedback.submit(
+            payload.kind,
+            message=payload.message,
+            query=payload.query,
+            platform=payload.platform,
+            target=payload.target,
+            url=payload.url,
+            contact=payload.contact,
+            visitor=visitor,
+            ip=ip,
+            ua=request.headers.get("user-agent", ""),
+            page=payload.page,
+        )
+    except feedback.RateLimited:
+        return JSONResponse(
+            status_code=429,
+            content={"code": 429, "msg": "提交有点频繁，过几分钟再试"},
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+    except Exception:  # noqa: BLE001
+        log.exception("反馈写入失败")
+        return JSONResponse(
+            status_code=500, content={"code": 500, "msg": "提交失败，请稍后重试"}
+        )
+
+    log.info("feedback kind=%s id=%s dup=%s", payload.kind, result["id"], result["duplicate"])
+    return JSONResponse(
+        content={
+            "code": 0,
+            "id": result["id"],
+            "duplicate": result["duplicate"],
+            "msg": "已收到",
+        }
+    )
 
 
 def _admin_allowed(request: Request) -> bool:
@@ -393,6 +504,47 @@ async def admin_stats(request: Request, days: int = Query(7, ge=1, le=365)):
     except Exception as exc:  # noqa: BLE001
         log.exception("统计查询失败")
         return JSONResponse(status_code=500, content={"code": 500, "msg": f"统计查询失败：{exc}"})
+
+
+@app.get("/api/admin/feedback", include_in_schema=False)
+async def admin_feedback(
+    request: Request,
+    days: int = Query(30, ge=1, le=365),
+    status: str = Query("", description="new / done，留空为全部"),
+    limit: int = Query(100, ge=1, le=300),
+):
+    """看板的反馈列表。待办排前面，这是唯一需要人工介入的区块。"""
+    if not FEEDBACK_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "反馈已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        return {"code": 0, "data": feedback.summary(days, status, limit)}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("反馈查询失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"查询失败：{exc}"})
+
+
+class FeedbackUpdate(BaseModel):
+    status: str = ""
+    note: str = ""
+
+
+@app.post("/api/admin/feedback/{fid}", include_in_schema=False)
+async def admin_feedback_update(fid: int, payload: FeedbackUpdate, request: Request):
+    if not FEEDBACK_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "反馈已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    if payload.status not in ("new", "done"):
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "状态只能是 new 或 done"})
+    try:
+        ok = feedback.set_status(fid, payload.status, payload.note)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+    if not ok:
+        return JSONResponse(status_code=404, content={"code": 404, "msg": "没有这条反馈"})
+    return {"code": 0, "msg": "已更新"}
 
 
 @app.get("/admin", include_in_schema=False)

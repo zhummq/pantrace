@@ -35,3 +35,23 @@ export function searchResources({ q, platforms, page, pageSize, searchIn = 'titl
 export function fetchPlatforms() {
   return request('/api/platforms')
 }
+
+// 反馈 / 求资源。和搜索不同，失败要把服务端的原话给用户看——
+// "提交太快了"和"缺少必要信息"是两种完全不同的处理方式。
+export async function submitFeedback(payload) {
+  const res = await fetch(`${BASE}/api/feedback`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...trackHeaders() },
+    body: JSON.stringify(payload),
+  })
+  let data = {}
+  try {
+    data = await res.json()
+  } catch {
+    throw new Error('服务返回格式异常')
+  }
+  if (!res.ok || data.code !== 0) {
+    throw new Error(data.msg || `提交失败（${res.status}）`)
+  }
+  return data
+}

@@ -133,6 +133,36 @@
   table.stream td .kind.fail { background: #fdecea; color: var(--red); }
   table.stream td.ellip { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+  /* 反馈与需求：唯一需要人动手的区块 */
+  .fb-item {
+    border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    margin-bottom: 8px; background: #fff;
+  }
+  .fb-item.done { opacity: .55; }
+  .fb-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .fb-kind {
+    font-size: 11px; padding: 1px 7px; border-radius: 5px;
+    background: #eef2f6; color: var(--ink-2);
+  }
+  .fb-kind.dead_link, .fb-kind.pwd_wrong { background: #fdecea; color: var(--red); }
+  .fb-kind.missing { background: var(--brand-soft); color: var(--brand); }
+  .fb-kind.bug { background: #fff4e5; color: #b54708; }
+  .fb-title {
+    font-size: 12.5px; font-weight: 600; color: var(--ink); max-width: 440px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .fb-head .t { margin-left: auto; font-size: 11px; color: var(--faint); font-variant-numeric: tabular-nums; }
+  .fb-msg { margin-top: 5px; font-size: 12.5px; color: var(--ink-2); white-space: pre-wrap; word-break: break-word; }
+  .fb-meta { margin-top: 4px; font-size: 11.5px; color: var(--faint); word-break: break-word; }
+  .fb-link { color: var(--blue); text-decoration: underline; text-underline-offset: 2px; word-break: break-all; }
+  .fb-actions { margin-top: 7px; }
+  .fb-btn {
+    height: 26px; padding: 0 10px; font-size: 11.5px; border-radius: 6px;
+    border: 1px solid var(--line-strong); background: #fff; color: var(--ink-2);
+    cursor: pointer; font-family: inherit;
+  }
+  .fb-btn:hover { border-color: #b7ddd5; color: var(--brand); }
+
   .gate {
     position: fixed; inset: 0; background: rgba(244, 246, 249, 0.94);
     display: grid; place-items: center; z-index: 50; backdrop-filter: blur(4px);
@@ -173,6 +203,28 @@
   <!-- 首层：每天必看的三个数 -->
   <section class="overview" id="overview"></section>
   <section class="substats" id="substats"></section>
+
+  <!-- 反馈 / 求资源：待办性质，放最前面 -->
+  <details class="panel" id="fb-panel" open>
+    <summary>用户反馈与求资源 <span class="tag" id="fb-tag">载入中…</span><span class="arrow">▾</span></summary>
+    <div class="body">
+      <div class="substats" id="fb-stats" style="margin:10px 0 14px"></div>
+      <div class="grid2">
+        <section class="rank">
+          <h2>需求清单 <span>该补什么源</span></h2>
+          <div id="fb-requests"></div>
+        </section>
+        <section class="rank">
+          <h2>已被自动隐藏 <span>≥2 人报失效</span></h2>
+          <div id="fb-flagged"></div>
+        </section>
+      </div>
+      <div class="rank" style="margin-top:16px">
+        <h2>反馈明细 <span id="fb-hint"></span></h2>
+        <div id="fb-list"></div>
+      </div>
+    </div>
+  </details>
 
   <!-- 健康层：出问题才看 -->
   <details class="panel">
@@ -309,6 +361,7 @@
         }
         hideGate();
         render(r.body.data);
+        loadFeedback(silent);
       })
       .catch(function (e) {
         if (!silent) $('meta').innerHTML = '<span class="err">网络错误：' + esc(e.message) + '</span>';
@@ -371,6 +424,132 @@
 
     // 流水
     renderRecent(d.recent || []);
+  }
+
+  // ---------------- 反馈 / 求资源 ----------------
+  var fbAutoClosed = false;
+
+  function loadFeedback(silent) {
+    var headers = {};
+    var t = token();
+    if (t) headers['x-admin-token'] = t;
+
+    fetch('/api/admin/feedback?days=' + days + '&limit=100', { headers: headers })
+      .then(function (res) {
+        return res.json().then(function (body) { return { status: res.status, body: body }; });
+      })
+      .then(function (r) {
+        if (r.status === 401) return;
+        if (!r.body || r.body.code !== 0) {
+          if (!silent) {
+            $('fb-list').innerHTML = '<div class="err">反馈读取失败：' +
+              esc((r.body && r.body.msg) || '未知错误') + '</div>';
+          }
+          return;
+        }
+        renderFeedback(r.body.data);
+      })
+      .catch(function (e) {
+        if (!silent) $('fb-list').innerHTML = '<div class="err">反馈读取失败：' + esc(e.message) + '</div>';
+      });
+  }
+
+  function fbTime(ts) {
+    var d = new Date(ts * 1000);
+    function p(x) { return (x < 10 ? '0' : '') + x; }
+    return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+
+  function fbSmall(label, value) {
+    return '<div class="stat"><div class="k">' + esc(label) + '</div>' +
+      '<div class="v">' + value + '</div></div>';
+  }
+
+  function renderFeedback(d) {
+    var c = d.counts || {};
+    var pending = Number(c.pending) || 0;
+    var done = Number(c.done) || 0;
+    var total = Number(c.total) || 0;
+
+    $('fb-tag').textContent = pending ? pending + ' 条待处理' : '没有待办';
+    // 没有待办时收起来，别让一个空面板占着首屏；只自动收一次，
+    // 用户自己展开后就尊重他的选择。
+    if (pending === 0 && !fbAutoClosed) {
+      fbAutoClosed = true;
+      $('fb-panel').removeAttribute('open');
+    }
+
+    $('fb-stats').innerHTML =
+      fbSmall('待处理', pending) + fbSmall('已处理', done) + fbSmall('区间合计', total);
+    $('fb-hint').textContent = '新提交在前，共 ' + (d.items || []).length + ' 条';
+
+    var reqs = d.requests || [];
+    $('fb-requests').innerHTML = reqs.length
+      ? barRows(reqs.map(function (r) { return { label: r.q, n: r.n }; }), 'warn')
+      : '<div class="empty">还没有人提需求</div>';
+
+    var flagged = d.flagged || [];
+    $('fb-flagged').innerHTML = flagged.length
+      ? flagged.map(function (f) {
+          return '<div class="bar-row" title="' + esc(f.url) + '">' +
+            '<span class="name">' + esc(f.target || f.url) + '</span>' +
+            '<span class="n">' + f.n + '</span></div>';
+        }).join('')
+      : '<div class="empty">暂时没有被多人报失效的链接</div>';
+
+    var items = d.items || [];
+    if (!items.length) {
+      $('fb-list').innerHTML = '<div class="empty">这个区间没有反馈</div>';
+      return;
+    }
+    $('fb-list').innerHTML = items.map(fbItem).join('');
+    Array.prototype.forEach.call($('fb-list').querySelectorAll('button[data-id]'), function (btn) {
+      btn.addEventListener('click', function () { markDone(btn.getAttribute('data-id')); });
+    });
+  }
+
+  function fbItem(it) {
+    var ctx = [];
+    if (it.query) ctx.push('关键词：' + it.query);
+    if (it.platform) ctx.push(platformName(it.platform));
+    if (it.ip) ctx.push(it.ip);
+    ctx.push(it.device === 'mobile' ? '手机' : '桌面');
+
+    var head = '<span class="fb-kind ' + esc(it.kind) + '">' + esc(it.kindName) + '</span>';
+    if (it.target) {
+      head += '<span class="fb-title" title="' + esc(it.target) + '">' + esc(it.target) + '</span>';
+    }
+    head += '<span class="t">' + fbTime(it.ts) + '</span>';
+
+    var body = it.message ? '<div class="fb-msg">' + esc(it.message) + '</div>' : '';
+    var link = it.url && /^https?:\/\//i.test(it.url)
+      ? '<div class="fb-meta"><a class="fb-link" href="' + esc(it.url) +
+        '" target="_blank" rel="noopener noreferrer">' + esc(it.url) + '</a></div>'
+      : '';
+    var meta = '<div class="fb-meta">' + esc(ctx.join(' · ')) +
+      (it.contact ? ' · 联系：' + esc(it.contact) : '') + '</div>';
+    var act = it.status === 'new'
+      ? '<div class="fb-actions"><button class="fb-btn" data-id="' + it.id + '">标为已处理</button></div>'
+      : '<div class="fb-meta" style="margin-top:7px">已处理' +
+        (it.note ? '：' + esc(it.note) : '') + '</div>';
+
+    return '<div class="fb-item' + (it.status === 'done' ? ' done' : '') + '">' +
+      '<div class="fb-head">' + head + '</div>' + body + link + meta + act + '</div>';
+  }
+
+  function markDone(id) {
+    var headers = { 'content-type': 'application/json' };
+    var t = token();
+    if (t) headers['x-admin-token'] = t;
+
+    fetch('/api/admin/feedback/' + encodeURIComponent(id), {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({ status: 'done' })
+    })
+      .then(function (res) { return res.json(); })
+      .then(function (b) { if (b && b.code === 0) loadFeedback(true); })
+      .catch(function () {});
   }
 
   function barRows(rows, fillCls) {

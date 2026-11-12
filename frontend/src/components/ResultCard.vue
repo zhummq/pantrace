@@ -7,6 +7,8 @@ const props = defineProps({
   keyword: { type: String, default: '' },
 })
 
+const emit = defineEmits(['feedback'])
+
 // 与后端 PLATFORMS 列表保持一致（main.py）。多一个少一个 key 都会让
 // 对应平台的色条/徽章掉进默认灰色。
 const PLATFORM_COLORS = {
@@ -146,6 +148,9 @@ async function onCopyPwd() {
           <span class="dot"></span>
           <span class="pwd">提取码 <b>{{ item.sharePwd }}</b></span>
         </template>
+        <!-- 纠错入口挂在卡片内部：用户判断"这条有问题"的时机只在这一屏，
+             放到页脚或者独立页面就等于没有 -->
+        <button class="flag" @click="emit('feedback', item)">这条有问题</button>
       </div>
     </div>
 
@@ -265,6 +270,24 @@ a.title:hover {
   color: var(--ink-2);
   font-weight: 600;
   letter-spacing: 0.5px;
+}
+
+.flag {
+  margin-left: auto;
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 12px;
+  color: var(--muted);
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 3px;
+  transition: color 0.15s;
+}
+
+.flag:hover {
+  color: var(--danger);
+  text-decoration-color: #f0c2bd;
 }
 
 .actions {
