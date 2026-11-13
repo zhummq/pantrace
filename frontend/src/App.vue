@@ -376,31 +376,6 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <!-- 网站介绍：只在首页出现。它同时是给用户看的说明书，
-         也是这个站唯一成段的可用收录内容——没有它，搜索引擎眼里这就是个空壳页 -->
-    <section v-if="!searched" class="intro">
-      <div class="wrap intro-grid">
-        <div class="intro-block">
-          <h2 class="intro-h mono">这是什么</h2>
-          <p>
-            盘迹（PanTrace）是一个网盘资源聚合搜索引擎。夸克、百度、阿里、迅雷、微云等各家网盘的公开分享散落在不同的角落，盘迹把它们收进同一个搜索框——输入一次，全部检索。
-          </p>
-        </div>
-        <div class="intro-block">
-          <h2 class="intro-h mono">能搜什么</h2>
-          <p>
-            影视剧、综艺、动漫、纪录片、电子书、学习资料、软件安装包。只要有人在网盘里分享过，这里就有机会一次翻到，不用再挨个平台碰运气。
-          </p>
-        </div>
-        <div class="intro-block">
-          <h2 class="intro-h mono">怎么用</h2>
-          <p>
-            输入关键词，按平台筛选结果，点开链接即可转存。所有资源均来自第三方公开分享，本站不存储任何文件；失效链接可一键报错，被多人报错后会自动隐藏。
-          </p>
-        </div>
-      </div>
-    </section>
-
     <main class="wrap content">
       <div class="filters" role="group" aria-label="平台筛选">
         <button class="chip" :class="{ on: activePlatform === '' }" @click="pickPlatform('')">全部平台</button>
@@ -416,6 +391,32 @@ onBeforeUnmount(() => {
           <span class="chip-short">{{ shortPlatform(p.name) }}</span>
         </button>
       </div>
+
+      <!-- 网站介绍：放在平台筛选下方，只在首页出现。
+           它同时是给用户看的说明书，也是这个站唯一成段的可用收录内容——
+           没有它，搜索引擎眼里这就是个空壳页 -->
+      <section v-if="!searched" class="intro">
+        <div class="intro-grid">
+          <div class="intro-block">
+            <h2 class="intro-h mono">这是什么</h2>
+            <p>
+              盘迹（PanTrace）是一个网盘资源聚合搜索引擎。夸克、百度、阿里、迅雷、微云等各家网盘的公开分享散落在不同的角落，盘迹把它们收进同一个搜索框——输入一次，全部检索。
+            </p>
+          </div>
+          <div class="intro-block">
+            <h2 class="intro-h mono">能搜什么</h2>
+            <p>
+              影视剧、综艺、动漫、纪录片、电子书、学习资料、软件安装包。只要有人在网盘里分享过，这里就有机会一次翻到，不用再挨个平台碰运气。
+            </p>
+          </div>
+          <div class="intro-block">
+            <h2 class="intro-h mono">怎么用</h2>
+            <p>
+              输入关键词，按平台筛选结果，点开链接即可转存。所有资源均来自第三方公开分享，本站不存储任何文件；失效链接可一键报错，被多人报错后会自动隐藏。
+            </p>
+          </div>
+        </div>
+      </section>
 
       <div v-if="loading" class="scan-state">
         <div class="scan-head">
@@ -876,7 +877,9 @@ onBeforeUnmount(() => {
 
 /* ---------- 首页介绍区 ---------- */
 .intro {
-  padding: 36px 0 6px;
+  margin-top: 4px;
+  padding: 20px 0 6px;
+  border-top: 1px solid var(--line);
 }
 
 .intro-grid {
@@ -1348,7 +1351,7 @@ onBeforeUnmount(() => {
   }
 
   .intro {
-    padding: 26px 0 4px;
+    padding: 14px 0 4px;
   }
 
   .intro-grid {
