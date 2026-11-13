@@ -8,6 +8,10 @@ import { initTracking, track } from './track.js'
 
 const PAGE_SIZE = 20
 
+// 首页搜索框下的快捷词：都是长期有人搜的常青词，点一次直接出结果。
+// 别放冷门词——点了没结果，等于在首页摆了个坏掉的按钮。
+const sampleKeywords = ['三体', '庆余年', '流浪地球', '哈利波特']
+
 const keyword = ref('')
 const lastKeyword = ref('')
 const activePlatform = ref('')
@@ -233,6 +237,12 @@ function retry() {
   doSearch(page.value)
 }
 
+function quickSearch(word) {
+  if (loading.value) return
+  keyword.value = word
+  doSearch(1)
+}
+
 function resetHome() {
   keyword.value = ''
   searched.value = false
@@ -328,7 +338,7 @@ onBeforeUnmount(() => {
           <input
             v-model="keyword"
             type="search"
-            placeholder="输入片名、剧名或资源关键词"
+            placeholder="搜影视剧、电子书、学习资料、软件…"
             autocomplete="off"
             autocapitalize="off"
             spellcheck="false"
@@ -343,12 +353,50 @@ onBeforeUnmount(() => {
           <span v-if="loading" class="scanline" aria-hidden="true"></span>
         </form>
 
+        <div v-if="!searched" class="hero-try">
+          <span class="ht-label mono">试试</span>
+          <button
+            v-for="w in sampleKeywords"
+            :key="w"
+            type="button"
+            class="ht-word"
+            @click="quickSearch(w)"
+          >
+            {{ w }}
+          </button>
+        </div>
+
         <div v-if="!searched" class="hero-meta mono">
           <span>{{ sourceCount ? `${sourceCount} 个来源` : '来源同步中' }}</span>
           <i>/</i>
           <span>首次查询 10–60s</span>
           <i>/</i>
           <span>结果实时聚合</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 网站介绍：只在首页出现。它同时是给用户看的说明书，
+         也是这个站唯一成段的可用收录内容——没有它，搜索引擎眼里这就是个空壳页 -->
+    <section v-if="!searched" class="intro">
+      <div class="wrap intro-grid">
+        <div class="intro-block">
+          <h2 class="intro-h mono">这是什么</h2>
+          <p>
+            盘迹（PanTrace）是一个网盘资源聚合搜索引擎。夸克、百度、阿里、迅雷、微云等各家网盘的公开分享散落在不同的角落，盘迹把它们收进同一个搜索框——输入一次，全部检索。
+          </p>
+        </div>
+        <div class="intro-block">
+          <h2 class="intro-h mono">能搜什么</h2>
+          <p>
+            影视剧、综艺、动漫、纪录片、电子书、学习资料、软件安装包。只要有人在网盘里分享过，这里就有机会一次翻到，不用再挨个平台碰运气。
+          </p>
+        </div>
+        <div class="intro-block">
+          <h2 class="intro-h mono">怎么用</h2>
+          <p>
+            输入关键词，按平台筛选结果，点开链接即可转存。所有资源均来自第三方公开分享，本站不存储任何文件；失效链接可一键报错，被多人报错后会自动隐藏。
+          </p>
         </div>
       </div>
     </section>
@@ -794,6 +842,65 @@ onBeforeUnmount(() => {
   color: var(--line-2);
 }
 
+/* 快捷搜索词：点一次直接出结果，省掉输入这步 */
+.hero-try {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.ht-label {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--faint);
+}
+
+.ht-word {
+  padding: 0;
+  border: none;
+  background: none;
+  font-size: 12.5px;
+  color: var(--muted);
+  border-bottom: 1px dashed var(--line-2);
+  line-height: 1.6;
+  transition: color 0.16s ease, border-color 0.16s ease;
+}
+
+.ht-word:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ---------- 首页介绍区 ---------- */
+.intro {
+  padding: 36px 0 6px;
+}
+
+.intro-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 30px;
+}
+
+.intro-h {
+  margin: 0 0 9px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.18em;
+  color: var(--faint);
+}
+
+.intro-block p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.78;
+  color: var(--muted);
+  text-align: justify;
+}
+
 /* 已搜索：搜索条吸顶，翻长列表随时能改词 */
 .hero.compact {
   position: sticky;
@@ -1229,6 +1336,28 @@ onBeforeUnmount(() => {
     margin-top: 14px;
     font-size: 9.5px;
     gap: 7px;
+  }
+
+  .hero-try {
+    margin-top: 12px;
+    gap: 10px;
+  }
+
+  .ht-word {
+    font-size: 12px;
+  }
+
+  .intro {
+    padding: 26px 0 4px;
+  }
+
+  .intro-grid {
+    grid-template-columns: 1fr;
+    gap: 18px;
+  }
+
+  .intro-block p {
+    font-size: 12.5px;
   }
 
   .hero.compact {
