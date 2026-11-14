@@ -278,7 +278,7 @@
         <span class="grp-msg" id="plan-msg"></span>
       </div>
       <div class="rank">
-        <h2>按优先级排序 <span>替换型（已有点击）排在补位型前面 · 已上架的自动剔除</span></h2>
+        <h2>按优先级排序 <span>替换型优先 · 按去重人数排，次数只做同分 · 已上架自动剔除</span></h2>
         <div id="plan-list"></div>
       </div>
     </div>
@@ -905,7 +905,8 @@
         : '<span class="fb-kind other">补位</span>';
       var meta = (it.sources || []).join(' + ')
         + (it.platform ? ' · ' + platformName(it.platform) : '')
-        + ' · 合计 ' + it.n + ' 次';
+        + ' · ' + it.n + ' 次 / ' + (Number(it.u) || 0) + ' 人'
+        + (it.repeat ? ' · 单人重复较多' : '');
       return '<div class="fb-item">' +
         '<div class="fb-head">' + badge +
         '<span class="fb-title" title="' + esc(it.q) + '">' +
@@ -935,7 +936,8 @@
     planCache.forEach(function (it) {
       var g = it.type === 'replace' ? '替换（已有点击，优先做）' : '补位（需求已验证，现在接不住）';
       if (g !== group) { group = g; lines.push('', g + '：'); }
-      lines.push('- ' + it.q + '  [' + (it.sources || []).join('/') + ' ' + it.n + ' 次]');
+      lines.push('- ' + it.q + '  [' + (it.sources || []).join('/') + ' '
+        + it.n + ' 次 / ' + (Number(it.u) || 0) + ' 人]');
     });
     var text = '上架清单 · 近 ' + days + ' 天\n' + lines.join('\n');
     function fallback() {

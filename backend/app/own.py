@@ -307,6 +307,7 @@ def misses(days: int = 30, limit: int = 20) -> list[dict]:
 
 
 PLAN_SOURCES = {
+    "search": "搜索",
     "click": "点击榜",
     "zero": "零结果",
     "request": "求资源",
@@ -321,7 +322,14 @@ def plan(days: int = 30, limit: int = 40) -> dict:
     - click   被点开最多的资源（只算上游链接）→ 替换型，转化已验证
     - zero    搜了 0 结果的词 → 补位型
     - request 求资源工单 → 补位型，用户主动举手
-    - miss    没接住自有链接的搜索词 → 给前面几项补次数
+    - miss    没接住自有链接的搜索词 → 只打标签，不再单独计数
+
+    计数口径（2026-11 修正）：
+    - n 是**动作次数**，一个人反复搜同一个词会重复累加；
+    - u 是**去重访客数**，回答"到底几个人在要这个资源"；
+    - 未命中的搜索已经在搜素事件里计过一次，miss 只用来打标签，
+      否则同一个词会被零结果榜和未命中榜各算一遍（旧的重复计数 bug）。
+    - 排序按 u（人），n 只做同分排序——一个人搜 20 次不该压过 8 个人各搜一次。
 
     判定"已上架"复用 match()：现在能命中的词直接从清单消失，不用人工对。
     """
@@ -333,49 +341,49 @@ def plan(days: int = 30, limit: int = 40) -> dict:
     start = time.time() - days * 86400
     buckets: dict[str, dict] = {}
 
-    def add(query: object, kind: str, n: object, platform: str = "") -> None:
+    def add(query: object, kind: str, n: object = 0, u: object = 0, platform: str = "") -> None:
         q = str(query or "").strip()[:100]
         if len(normalize(q)) < 2:
             return
         key = normalize(q)
         b = buckets.get(key)
         if b is None:
-            b = buckets[key] = {"q": q, "n": 0, "sources": {}, "platform": ""}
-        hits = int(n or 0)
-        b["n"] += hits
-        b["sources"][kind] = b["sources"].get(kind, 0) + hits
+            b = buckets[key] = {"q": q, "n": 0, "u": 0, "sources": {}, "platform": ""}
+        b["n"] += int(n or 0)
+        b["u"] = max(b["u"], int(u or 0))  # 多个来源的人数取并集上限，不叠加
+        b["sources"][kind] = True
         if platform and not b["platform"]:
             b["platform"] = platform
 
     # 单张表缺失不该让整个清单挂掉：新装库还没产生某类数据是常态
     queries = (
         (
-            "zero",
-            """SELECT query AS q, COUNT(*) AS n FROM events
-               WHERE kind='search' AND ok=1 AND result_count=0 AND bot=0
-                     AND ts >= ? AND query<>''
-               GROUP BY query ORDER BY n DESC LIMIT 100""",
+            "search",
+            """SELECT query AS q, COUNT(*) AS n,
+                      COUNT(DISTINCT CASE WHEN visitor<>'' THEN visitor END) AS u,
+                      SUM(CASE WHEN ok=1 AND result_count=0 THEN 1 ELSE 0 END) AS z
+               FROM events
+               WHERE kind='search' AND bot=0 AND ts >= ? AND query<>''
+               GROUP BY query ORDER BY n DESC LIMIT 300""",
             False,
         ),
         (
             "click",
-            """SELECT target AS q, platform, COUNT(*) AS n FROM events
+            """SELECT target AS q, platform, COUNT(*) AS n,
+                      COUNT(DISTINCT CASE WHEN visitor<>'' THEN visitor END) AS u
+               FROM events
                WHERE kind='click' AND bot=0 AND ts >= ? AND target<>''
                      AND COALESCE(source,'') <> 'own'
-               GROUP BY target, platform ORDER BY n DESC LIMIT 100""",
+               GROUP BY target, platform ORDER BY n DESC LIMIT 300""",
             True,
         ),
         (
             "request",
-            """SELECT query AS q, COUNT(*) AS n FROM feedback
+            """SELECT query AS q, COUNT(*) AS n,
+                      COUNT(DISTINCT CASE WHEN visitor<>'' THEN visitor END) AS u
+               FROM feedback
                WHERE kind='missing' AND ts >= ? AND query<>''
                GROUP BY query ORDER BY n DESC LIMIT 100""",
-            False,
-        ),
-        (
-            "miss",
-            """SELECT query AS q, n FROM own_misses
-               WHERE last_ts >= ? ORDER BY n DESC LIMIT 100""",
             False,
         ),
     )
@@ -383,9 +391,21 @@ def plan(days: int = 30, limit: int = 40) -> dict:
         for kind, sql, has_platform in queries:
             try:
                 for r in conn.execute(sql, (start,)).fetchall():
-                    add(r["q"], kind, r["n"], r["platform"] if has_platform else "")
+                    add(r["q"], kind, r["n"], r["u"], r["platform"] if has_platform else "")
+                    if kind == "search" and (r["z"] or 0) > 0:
+                        add(r["q"], "zero")  # 只打标签，不重复计数
             except sqlite3.Error:
                 continue
+        # 未命中：只标标签。这些搜索在上面已经计过数了
+        try:
+            for r in conn.execute(
+                """SELECT query AS q FROM own_misses
+                   WHERE last_ts >= ? ORDER BY n DESC LIMIT 300""",
+                (start,),
+            ).fetchall():
+                add(r["q"], "miss")
+        except sqlite3.Error:
+            pass
 
     items = []
     covered = 0
@@ -394,18 +414,28 @@ def plan(days: int = 30, limit: int = 40) -> dict:
             covered += 1
             continue
         is_replace = "click" in b["sources"]
-        # 点击是"已经发生的转化"，比搜索需求更值钱，同分时排前面
+        tags = [k for k in ("click", "zero", "request", "miss", "search") if k in b["sources"]]
+        # "搜索"只是计数底噪：已经有具体来源标签时不展示
+        if len(tags) > 1 and "search" in tags:
+            tags.remove("search")
+        # 零结果已经隐含"没接住"，未命中标签是噪声，去掉
+        if "zero" in tags and "miss" in tags:
+            tags.remove("miss")
+        u = b["u"] or (1 if b["n"] else 0)
         items.append(
             {
                 "q": b["q"],
                 "type": "replace" if is_replace else "fill",
                 "n": b["n"],
-                "score": b["n"] * (2 if is_replace else 1),
-                "sources": [PLAN_SOURCES.get(k, k) for k in b["sources"]],
+                "u": b["u"],
+                "repeat": bool(b["u"] and b["n"] >= 3 * b["u"] and b["n"] - b["u"] >= 4),
+                "score": u * (2 if is_replace else 1),
+                "sources": [PLAN_SOURCES.get(k, k) for k in tags],
                 "platform": b["platform"],
             }
         )
 
+    # 先按"有几个人要"排，重复次数只做同分排序
     items.sort(key=lambda x: (-x["score"], -x["n"], x["q"]))
     return {
         "days": days,
