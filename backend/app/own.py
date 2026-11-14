@@ -306,106 +306,48 @@ def misses(days: int = 30, limit: int = 20) -> list[dict]:
     return out
 
 
-PLAN_SOURCES = {
-    "search": "搜索",
-    "click": "点击榜",
-    "zero": "零结果",
-    "request": "求资源",
-    "miss": "未命中",
-}
-
-
 def plan(days: int = 30, limit: int = 40) -> dict:
-    """上架清单：把四处需求合成一份可执行待办，已上架的自动剔除。
+    """上架清单：近 N 天被搜得最多的词，已上架的自动剔除。
 
-    来源：
-    - click   被点开最多的资源（只算上游链接）→ 替换型，转化已验证
-    - zero    搜了 0 结果的词 → 补位型
-    - request 求资源工单 → 补位型，用户主动举手
-    - miss    没接住自有链接的搜索词 → 只打标签，不再单独计数
+    口径只有一条——**搜索次数**。不看点击、不看有没有结果、不分类：
+    搜得越多越先上架，就这么简单。
 
-    计数口径（2026-11 修正）：
-    - n 是**动作次数**，一个人反复搜同一个词会重复累加；
-    - u 是**去重访客数**，回答"到底几个人在要这个资源"；
-    - 未命中的搜索已经在搜素事件里计过一次，miss 只用来打标签，
-      否则同一个词会被零结果榜和未命中榜各算一遍（旧的重复计数 bug）。
-    - 排序按 u（人），n 只做同分排序——一个人搜 20 次不该压过 8 个人各搜一次。
-
-    判定"已上架"复用 match()：现在能命中的词直接从清单消失，不用人工对。
+    u（去重访客数）只是附带展示，用来识别"一个人反复搜"，
+    不参与排序；排序严格按次数 n。
     """
     if not _inited:
-        return {"days": days, "items": [], "covered": 0, "replace": 0, "fill": 0}
+        return {"days": days, "items": [], "covered": 0}
 
     days = max(1, min(365, int(days or 30)))
     limit = max(1, min(100, int(limit or 40)))
     start = time.time() - days * 86400
     buckets: dict[str, dict] = {}
 
-    def add(query: object, kind: str, n: object = 0, u: object = 0, platform: str = "") -> None:
-        q = str(query or "").strip()[:100]
-        if len(normalize(q)) < 2:
-            return
-        key = normalize(q)
+    try:
+        with _session() as conn:
+            rows = conn.execute(
+                """SELECT query AS q, COUNT(*) AS n,
+                          COUNT(DISTINCT CASE WHEN visitor<>'' THEN visitor END) AS u,
+                          MAX(ts) AS last
+                   FROM events
+                   WHERE kind='search' AND bot=0 AND ts >= ? AND query<>''
+                   GROUP BY query ORDER BY n DESC LIMIT 500""",
+                (start,),
+            ).fetchall()
+    except sqlite3.Error:
+        rows = []
+
+    for r in rows:
+        raw = str(r["q"] or "").strip()[:100]
+        key = normalize(raw)  # 同一词的不同写法（空格/全角）合并计数
+        if len(key) < 2:
+            continue
         b = buckets.get(key)
         if b is None:
-            b = buckets[key] = {"q": q, "n": 0, "u": 0, "sources": {}, "platform": ""}
-        b["n"] += int(n or 0)
-        b["u"] = max(b["u"], int(u or 0))  # 多个来源的人数取并集上限，不叠加
-        b["sources"][kind] = True
-        if platform and not b["platform"]:
-            b["platform"] = platform
-
-    # 单张表缺失不该让整个清单挂掉：新装库还没产生某类数据是常态
-    queries = (
-        (
-            "search",
-            """SELECT query AS q, COUNT(*) AS n,
-                      COUNT(DISTINCT CASE WHEN visitor<>'' THEN visitor END) AS u,
-                      SUM(CASE WHEN ok=1 AND result_count=0 THEN 1 ELSE 0 END) AS z
-               FROM events
-               WHERE kind='search' AND bot=0 AND ts >= ? AND query<>''
-               GROUP BY query ORDER BY n DESC LIMIT 300""",
-            False,
-        ),
-        (
-            "click",
-            """SELECT target AS q, platform, COUNT(*) AS n,
-                      COUNT(DISTINCT CASE WHEN visitor<>'' THEN visitor END) AS u
-               FROM events
-               WHERE kind='click' AND bot=0 AND ts >= ? AND target<>''
-                     AND COALESCE(source,'') <> 'own'
-               GROUP BY target, platform ORDER BY n DESC LIMIT 300""",
-            True,
-        ),
-        (
-            "request",
-            """SELECT query AS q, COUNT(*) AS n,
-                      COUNT(DISTINCT CASE WHEN visitor<>'' THEN visitor END) AS u
-               FROM feedback
-               WHERE kind='missing' AND ts >= ? AND query<>''
-               GROUP BY query ORDER BY n DESC LIMIT 100""",
-            False,
-        ),
-    )
-    with _session() as conn:
-        for kind, sql, has_platform in queries:
-            try:
-                for r in conn.execute(sql, (start,)).fetchall():
-                    add(r["q"], kind, r["n"], r["u"], r["platform"] if has_platform else "")
-                    if kind == "search" and (r["z"] or 0) > 0:
-                        add(r["q"], "zero")  # 只打标签，不重复计数
-            except sqlite3.Error:
-                continue
-        # 未命中：只标标签。这些搜索在上面已经计过数了
-        try:
-            for r in conn.execute(
-                """SELECT query AS q FROM own_misses
-                   WHERE last_ts >= ? ORDER BY n DESC LIMIT 300""",
-                (start,),
-            ).fetchall():
-                add(r["q"], "miss")
-        except sqlite3.Error:
-            pass
+            b = buckets[key] = {"q": raw, "n": 0, "u": 0, "last": 0.0}
+        b["n"] += int(r["n"] or 0)
+        b["u"] = max(b["u"], int(r["u"] or 0))
+        b["last"] = max(b["last"], float(r["last"] or 0))
 
     items = []
     covered = 0
@@ -413,37 +355,18 @@ def plan(days: int = 30, limit: int = 40) -> dict:
         if match(b["q"]):  # 已经接得住了，不是待办
             covered += 1
             continue
-        is_replace = "click" in b["sources"]
-        tags = [k for k in ("click", "zero", "request", "miss", "search") if k in b["sources"]]
-        # "搜索"只是计数底噪：已经有具体来源标签时不展示
-        if len(tags) > 1 and "search" in tags:
-            tags.remove("search")
-        # 零结果已经隐含"没接住"，未命中标签是噪声，去掉
-        if "zero" in tags and "miss" in tags:
-            tags.remove("miss")
-        u = b["u"] or (1 if b["n"] else 0)
         items.append(
             {
                 "q": b["q"],
-                "type": "replace" if is_replace else "fill",
                 "n": b["n"],
                 "u": b["u"],
-                "repeat": bool(b["u"] and b["n"] >= 3 * b["u"] and b["n"] - b["u"] >= 4),
-                "score": u * (2 if is_replace else 1),
-                "sources": [PLAN_SOURCES.get(k, k) for k in tags],
-                "platform": b["platform"],
+                "last": int(b["last"]),
             }
         )
 
-    # 先按"有几个人要"排，重复次数只做同分排序
-    items.sort(key=lambda x: (-x["score"], -x["n"], x["q"]))
-    return {
-        "days": days,
-        "items": items[:limit],
-        "covered": covered,
-        "replace": sum(1 for i in items if i["type"] == "replace"),
-        "fill": sum(1 for i in items if i["type"] == "fill"),
-    }
+    # 只看搜索次数；次数相同按最近被搜的时间
+    items.sort(key=lambda x: (-x["n"], -x["last"], x["q"]))
+    return {"days": days, "items": items[:limit], "covered": covered}
 
 
 def save(payload: dict) -> dict:

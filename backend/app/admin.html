@@ -278,7 +278,7 @@
         <span class="grp-msg" id="plan-msg"></span>
       </div>
       <div class="rank">
-        <h2>按优先级排序 <span>替换型优先 · 按去重人数排，次数只做同分 · 已上架自动剔除</span></h2>
+        <h2>按搜索次数排序 <span>搜得越多越先做 · 已上架的自动剔除</span></h2>
         <div id="plan-list"></div>
       </div>
     </div>
@@ -860,7 +860,7 @@
       .catch(function (e) { ownMsg('保存失败：' + e.message, true); });
   });
 
-  // ---------------- 上架清单（四路需求合成一份待办） ----------------
+  // ---------------- 上架清单（按搜索次数排的待上架词） ----------------
   var planCache = [];
 
   function loadPlan(silent) {
@@ -882,15 +882,12 @@
 
   function renderPlan(d) {
     planCache = d.items || [];
-    var replace = Number(d.replace) || 0;
-    var fill = Number(d.fill) || 0;
     $('plan-tag').textContent = planCache.length
-      ? replace + ' 个替换 + ' + fill + ' 个补位'
+      ? planCache.length + ' 个词待上架'
       : '暂时没有待办';
 
     $('plan-stats').innerHTML =
-      fbSmall('替换型', replace) +
-      fbSmall('补位型', fill) +
+      fbSmall('待上架词', planCache.length) +
       fbSmall('已上架剔除', Number(d.covered) || 0) +
       fbSmall('区间', d.days + ' 天');
 
@@ -900,21 +897,16 @@
     }
 
     $('plan-list').innerHTML = planCache.map(function (it, i) {
-      var badge = it.type === 'replace'
-        ? '<span class="fb-kind missing">替换</span>'
-        : '<span class="fb-kind other">补位</span>';
-      var meta = (it.sources || []).join(' + ')
-        + (it.platform ? ' · ' + platformName(it.platform) : '')
-        + ' · ' + it.n + ' 次 / ' + (Number(it.u) || 0) + ' 人'
-        + (it.repeat ? ' · 单人重复较多' : '');
+      var meta = it.n + ' 次搜索'
+        + (Number(it.u) > 0 ? ' · ' + it.u + ' 人' : '');
       return '<div class="fb-item">' +
-        '<div class="fb-head">' + badge +
+        '<div class="fb-head">' +
         '<span class="fb-title" title="' + esc(it.q) + '">' +
-          (i + 1) + '. ' + esc(it.q) + '</span></div>' +
-        '<div class="fb-meta">' + esc(meta) + '</div>' +
+          (i + 1) + '. ' + esc(it.q) + '</span>' +
+        '<span class="t">' + meta + '</span></div>' +
         '<div class="fb-actions">' +
         '<a class="fb-btn" href="/?q=' + encodeURIComponent(it.q) + '" target="_blank" ' +
-          'rel="noopener noreferrer">去上游看一眼</a>' +
+          'rel="noopener noreferrer">去搜一下</a>' +
         '<button class="fb-btn" data-plan-q="' + esc(it.q) + '">补录</button>' +
         '</div></div>';
     }).join('');
@@ -931,15 +923,10 @@
 
   $('plan-copy').addEventListener('click', function () {
     if (!planCache.length) { planMsg('清单是空的', true); return; }
-    var lines = [];
-    var group = '';
-    planCache.forEach(function (it) {
-      var g = it.type === 'replace' ? '替换（已有点击，优先做）' : '补位（需求已验证，现在接不住）';
-      if (g !== group) { group = g; lines.push('', g + '：'); }
-      lines.push('- ' + it.q + '  [' + (it.sources || []).join('/') + ' '
-        + it.n + ' 次 / ' + (Number(it.u) || 0) + ' 人]');
+    var lines = planCache.map(function (it, i) {
+      return (i + 1) + '. ' + it.q + '  [' + it.n + ' 次]';
     });
-    var text = '上架清单 · 近 ' + days + ' 天\n' + lines.join('\n');
+    var text = '上架清单 · 近 ' + days + ' 天（按搜索次数）\n' + lines.join('\n');
     function fallback() {
       var ta = document.createElement('textarea');
       ta.value = text;
