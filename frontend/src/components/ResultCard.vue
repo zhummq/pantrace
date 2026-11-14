@@ -135,67 +135,83 @@ async function onCopyPwd() {
 </script>
 
 <template>
-  <article class="card">
-    <span class="bar" :style="{ background: color }" aria-hidden="true"></span>
+  <div class="card-unit">
+    <article class="card">
+      <span class="bar" :style="{ background: color }" aria-hidden="true"></span>
 
-    <div class="main">
-      <div class="head">
-        <span class="badge" :style="{ color, borderColor: color + '40' }">
-          {{ item.platformName || '未知平台' }}
-        </span>
+      <div class="main">
+        <div class="head">
+          <span class="badge" :style="{ color, borderColor: color + '40' }">
+            {{ item.platformName || '未知平台' }}
+          </span>
+          <a
+            v-if="safeUrl"
+            class="title"
+            :href="safeUrl"
+            target="_blank"
+            rel="noopener noreferrer"
+            @click="onOpen"
+            v-html="titleHtml"
+          ></a>
+          <span v-else class="title" v-html="titleHtml"></span>
+        </div>
+
+        <div class="meta">
+          <span v-if="fileCountText">{{ fileCountText }}</span>
+          <i v-if="fileCountText" class="dot"></i>
+          <span>{{ sizeText }}</span>
+          <template v-if="item.sharePwd">
+            <i class="dot"></i>
+            <span class="pwd">提取码 <b>{{ item.sharePwd }}</b></span>
+          </template>
+          <!-- 纠错入口挂在卡片内部：用户判断"这条有问题"的时机只在这一屏，
+               放到页脚或者独立页面就等于没有 -->
+          <button class="flag" @click="emit('feedback', item)">这条有问题</button>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button
+          v-if="item.sharePwd"
+          class="btn ghost"
+          :class="{ done: copied === 'pwd' }"
+          @click="onCopyPwd"
+        >
+          {{ copied === 'pwd' ? '已复制' : '复制提取码' }}
+        </button>
         <a
           v-if="safeUrl"
-          class="title"
+          class="btn solid"
           :href="safeUrl"
           target="_blank"
           rel="noopener noreferrer"
           @click="onOpen"
-          v-html="titleHtml"
-        ></a>
-        <span v-else class="title" v-html="titleHtml"></span>
+        >
+          打开链接
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M7 17 17 7M9 7h8v8" />
+          </svg>
+        </a>
       </div>
+    </article>
 
-      <div class="meta">
-        <span v-if="fileCountText">{{ fileCountText }}</span>
-        <i v-if="fileCountText" class="dot"></i>
-        <span>{{ sizeText }}</span>
-        <template v-if="item.sharePwd">
-          <i class="dot"></i>
-          <span class="pwd">提取码 <b>{{ item.sharePwd }}</b></span>
-        </template>
-        <!-- 纠错入口挂在卡片内部：用户判断"这条有问题"的时机只在这一屏，
-             放到页脚或者独立页面就等于没有 -->
-        <button class="flag" @click="emit('feedback', item)">这条有问题</button>
-      </div>
-    </div>
-
-    <div class="actions">
-      <button
-        v-if="item.sharePwd"
-        class="btn ghost"
-        :class="{ done: copied === 'pwd' }"
-        @click="onCopyPwd"
-      >
-        {{ copied === 'pwd' ? '已复制' : '复制提取码' }}
-      </button>
-      <a
-        v-if="safeUrl"
-        class="btn solid"
-        :href="safeUrl"
-        target="_blank"
-        rel="noopener noreferrer"
-        @click="onOpen"
-      >
-        打开链接
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M7 17 17 7M9 7h8v8" />
-        </svg>
-      </a>
-    </div>
-  </article>
+    <!-- 时效提示挂在卡片下方：用户点开链接前的最后一秒才会犹豫，
+         提示必须贴着按钮，而不是堆在页面底部当免责声明 -->
+    <p v-if="safeUrl" class="ttl-hint">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7.5V12l3 2" />
+      </svg>
+      <span>网盘链接有效期为 <b>30 分钟</b>，请及时转存，失效后可重新获取。</span>
+    </p>
+  </div>
 </template>
 
 <style scoped>
+.card-unit {
+  display: block;
+}
+
 .card {
   position: relative;
   display: flex;
@@ -212,6 +228,29 @@ async function onCopyPwd() {
   border-color: var(--line-2);
   box-shadow: var(--shadow-md);
   transform: translateY(-1px);
+}
+
+/* 拉线对齐卡片正文（卡片 padding-left 20px），不跟色条抢位置 */
+.ttl-hint {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 6px 0 0;
+  padding-left: 21px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--warn);
+}
+
+.ttl-hint svg {
+  flex-shrink: 0;
+  opacity: 0.9;
+  transform: translateY(0.5px);
+}
+
+.ttl-hint b {
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 /* 平台色只留一条 2px 标记，不做整块染色 */
@@ -376,6 +415,11 @@ a.title:hover {
 
   .meta {
     font-size: 11.5px;
+  }
+
+  .ttl-hint {
+    padding-left: 19px;
+    font-size: 11px;
   }
 
   .flag {

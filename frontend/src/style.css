@@ -29,6 +29,10 @@
   --danger: #c0392b;
   --danger-soft: #fdf1ef;
 
+  /* 提醒色：链接时效一类"该动手但别慌"的提示 */
+  --warn: #c96a09;
+  --warn-soft: #fff8ef;
+
   /* 近直角，工具感来自几何精确而不是圆润 */
   --radius: 9px;
   --radius-sm: 6px;
