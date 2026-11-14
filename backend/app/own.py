@@ -17,6 +17,7 @@ own 这边不重复造一套。
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -24,6 +25,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 _db_path: Path | None = None
 _lock = threading.Lock()
@@ -389,6 +391,319 @@ def plan(days: int = 30, page: int = 1, page_size: int = 20) -> dict:
     }
 
 
+# ---- 补录解析：贴一段分享文案就够 ----
+#
+# 运营实测的痛点：一条链接要填主关键词、别名、标题、平台、链接、提取码、
+# 文件数、大小、备注共 9 个格子，其中 7 个是可以从链接本身推出来的。
+# 这里只做两件事：把分享文案拆成条目（纯本地正则，不联网），
+# 再对夸克补一次元信息（标题/到期/文件数，公开接口，失败就当没有）。
+
+_URL_RE = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", re.IGNORECASE)
+
+# 域名 → 平台 key，一律小写匹配；顺序即优先级
+_HOST_RULES: tuple[tuple[str, str], ...] = (
+    (r"(^|\.)pan\.quark\.cn$", "quark"),
+    (r"(^|\.)drive\.uc\.cn$", "uc"),
+    (r"(^|\.)pan\.baidu\.com$", "baidu"),
+    (r"(^|\.)(alipan|aliyundrive)\.com$", "ali"),
+    (r"(^|\.)pan\.xunlei\.com$", "xunlei"),
+    (r"(^|\.)(h5\.)?cloud\.189\.cn$", "tianyi"),
+    (r"(^|\.)115\.com$", "115"),
+    (r"(^|\.)(123pan|123684|123865)\.(com|cn)$", "123"),
+    (r"(^|\.)(caiyun|yun)\.139\.com$", "yidong"),
+    (r"(^|\.)ilanzou\.com$", "lanzou"),
+    (r"(^|\.)lanzou[a-z]*\.com$", "lanzou"),
+    (r"(^|\.)share\.weiyun\.com$", "weiyun"),
+    (r"(^|\.)guangyapan\.com$", "guangya"),
+    (r"(^|\.)ctfile\.com$", "ctfile"),
+    (r"(^|\.)pan\.wo\.cn$", "wo"),
+)
+
+# 文案里的提取码：提取码/访问码/密码/口令，后面允许缺分隔符（"pwd2hBE" 实测存在）
+_PWD_RE = re.compile(
+    r"(?:提取码|抽取码|访问码|提取密码|密码|口令|pwd|passcode)\s*[:：=]?\s*([A-Za-z0-9]{3,8})",
+    re.IGNORECASE,
+)
+# 分享标题：书名号、直角引号、半角引号都收（微信里半角 ｢｣ 很常见）
+_TITLE_RE = re.compile(r"[「『《“\"｢]([^」』》”\"｢｣]{2,120})[」』》”\"｣]")
+
+# 标题转关键词时要剥掉的噪音，越靠前越先剥
+_NOISE_RE = re.compile(
+    r"(4K|8K|1080[PI]|720[PI]|2160P|HDR|蓝光|高清|超清|标清|原盘|重制版?|"
+    r"国语|粤语|日语|中字|双语|中英字幕|内嵌字幕|字幕版?|"
+    r"未删减|无删减|完整版|修正版|修复版|"
+    r"全\s*\d+\s*季|\d+\s*-\s*\d+\s*季|第[一二三四五六七八九十百\d]+\s*季|"
+    r"全集|合集|完结|连载中|更新至[^\s,，。]*|"
+    r"BT|磁力|种子|迅雷下载|网盘资源|资源整理|资源|整理版?|珍藏版?|收藏版?|"
+    r"夸克|百度网盘|迅雷|阿里云盘|UC|123云盘|蓝奏云|"
+    r"MP4|MKV|AVI|FLAC|APE|PDF|EPUB|MOBI|AZW3|TXT|ZIP|RAR|7Z)",
+    re.IGNORECASE,
+)
+_EXT_RE = re.compile(r"\.[A-Za-z0-9]{2,5}$")
+
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+_QUARK_TOKEN = "https://drive-pc.quark.cn/1/clouddrive/share/sharepage/token?pr=ucpro&fr=pc"
+_QUARK_DETAIL = "https://drive-pc.quark.cn/1/clouddrive/share/sharepage/detail"
+# 永久分享的 expired_at 落在 2100 年，用它当天花板判断"永久"
+_FOREVER_TS = 4102416000.0
+
+
+def _platform_of(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    for pattern, key in _HOST_RULES:
+        if re.search(pattern, host):
+            return key
+    return ""
+
+
+def _trim_url(url: str) -> str:
+    """去掉粘贴时常带的尾巴标点（句号、逗号、右括号）。"""
+    return url.rstrip(".,;:!?，。；：！？、)")
+
+
+def _pwd_from_url(url: str) -> str:
+    try:
+        q = parse_qs(urlparse(url).query)
+    except ValueError:
+        return ""
+    for key in ("pwd", "passcode", "password", "code", "access_code"):
+        vals = q.get(key) or []
+        if vals and vals[0]:
+            return vals[0].strip()[:20]
+    return ""
+
+
+def _with_pwd(url: str, pwd: str) -> str:
+    """把提取码并进 URL（夸克/百度/迅雷/阿里打开即自动填充）。
+
+    顺手修一个实测的脏数据：有些导出把 `?pwd=abcd` 写成了 `?pwdabcd`，
+    等号丢了，这个参数是废的，留着只会让卡片上的链接看着像坏的。
+    """
+    if not pwd:
+        return url
+    cleaned = re.sub(r"([?&])pwd[^=&\s]{1,8}(?=&|$)", r"\1", url)
+    cleaned = cleaned.replace("?&", "?").replace("&&", "&").rstrip("?&")
+    if _pwd_from_url(cleaned):
+        return cleaned
+    key = _platform_of(cleaned)
+    if key in {"quark", "baidu", "xunlei", "ali"}:
+        return f"{cleaned}{'&' if '?' in cleaned else '?'}pwd={pwd}"
+    return cleaned
+
+
+def suggest_keyword(title: str) -> str:
+    """从分享标题推一个能用的主关键词。
+
+    匹配靠「归一化 + 双向包含」，关键词偏长还能靠 `query in term` 接住短词，
+    所以这里的目标是"干净"而不是"短"：剥掉季数/清晰度/格式/网盘名这些
+    人人会变的装饰，剩下的核心词才是用户真正会搜的东西。
+    """
+    text = (title or "").strip()
+    if not text:
+        return ""
+    text = _TITLE_RE.sub(lambda m: m.group(1), text)
+    text = re.sub(r"[\[【（(][^\[\]【】（）()]{1,30}[\]】）)]", " ", text)
+    text = _EXT_RE.sub("", text)
+    text = _NOISE_RE.sub(" ", text)
+    text = re.sub(r"[_/\\|~·—\-+]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" .-:：|")
+    if len(text) < 2:
+        # 剥完啥都不剩（标题本身就是"全集"这类词）就退回原标题
+        fallback = re.sub(r"\s+", " ", (title or "").strip())
+        return fallback[:40]
+    return text[:40]
+
+
+def _quark_meta(url: str, passcode: str, timeout: float = 6.0) -> dict:
+    """夸克分享元信息：标题、到期时间、顶层文件数与大小。
+
+    公开接口，不需要登录/签名，实测直接可用。任何失败都返回 error 字段，
+    调用方照常保存——元信息是加分项，不该拦住补录。
+    """
+    pwd_id = ""
+    path = urlparse(url).path or ""
+    m = re.search(r"/s/([A-Za-z0-9]+)", path)
+    if m:
+        pwd_id = m.group(1)
+    if not pwd_id:
+        return {"error": "链接里没找到分享 id"}
+
+    try:
+        import requests
+    except ImportError:  # pragma: no cover - 依赖缺失时静默降级
+        return {"error": "requests 未安装"}
+
+    session = requests.Session()
+    session.trust_env = False  # 和 providers 一致：不走系统代理
+    session.headers.update({"User-Agent": _UA, "Referer": "https://pan.quark.cn/"})
+    try:
+        resp = session.post(
+            _QUARK_TOKEN,
+            json={"pwd_id": pwd_id, "passcode": passcode or ""},
+            timeout=timeout,
+        )
+        tok = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"夸克接口不可达：{exc}"}
+
+    if tok.get("code") == 41008:
+        return {"needPwd": True, "error": "这条分享需要提取码"}
+    if tok.get("code") == 41019:
+        return {"expired": True, "error": "分享已过期"}
+    if tok.get("code") != 0:
+        return {"error": str(tok.get("message") or "夸克接口返回异常")}
+
+    data = tok.get("data") or {}
+    out = {
+        "title": str(data.get("title") or "")[:200],
+        "expiredAt": (float(data.get("expired_at") or 0) / 1000) or None,
+    }
+    stoken = data.get("stoken")
+    if not stoken:
+        return out
+
+    try:
+        detail = session.get(
+            _QUARK_DETAIL,
+            params={
+                "pr": "ucpro", "fr": "pc", "pwd_id": pwd_id, "stoken": stoken,
+                "passcode": passcode or "", "force": 0, "offset": 0, "size": 50,
+            },
+            timeout=timeout,
+        ).json()
+    except Exception:  # noqa: BLE001
+        return out
+
+    entries = ((detail.get("data") or {}).get("list")) or []
+    files = [e for e in entries if not e.get("dir")]
+    # 只有顶层全是文件时数字才算得准；含文件夹时留空，别在卡片上写错数
+    if files and len(files) == len(entries):
+        out["fileCount"] = len(files)
+        out["sizeBytes"] = sum(int(e.get("size") or 0) for e in files)
+    return out
+
+
+def _blocks_of(text: str) -> list[tuple[int, int]]:
+    """按空行切块，返回字符区间。
+
+    分享文案天然一块一条（标题 / 链接 / 提取码三行），空行是最好的分界线；
+    一坨没有空行的多条（论坛里那种连续列表）在块内再按"离哪个链接近"分。
+    """
+    bounds = [0]
+    for m in re.finditer(r"\n\s*\n", text):
+        bounds.append(m.start())
+        bounds.append(m.end())
+    bounds.append(len(text))
+    return list(zip(bounds[0::2], bounds[1::2]))
+
+
+def parse_share(text: str, keyword_hint: str = "", with_meta: bool = True) -> list[dict]:
+    """把粘贴的一段分享文案拆成若干条待录链接。
+
+    归属规则：块内只有一个链接，块里的标题和提取码全归它；块内多个链接时，
+    提取码归它**前面最近**的那个链接（分享文案一律是"链接 → 提取码"的顺序），
+    标题取离它最近的一个。
+    """
+    raw_text = (text or "").strip()
+    if not raw_text:
+        return []
+
+    hits = [(m.start(), _trim_url(m.group(0))) for m in _URL_RE.finditer(raw_text)]
+    if not hits:
+        return []
+
+    def _spans(regex: re.Pattern) -> list[tuple[int, int, str]]:
+        return [(m.start(), m.end(), m.group(1).strip()) for m in regex.finditer(raw_text)]
+
+    pwd_spans = _spans(_PWD_RE)
+    title_spans = _spans(_TITLE_RE)
+    used_pwd: set[int] = set()
+    used_title: set[int] = set()
+    blocks = _blocks_of(raw_text)
+
+    def _pick(spans, used: set[int], lo: int, hi: int, pos: int, prefer_left: bool) -> str:
+        best, best_dist, best_idx = "", None, None
+        for i, (s, e, val) in enumerate(spans):
+            if i in used or s < lo or e > hi or not val:
+                continue
+            if prefer_left and e <= pos:  # 提取码只认链接之后的
+                continue
+            dist = abs((s + e) // 2 - pos)
+            if best_dist is None or dist < best_dist:
+                best, best_dist, best_idx = val, dist, i
+        if best_idx is not None:
+            used.add(best_idx)
+        return best
+
+    results: list[dict] = []
+    seen: set[str] = set()
+    for idx, (pos, url) in enumerate(hits):
+        if url in seen:
+            continue
+        seen.add(url)
+
+        lo, hi = next((b for b in blocks if b[0] <= pos <= b[1]), (0, len(raw_text)))
+        in_block = [h for h in hits if lo <= h[0] <= hi]
+        multi = len(in_block) > 1
+        if multi:
+            # 块内多条：把区间收窄到"上一条链接之后 / 下一条链接之前"
+            prev = max((h[0] for h in in_block if h[0] < pos), default=lo)
+            nxt = min((h[0] for h in in_block if h[0] > pos), default=hi)
+            lo, hi = prev, nxt
+
+        pwd = _pwd_from_url(url) or _pick(pwd_spans, used_pwd, pos, hi, pos, True)
+        title = _pick(title_spans, used_title, lo, hi, pos, False)
+
+        platform = _platform_of(url)
+        item = {
+            "platform": platform,
+            "platformName": _PLATFORMS.get(platform, platform or "未知平台"),
+            "url": url,
+            "pwd": pwd,
+            "title": title,
+            "keyword": "",
+            "fileCount": 0,
+            "sizeBytes": 0,
+            "expiredAt": None,
+            "error": "",
+            "needPwd": False,
+            "dupId": 0,
+        }
+
+        if platform == "quark" and with_meta:
+            meta = _quark_meta(url, pwd)
+            if meta.get("title"):
+                item["title"] = meta["title"]
+            if meta.get("expiredAt"):
+                item["expiredAt"] = meta["expiredAt"]
+            if meta.get("fileCount"):
+                item["fileCount"] = int(meta["fileCount"])
+                item["sizeBytes"] = int(meta.get("sizeBytes") or 0)
+            if meta.get("needPwd"):
+                item["needPwd"] = True
+            item["error"] = str(meta.get("error") or "")
+
+        item["url"] = _with_pwd(url, pwd)
+        item["keyword"] = suggest_keyword(item["title"]) or (
+            keyword_hint.strip()[:60] if keyword_hint else ""
+        )
+        if not item["platform"]:
+            item["error"] = item["error"] or "认不出这是哪个网盘，请手动选平台"
+        results.append(item)
+
+    # 单条补录时，清单里那个词比从标题推的准——那是用户真正搜过的词
+    if len(results) == 1 and keyword_hint.strip():
+        results[0]["keyword"] = keyword_hint.strip()[:60]
+
+    existing = {r["share_url"]: r["id"] for r in list_links() if r.get("share_url")}
+    for it in results:
+        it["dupId"] = int(existing.get(it["url"]) or 0)
+    return results
+
+
 def save(payload: dict) -> dict:
     """新增 / 更新一条链接。校验失败抛 ValueError，接口层转 400。"""
     if not _inited:
@@ -445,6 +760,18 @@ def save(payload: dict) -> dict:
                 link_id = int(cur.lastrowid or 0)
     list_links(force=True)
     return {"id": int(link_id)}
+
+
+def save_many(items: list[dict]) -> dict:
+    """批量补录：逐条独立校验，一条坏不连坐，返回成功项和失败下标。"""
+    saved: list[dict] = []
+    errors: list[dict] = []
+    for idx, item in enumerate(items):
+        try:
+            saved.append(save(item))
+        except ValueError as exc:
+            errors.append({"index": idx, "msg": str(exc)})
+    return {"saved": saved, "errors": errors}
 
 
 def delete(link_id: int) -> bool:

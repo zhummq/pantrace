@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
 import Panel from './Panel.vue'
 import BarList from './BarList.vue'
 import StatGrid from './StatGrid.vue'
@@ -12,18 +12,27 @@ const props = defineProps({
 })
 
 const panel = ref(null)
-const keywordInput = ref(null)
+const quickInput = ref(null)
 
 const loading = ref(true)
 const error = ref('')
-const message = ref('')
-const messageErr = ref(false)
 const links = ref([])
 const misses = ref([])
 const stats = ref({})
 const editingId = ref(null)
 const saving = ref(false)
+const manualOpen = ref(false)
 
+// ---- 快速补录：粘贴 → 解析 → 确认 ----
+const quickText = ref('')
+const quickItems = ref([])
+const quickBusy = ref(false)
+const quickMessage = ref('')
+const quickErr = ref(false)
+const pendingKeyword = ref('')
+let parseTimer = null
+
+// ---- 手动表单（编辑已有链接时才需要露面）----
 const form = reactive({
   keyword: '',
   aliases: '',
@@ -47,16 +56,17 @@ const statItems = computed(() => [
   { k: '自有点击占比', v: (props.ownRatio * 100).toFixed(1) + '%' },
 ])
 const missRows = computed(() => misses.value.map((m) => ({ label: m.q, n: m.n, q: m.q })))
-const formTitle = computed(() =>
-  editingId.value
-    ? [`编辑 #${editingId.value}`, '改完保存即时生效']
-    : ['新增链接', '转存到自己网盘后，把分享链接录进来']
-)
+const quickReady = computed(() => quickItems.value.filter((it) => it.checked && !it.dupId))
+const quickHint = computed(() => {
+  if (quickBusy.value) return '识别中…'
+  if (!quickItems.value.length) return ''
+  return `识别到 ${quickItems.value.length} 条，可保存 ${quickReady.value.length} 条`
+})
 
 function flash(text, isErr) {
-  message.value = text
-  messageErr.value = !!isErr
-  if (text) setTimeout(() => { if (message.value === text) message.value = '' }, 4000)
+  quickMessage.value = text
+  quickErr.value = !!isErr
+  if (text) setTimeout(() => { if (quickMessage.value === text) quickMessage.value = '' }, 5000)
 }
 
 async function reload() {
@@ -73,6 +83,96 @@ async function reload() {
     loading.value = false
   }
 }
+
+// ---- 快速补录 ----
+
+function onQuickInput() {
+  clearTimeout(parseTimer)
+  const text = quickText.value.trim()
+  if (!text) {
+    quickItems.value = []
+    quickMessage.value = ''
+    return
+  }
+  parseTimer = setTimeout(runPreview, 500)
+}
+
+async function runPreview() {
+  const text = quickText.value.trim()
+  if (!text) return
+  quickBusy.value = true
+  try {
+    const d = await api.parseOwnShare(text, pendingKeyword.value)
+    quickItems.value = (d.items || []).map((it) => ({ ...it, checked: !it.dupId }))
+    if (!quickItems.value.length) flash('没认出链接——粘贴里得有 http(s) 开头的地址', true)
+    else if (quickMessage.value.startsWith('没认出')) flash('')
+  } catch (e) {
+    flash(e.message, true)
+  } finally {
+    quickBusy.value = false
+  }
+}
+
+/** 每行的状态徽章：已收录 / 过期 / 缺提取码 / 缺关键词 */
+function statusOf(it) {
+  if (it.dupId) return { text: '已收录，跳过', tone: 'muted' }
+  if (it.expiredAt && it.expiredAt * 1000 < Date.now()) return { text: '分享已过期', tone: 'bad' }
+  if (it.needPwd) return { text: '需要提取码', tone: 'bad' }
+  if (!it.keyword.trim()) return { text: '填个关键词', tone: 'bad' }
+  if (it.error) return { text: it.error, tone: 'warn' }
+  return { text: '可保存', tone: 'ok' }
+}
+
+function expiryText(it) {
+  if (!it.expiredAt) return ''
+  if (it.expiredAt > 4102416000) return '永久'
+  const d = new Date(it.expiredAt * 1000)
+  const days = Math.round((d.getTime() - Date.now()) / 86400000)
+  if (days < 0) return '已过期'
+  return `${d.getMonth() + 1}-${d.getDate()} 到期${days <= 7 ? `（剩 ${days} 天）` : ''}`
+}
+
+function dropRow(i) {
+  quickItems.value.splice(i, 1)
+}
+
+async function saveQuick() {
+  const items = quickReady.value
+  if (!items.length) return flash('没有可保存的条目', true)
+  const noKeyword = items.find((it) => !it.keyword.trim())
+  if (noKeyword) return flash(`这条还没关键词：${noKeyword.title || noKeyword.url}`, true)
+  saving.value = true
+  flash(`保存 ${items.length} 条…`)
+  try {
+    const d = await api.bulkSaveOwnLinks(
+      items.map((it) => ({
+        keyword: it.keyword.trim(),
+        aliases: '',
+        title: it.title || '',
+        platform: it.platform || '',
+        shareUrl: it.url,
+        sharePwd: it.pwd || '',
+        fileCount: Number(it.fileCount) || 0,
+        sizeBytes: Number(it.sizeBytes) || 0,
+        note: '',
+        enabled: true,
+      }))
+    )
+    const ok = (d.saved || []).length
+    const bad = d.errors || []
+    quickText.value = ''
+    quickItems.value = []
+    pendingKeyword.value = ''
+    await reload()
+    flash(bad.length ? `已保存 ${ok} 条，${bad.length} 条失败：${bad[0].msg}` : `已保存 ${ok} 条，下次搜索即生效`, bad.length > 0)
+  } catch (e) {
+    flash(e.message, true)
+  } finally {
+    saving.value = false
+  }
+}
+
+// ---- 手动表单 ----
 
 function reset() {
   editingId.value = null
@@ -101,18 +201,26 @@ function edit(link) {
   form.sizeGb = gb > 0 ? gb.toFixed(2) : ''
   form.note = link.note || ''
   form.enabled = !!link.enabled
+  manualOpen.value = true
   if (panel.value) panel.value.show()
+  nextTick(() => {
+    const el = document.getElementById('own-manual')
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  })
 }
 
-/** 从清单/未命中榜点「补录」：展开面板、填词、聚焦、滚到表单 */
+/** 从清单/未命中榜点「补录」：带上那个词、展开、聚焦粘贴框 */
 function fillForm(q) {
   editingId.value = null
-  form.keyword = q
+  pendingKeyword.value = q
+  manualOpen.value = false
   if (panel.value) panel.value.show()
+  // 已经贴过内容时，带上新词重算一次，别让人再手动戳「重新识别」
+  if (quickText.value.trim()) runPreview()
   requestAnimationFrame(() => {
-    if (keywordInput.value) {
-      keywordInput.value.focus()
-      keywordInput.value.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (quickInput.value) {
+      quickInput.value.focus()
+      quickInput.value.scrollIntoView({ behavior: 'smooth', block: 'center' })
     }
   })
 }
@@ -211,49 +319,106 @@ defineExpose({ reload, fillForm })
     </div>
 
     <div class="rank" style="margin-top: 16px">
-      <h2>{{ formTitle[0] }} <span>{{ formTitle[1] }}</span></h2>
-      <div class="grp-grid">
-        <label>主关键词 <span style="color: var(--red)">*</span>
-          <input ref="keywordInput" v-model="form.keyword" maxlength="60" placeholder="例：尸兄" />
-        </label>
-        <label>别名（逗号分隔，可空）
-          <input v-model="form.aliases" maxlength="300" placeholder="例：尸兄动漫,尸兄漫画" />
-        </label>
-        <label>分享标题（卡片上显示，可空则用主关键词）
-          <input v-model="form.title" maxlength="200" placeholder="例：尸兄 1-4季 全集合集" />
-        </label>
-        <label>平台
-          <select v-model="form.platform">
-            <option value="">（不指定平台）</option>
-            <option v-for="p in platforms" :key="p.key" :value="p.key">{{ p.name }}</option>
-          </select>
-        </label>
-        <label>分享链接 <span style="color: var(--red)">*</span>
-          <input v-model="form.shareUrl" maxlength="500" placeholder="https://pan.quark.cn/s/…" />
-        </label>
-        <label>提取码（可空）
-          <input v-model="form.sharePwd" maxlength="20" />
-        </label>
-        <div class="grp-grid3" style="margin-bottom: 0">
-          <label>文件数
-            <input v-model.number="form.fileCount" type="number" min="0" />
-          </label>
-          <label>大小（GB，可小数）
-            <input v-model="form.sizeGb" type="number" min="0" step="0.1" />
-          </label>
-          <label>备注（卡片小字，可空）
-            <input v-model="form.note" maxlength="200" placeholder="例：每周更新" />
-          </label>
+      <h2>快速补录 <span>粘贴分享链接或整段分享文字，其余字段自动识别</span></h2>
+
+      <div v-if="pendingKeyword" class="quick-hint">
+        正在补录清单里的词：<b>{{ pendingKeyword }}</b>
+        <button class="fb-btn" style="margin-left: 8px" @click="pendingKeyword = ''">不用这个词</button>
+      </div>
+
+      <textarea
+        ref="quickInput"
+        v-model="quickText"
+        class="quick-box"
+        rows="4"
+        spellcheck="false"
+        placeholder="例：我用夸克网盘给你分享了「尸兄 1-4季」，链接：https://pan.quark.cn/s/xxxx 提取码：abcd
+可一次粘多条（每条之间空一行，或直接连着贴）"
+        @input="onQuickInput"
+      ></textarea>
+
+      <div class="quick-bar">
+        <span class="quick-status" :class="{ bad: quickErr }">{{ quickHint || quickMessage }}</span>
+        <button class="grp-save" :disabled="saving || !quickReady.length" @click="saveQuick">
+          保存{{ quickReady.length ? ` ${quickReady.length} 条` : '' }}
+        </button>
+        <button class="fb-btn" :disabled="quickBusy || !quickText" @click="runPreview">重新识别</button>
+      </div>
+
+      <div v-if="quickItems.length" class="quick-list">
+        <div v-for="(it, i) in quickItems" :key="it.url" class="quick-row" :class="{ off: it.dupId }">
+          <input v-model="it.checked" type="checkbox" :disabled="!!it.dupId" />
+          <div class="quick-main">
+            <div class="quick-title">
+              <span class="fb-kind">{{ it.platformName }}</span>
+              <span class="fb-title">{{ it.title || '（没取到标题）' }}</span>
+              <span class="quick-badge" :class="statusOf(it).tone">{{ statusOf(it).text }}</span>
+            </div>
+            <div class="quick-meta">
+              <span v-if="it.pwd">提取码 {{ it.pwd }}</span>
+              <span v-else>无提取码</span>
+              <span v-if="it.fileCount">{{ it.fileCount }} 个文件 · {{ sizeText(it.sizeBytes) }}</span>
+              <span v-if="expiryText(it)">{{ expiryText(it) }}</span>
+            </div>
+            <div class="quick-meta url">{{ it.url }}</div>
+          </div>
+          <input
+            v-model="it.keyword"
+            class="quick-kw"
+            maxlength="60"
+            placeholder="主关键词（必填）"
+          />
+          <button class="fb-btn" @click="dropRow(i)">移除</button>
         </div>
       </div>
-      <div class="grp-actions" style="margin-top: 10px">
-        <label style="flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2)">
-          <input v-model="form.enabled" type="checkbox" /> 启用
-        </label>
-        <button class="grp-save" :disabled="saving" @click="save">保存</button>
-        <button v-if="editingId" class="grp-btn" @click="reset">取消编辑</button>
-        <span class="grp-msg" :class="{ err: messageErr }">{{ message }}</span>
-      </div>
+
+      <div v-if="quickMessage && quickItems.length" class="quick-msg" :class="{ err: quickErr }">{{ quickMessage }}</div>
+
+      <details class="quick-manual" :open="manualOpen" id="own-manual" @toggle="manualOpen = $event.target.open">
+        <summary>手动录入 / 编辑已有链接</summary>
+        <div class="grp-grid" style="margin-top: 12px">
+          <label>主关键词 <span style="color: var(--red)">*</span>
+            <input v-model="form.keyword" maxlength="60" placeholder="例：尸兄" />
+          </label>
+          <label>别名（逗号分隔，可空）
+            <input v-model="form.aliases" maxlength="300" placeholder="例：尸兄动漫,尸兄漫画" />
+          </label>
+          <label>分享标题（卡片上显示，可空则用主关键词）
+            <input v-model="form.title" maxlength="200" placeholder="例：尸兄 1-4季 全集合集" />
+          </label>
+          <label>平台
+            <select v-model="form.platform">
+              <option value="">（不指定平台）</option>
+              <option v-for="p in platforms" :key="p.key" :value="p.key">{{ p.name }}</option>
+            </select>
+          </label>
+          <label>分享链接 <span style="color: var(--red)">*</span>
+            <input v-model="form.shareUrl" maxlength="500" placeholder="https://pan.quark.cn/s/…" />
+          </label>
+          <label>提取码（可空）
+            <input v-model="form.sharePwd" maxlength="20" />
+          </label>
+          <div class="grp-grid3" style="margin-bottom: 0; grid-column: 1 / -1">
+            <label>文件数
+              <input v-model.number="form.fileCount" type="number" min="0" />
+            </label>
+            <label>大小（GB，可小数）
+              <input v-model="form.sizeGb" type="number" min="0" step="0.1" />
+            </label>
+            <label>备注（卡片小字，可空）
+              <input v-model="form.note" maxlength="200" placeholder="例：每周更新" />
+            </label>
+          </div>
+        </div>
+        <div class="grp-actions" style="margin-top: 10px">
+          <label style="flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-2)">
+            <input v-model="form.enabled" type="checkbox" /> 启用
+          </label>
+          <button class="grp-save" :disabled="saving" @click="save">保存</button>
+          <button v-if="editingId" class="grp-btn" @click="reset">取消编辑</button>
+          <span class="grp-msg" :class="{ err: quickErr }">{{ quickMessage }}</span>
+        </div>
+      </details>
     </div>
   </Panel>
 </template>

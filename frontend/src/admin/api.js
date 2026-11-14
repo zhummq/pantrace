@@ -76,6 +76,10 @@ export const plan = (days, page, pageSize) =>
   api(`/api/admin/plan?days=${days}&page=${page}&pageSize=${pageSize}`)
 export const ownLinks = (days) => api(`/api/admin/own?days=${days}`)
 export const saveOwnLink = (payload) => api('/api/admin/own', { method: 'POST', body: payload })
+export const parseOwnShare = (text, keyword) =>
+  api('/api/admin/own/parse', { method: 'POST', body: { text, keyword: keyword || '' } })
+export const bulkSaveOwnLinks = (items) =>
+  api('/api/admin/own/bulk', { method: 'POST', body: { items } })
 export const deleteOwnLink = (id) => api(`/api/admin/own/${encodeURIComponent(id)}`, { method: 'DELETE' })
 export const groupConfig = () => api('/api/admin/group')
 export const saveGroupConfig = (payload) => api('/api/admin/group', { method: 'POST', body: payload })

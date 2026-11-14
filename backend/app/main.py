@@ -718,6 +718,58 @@ async def admin_own_save(payload: OwnLinkIn, request: Request):
     return {"code": 0, "data": saved, "msg": "已保存，下次搜索即生效"}
 
 
+class ParseIn(BaseModel):
+    """补录解析输入：一段分享文案 / 链接（可多行），外加清单里点进来的那个词。"""
+
+    text: str = ""
+    keyword: str = ""
+
+
+class BulkIn(BaseModel):
+    items: list[OwnLinkIn] = []
+
+
+@app.post("/api/admin/own/parse", include_in_schema=False)
+async def admin_own_parse(payload: ParseIn, request: Request):
+    """把粘贴的分享文案解析成可入库的字段，不写库。
+
+    纯本地正则 + 夸克公开接口补元信息；解析慢的是夸克那两次请求，
+    所以丢线程池，别占事件循环。
+    """
+    if not OWN_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    text = (payload.text or "")[:8000]
+    try:
+        items = await asyncio.to_thread(own.parse_share, text, payload.keyword or "")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("分享文案解析失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"解析失败：{exc}"})
+    return {"code": 0, "data": {"items": items}}
+
+
+@app.post("/api/admin/own/bulk", include_in_schema=False)
+async def admin_own_bulk(payload: BulkIn, request: Request):
+    """批量补录：逐条保存，返回成功条数与失败原因，不整批回滚。"""
+    if not OWN_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    items = payload.items[:50]
+    if not items:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "没有可保存的条目"})
+    try:
+        result = await asyncio.to_thread(own.save_many, [i.model_dump() for i in items])
+    except Exception as exc:  # noqa: BLE001
+        log.exception("批量补录失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存失败：{exc}"})
+    ok, failed = len(result["saved"]), result["errors"]
+    log.info("own bulk saved=%s failed=%s", ok, len(failed))
+    msg = f"已保存 {ok} 条" + (f"，{len(failed)} 条失败" if failed else "，下次搜索即生效")
+    return {"code": 0, "data": result, "msg": msg}
+
+
 @app.delete("/api/admin/own/{lid}", include_in_schema=False)
 async def admin_own_delete(lid: int, request: Request):
     if not OWN_ON:
