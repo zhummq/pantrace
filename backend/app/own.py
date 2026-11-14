@@ -306,20 +306,24 @@ def misses(days: int = 30, limit: int = 20) -> list[dict]:
     return out
 
 
-def plan(days: int = 30, limit: int = 100) -> dict:
+def plan(days: int = 30, page: int = 1, page_size: int = 20) -> dict:
     """上架清单：近 N 天被搜得最多的词，已上架的自动剔除。
 
     排序按**去重人数 u**（多少人搜过），不是动作次数：
     一个人刷 20 次不代表需求大，8 个人各搜一次才是真需求。
     次数 n 只做同分排序；u=0（老数据没带访客号）时退回按次数排。
 
-    返回 total（剔除已上架后的全部词数），前端可据此提示"还有多少没展示"。
+    返回 total / totalPages，前端按页取；分页在排序之后做，翻页不会串序。
     """
     if not _inited:
-        return {"days": days, "items": [], "covered": 0, "total": 0}
+        return {
+            "days": days, "items": [], "covered": 0,
+            "total": 0, "page": 1, "pageSize": page_size, "totalPages": 0,
+        }
 
     days = max(1, min(365, int(days or 30)))
-    limit = max(1, min(500, int(limit or 100)))
+    page_size = max(1, min(100, int(page_size or 20)))
+    page = max(1, int(page or 1))
     start = time.time() - days * 86400
     buckets: dict[str, dict] = {}
 
@@ -370,7 +374,19 @@ def plan(days: int = 30, limit: int = 100) -> dict:
         items.sort(key=lambda x: (-x["u"], -x["n"], x["q"]))
     else:
         items.sort(key=lambda x: (-x["n"], -x["last"], x["q"]))
-    return {"days": days, "items": items[:limit], "covered": covered, "total": len(items)}
+
+    total = len(items)
+    total_pages = (total + page_size - 1) // page_size
+    start_idx = (page - 1) * page_size
+    return {
+        "days": days,
+        "items": items[start_idx:start_idx + page_size],
+        "covered": covered,
+        "total": total,
+        "page": page,
+        "pageSize": page_size,
+        "totalPages": total_pages,
+    }
 
 
 def save(payload: dict) -> dict:

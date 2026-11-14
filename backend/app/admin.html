@@ -163,6 +163,17 @@
   }
   .fb-btn:hover { border-color: #b7ddd5; color: var(--brand); }
 
+  /* 上架清单分页 */
+  .plan-pager {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line);
+    font-size: 12px; color: var(--muted);
+  }
+  .plan-pager button { min-width: 30px; }
+  .plan-pager button[disabled] { opacity: .4; cursor: default; }
+  .plan-pager .cur { border-color: var(--brand); color: var(--brand); font-weight: 600; }
+  .plan-pager .spacer { flex: 1; }
+
   /* 群入口配置 */
   .grp-row { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); margin-bottom: 12px; }
   .grp-row input[type="checkbox"] { width: 15px; height: 15px; }
@@ -274,12 +285,13 @@
     <div class="body">
       <div class="substats" id="plan-stats" style="margin:10px 0 14px"></div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
-        <button class="fb-btn" id="plan-copy">复制本周清单</button>
+        <button class="fb-btn" id="plan-copy">复制本页清单</button>
         <span class="grp-msg" id="plan-msg"></span>
       </div>
       <div class="rank">
         <h2>按搜索人数排序 <span>搜的人越多越先做 · 已上架的自动剔除</span></h2>
         <div id="plan-list"></div>
+        <div class="plan-pager" id="plan-pager"></div>
       </div>
     </div>
   </details>
@@ -860,12 +872,15 @@
       .catch(function (e) { ownMsg('保存失败：' + e.message, true); });
   });
 
-  // ---------------- 上架清单（按搜索次数排的待上架词） ----------------
+  // ---------------- 上架清单（按搜索人数排的待上架词） ----------------
   var planCache = [];
   var lastPlanTotal = 0;
+  var planPage = 1;
+  var PLAN_PAGE_SIZE = 20;
 
   function loadPlan(silent) {
-    fetch('/api/admin/plan?days=' + days + '&limit=100', { headers: ownHeaders(false) })
+    fetch('/api/admin/plan?days=' + days + '&page=' + planPage + '&pageSize=' + PLAN_PAGE_SIZE,
+          { headers: ownHeaders(false) })
       .then(function (res) { return res.json(); })
       .then(function (b) {
         if (b && b.code === 0) renderPlan(b.data || {});
@@ -883,12 +898,15 @@
 
   function renderPlan(d) {
     planCache = d.items || [];
-    var total = Number(d.total) || planCache.length;
+    var total = Number(d.total) || 0;
+    var page = Number(d.page) || planPage;
+    var pages = Number(d.totalPages) || 0;
+    var size = Number(d.pageSize) || PLAN_PAGE_SIZE;
     lastPlanTotal = total;
+    planPage = page;
+
     $('plan-tag').textContent = total
-      ? (planCache.length < total
-          ? '展示 ' + planCache.length + ' / 共 ' + total + ' 个词'
-          : total + ' 个词待上架')
+      ? total + ' 个词待上架 · ' + pages + ' 页'
       : '暂时没有待办';
 
     $('plan-stats').innerHTML =
@@ -896,18 +914,27 @@
       fbSmall('已上架剔除', Number(d.covered) || 0) +
       fbSmall('区间', d.days + ' 天');
 
-    if (!planCache.length) {
-      $('plan-list').innerHTML = '<div class="empty">清单是空的——要么都上架了，要么还没有搜索数据</div>';
+    // 上架后总数变少，当前页可能越界——回退到最后一页重取
+    if (!planCache.length && page > 1 && total > 0) {
+      planPage = Math.max(1, pages);
+      loadPlan(true);
       return;
     }
 
+    if (!planCache.length) {
+      $('plan-list').innerHTML = '<div class="empty">清单是空的——要么都上架了，要么还没有搜索数据</div>';
+      $('plan-pager').innerHTML = '';
+      return;
+    }
+
+    var offset = (page - 1) * size;
     $('plan-list').innerHTML = planCache.map(function (it, i) {
       var u = Number(it.u) || 0;
       var meta = (u > 0 ? u + ' 人 · ' : '') + it.n + ' 次搜索';
       return '<div class="fb-item">' +
         '<div class="fb-head">' +
         '<span class="fb-title" title="' + esc(it.q) + '">' +
-          (i + 1) + '. ' + esc(it.q) + '</span>' +
+          (offset + i + 1) + '. ' + esc(it.q) + '</span>' +
         '<span class="t">' + meta + '</span></div>' +
         '<div class="fb-actions">' +
         '<a class="fb-btn" href="/?q=' + encodeURIComponent(it.q) + '" target="_blank" ' +
@@ -915,11 +942,6 @@
         '<button class="fb-btn" data-plan-q="' + esc(it.q) + '">补录</button>' +
         '</div></div>';
     }).join('');
-
-    if (planCache.length < total) {
-      $('plan-list').innerHTML += '<div class="empty">只列出人数最多的前 ' + planCache.length +
-        ' 个（共 ' + total + ' 个）——前面的够做几周了</div>';
-    }
 
     Array.prototype.forEach.call($('plan-list').querySelectorAll('button[data-plan-q]'), function (btn) {
       btn.addEventListener('click', function () {
@@ -929,17 +951,56 @@
         $('own-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
       });
     });
+
+    renderPlanPager(page, pages, total, size);
+  }
+
+  function renderPlanPager(page, pages, total, size) {
+    var el = $('plan-pager');
+    if (pages <= 1) { el.innerHTML = ''; return; }
+
+    var from = (page - 1) * size + 1;
+    var to = Math.min(page * size, total);
+    var html = '<button class="fb-btn" data-page="' + (page - 1) + '"' +
+      (page <= 1 ? ' disabled' : '') + '>‹ 上一页</button>';
+
+    // 页码窗口最多 7 个，避免页数多了把一行塞满
+    var start = Math.max(1, page - 3);
+    var end = Math.min(pages, start + 6);
+    start = Math.max(1, end - 6);
+    for (var p = start; p <= end; p++) {
+      html += '<button class="fb-btn' + (p === page ? ' cur' : '') +
+        '" data-page="' + p + '">' + p + '</button>';
+    }
+    html += '<button class="fb-btn" data-page="' + (page + 1) + '"' +
+      (page >= pages ? ' disabled' : '') + '>下一页 ›</button>';
+    html += '<span class="spacer"></span><span>' +
+      from + '–' + to + ' / 共 ' + total + ' 个词</span>';
+    el.innerHTML = html;
+
+    Array.prototype.forEach.call(el.querySelectorAll('button[data-page]'), function (btn) {
+      if (btn.disabled) return;
+      btn.addEventListener('click', function () {
+        var p = Number(btn.getAttribute('data-page')) || 1;
+        if (p === planPage) return;
+        planPage = p;
+        loadPlan();
+        var panel = $('plan-panel');
+        panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    });
   }
 
   $('plan-copy').addEventListener('click', function () {
     if (!planCache.length) { planMsg('清单是空的', true); return; }
+    var offset = (planPage - 1) * PLAN_PAGE_SIZE;
     var lines = planCache.map(function (it, i) {
       var u = Number(it.u) || 0;
-      return (i + 1) + '. ' + it.q + '  [' + (u > 0 ? u + ' 人 / ' : '') + it.n + ' 次]';
+      return (offset + i + 1) + '. ' + it.q + '  [' + (u > 0 ? u + ' 人 / ' : '') + it.n + ' 次]';
     });
     var text = '上架清单 · 近 ' + days + ' 天（按搜索人数）\n'
       + (lastPlanTotal > planCache.length
-          ? '（只取前 ' + planCache.length + ' 个 / 共 ' + lastPlanTotal + ' 个）\n' : '')
+          ? '（第 ' + planPage + ' 页 · 共 ' + lastPlanTotal + ' 个词）\n' : '')
       + lines.join('\n');
     function fallback() {
       var ta = document.createElement('textarea');
@@ -1229,6 +1290,7 @@
   Array.prototype.forEach.call($('range').querySelectorAll('button'), function (btn) {
     btn.addEventListener('click', function () {
       days = Number(btn.getAttribute('data-days')) || 7;
+      planPage = 1;  // 换区间回到第一页，否则可能停在一个不存在的页码
       Array.prototype.forEach.call($('range').querySelectorAll('button'), function (b) {
         b.classList.toggle('on', b === btn);
       });

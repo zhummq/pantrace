@@ -637,15 +637,16 @@ async def admin_feedback_update(fid: int, payload: FeedbackUpdate, request: Requ
 async def admin_plan(
     request: Request,
     days: int = Query(30, ge=1, le=365),
-    limit: int = Query(100, ge=1, le=500),
+    page: int = Query(1, ge=1, le=10000),
+    pageSize: int = Query(20, ge=1, le=100),
 ):
-    """上架清单：按搜索人数排序的待上架词，已上架的自动剔除。"""
+    """上架清单：按搜索人数排序的待上架词，已上架的自动剔除，支持分页。"""
     if not OWN_ON:
         return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
     if not _admin_allowed(request):
         return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
     try:
-        return {"code": 0, "data": own.plan(days=days, limit=limit)}
+        return {"code": 0, "data": own.plan(days=days, page=page, page_size=pageSize)}
     except Exception as exc:  # noqa: BLE001
         log.exception("上架清单生成失败")
         return JSONResponse(status_code=500, content={"code": 500, "msg": f"生成失败：{exc}"})
