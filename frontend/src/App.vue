@@ -123,8 +123,13 @@ function showGroupManual() {
 }
 
 // 打开链接的拦截：每次都先看群，弹窗里可「不进群了，直接打开资源」放行这一次
+// 地址可能是 /go/ 站内跳转（上游结果已不再下发真实链接），相对地址同样放行
+function openable(url) {
+  return /^https?:\/\//i.test(url || '') || String(url || '').startsWith('/go/')
+}
+
 function handleOpen(item) {
-  const url = /^https?:\/\//i.test(item.shareUrl || '') ? item.shareUrl : ''
+  const url = openable(item.shareUrl) ? item.shareUrl : ''
   if (!url) return
   if (groupIntercept.value) {
     openGroup('acquire', url)

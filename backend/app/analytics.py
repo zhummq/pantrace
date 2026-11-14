@@ -40,6 +40,7 @@ KINDS = {
     "filter",    # 切换平台筛选
     "page",      # 翻页
     "retry",     # 失败后重试
+    "mirror",    # 点击转存：ok=最终有没有给出可用链接，source=cached/fresh/fallback
 }
 
 _VISITOR_RE = re.compile(r"^[A-Za-z0-9_\-]{6,64}$")

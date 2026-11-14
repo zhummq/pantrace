@@ -259,3 +259,46 @@ details.panel > .body { padding: 2px 16px 16px; border-top: 1px solid var(--line
 .quick-manual summary { cursor: pointer; font-size: 12.5px; color: var(--muted); }
 .quick-manual summary:hover { color: var(--brand); }
 @media (max-width: 720px) { .quick-row { flex-wrap: wrap; } .quick-kw { width: 100%; } }
+
+/* ---- 网盘账号 ---- */
+.acct-blank {
+  margin-top: 12px; padding: 18px 16px; border: 1px dashed var(--line-strong);
+  border-radius: 10px; background: #fcfdfe;
+  font-size: 12.5px; color: var(--muted); line-height: 1.7;
+}
+.acct-cred {
+  font-size: 11px; padding: 1px 7px; border-radius: 5px;
+  background: #f0f4f8; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.acct-err {
+  margin-top: 5px; padding: 6px 9px; border-radius: 7px;
+  background: #fdecea; color: var(--red); font-size: 11.5px;
+  word-break: break-word; line-height: 1.6;
+}
+.acct-tip {
+  margin-top: 10px; padding: 9px 11px; border-radius: 9px;
+  background: var(--brand-soft); color: #0a6357;
+  font-size: 12px; line-height: 1.7;
+}
+.acct-field { margin-bottom: 12px; }
+.acct-field > label {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 11.5px; color: var(--muted); margin-bottom: 5px;
+}
+.acct-ta { min-height: 64px; }
+.acct-req { font-size: 10.5px; padding: 0 6px; border-radius: 4px; background: #eef2f6; color: var(--ink-2); }
+.acct-req.must { background: #fff4e5; color: #b54708; }
+.acct-keep { font-size: 10.5px; color: var(--brand); }
+.acct-tool { margin-top: 16px; padding-top: 14px; border-top: 1px dashed var(--line-strong); }
+.acct-tool:first-of-type { margin-top: 12px; padding-top: 0; border-top: 0; }
+.acct-tool h3 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+.acct-tool h3 span { font-size: 11.5px; color: var(--faint); font-weight: 400; margin-left: 6px; }
+.acct-hint { margin: 0 0 10px; font-size: 11.5px; color: var(--muted); line-height: 1.7; }
+.acct-result {
+  margin-top: 10px; padding: 9px 11px; border-radius: 9px;
+  background: var(--brand-soft); color: #0a6357;
+  font-size: 12px; word-break: break-all; line-height: 1.7;
+}
+.acct-result.bad { background: #fdecea; color: var(--red); }
+

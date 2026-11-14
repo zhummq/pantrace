@@ -84,3 +84,15 @@ export const deleteOwnLink = (id) => api(`/api/admin/own/${encodeURIComponent(id
 export const groupConfig = () => api('/api/admin/group')
 export const saveGroupConfig = (payload) => api('/api/admin/group', { method: 'POST', body: payload })
 export const uploadGroupQr = (file) => api('/api/admin/group/upload', { method: 'POST', raw: file })
+
+// 网盘账号：cookie / token 只上行不下行，列表里给的是 hasCookie / hasToken 布尔值
+export const accounts = () => api('/api/admin/accounts')
+export const addAccount = (payload) => api('/api/admin/accounts', { method: 'POST', body: payload })
+export const updateAccount = (id, payload) =>
+  api(`/api/admin/accounts/${id}`, { method: 'PATCH', body: payload })
+export const deleteAccount = (id) => api(`/api/admin/accounts/${id}`, { method: 'DELETE' })
+export const testAccount = (id) => api(`/api/admin/accounts/${id}/test`, { method: 'POST' })
+export const cleanupMirrors = (coldDays) =>
+  api(`/api/admin/maintain/cleanup?cold_days=${coldDays || 0}`, { method: 'POST' })
+export const mirrorTest = (url, pwd) =>
+  api('/api/admin/mirror/test', { method: 'POST', body: { url, pwd: pwd || '' } })

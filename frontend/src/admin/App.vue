@@ -5,6 +5,7 @@ import StatGrid from './components/StatGrid.vue'
 import FeedbackPanel from './components/FeedbackPanel.vue'
 import PlanPanel from './components/PlanPanel.vue'
 import OwnPanel from './components/OwnPanel.vue'
+import AccountsPanel from './components/AccountsPanel.vue'
 import GroupPanel from './components/GroupPanel.vue'
 import InsightsPanel from './components/InsightsPanel.vue'
 import * as api from './api'
@@ -27,6 +28,7 @@ const lastLoaded = ref('')
 const feedbackPanel = ref(null)
 const planPanel = ref(null)
 const ownPanel = ref(null)
+const accountsPanel = ref(null)
 const groupPanel = ref(null)
 
 const o = computed(() => data.value.overview || {})
@@ -72,7 +74,7 @@ async function loadStats(silent = false) {
 
 function loadAll() {
   loadStats()
-  for (const p of [feedbackPanel, planPanel, ownPanel]) {
+  for (const p of [feedbackPanel, planPanel, ownPanel, accountsPanel]) {
     if (p.value) p.value.reload()
   }
 }
@@ -157,6 +159,7 @@ onUnmounted(() => {
       <FeedbackPanel ref="feedbackPanel" :days="days" />
       <PlanPanel ref="planPanel" :days="days" @fill="fillOwn" />
       <OwnPanel ref="ownPanel" :days="days" :own-ratio="ownRatio" />
+      <AccountsPanel ref="accountsPanel" />
       <GroupPanel ref="groupPanel" />
       <InsightsPanel :data="data" />
     </template>

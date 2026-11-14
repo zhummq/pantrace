@@ -8,6 +8,7 @@ export const PLATFORM_NAMES = {
   123: '123云盘',
   tianyi: '天翼云盘',
   yidong: '移动云盘',
+  c139: '移动云盘',
   wo: '联通云盘',
   guangya: '光鸭云盘',
   lanzou: '蓝奏云',

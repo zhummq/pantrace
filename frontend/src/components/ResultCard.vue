@@ -36,9 +36,11 @@ const color = computed(() => PLATFORM_COLORS[props.item.platform] || '#96a1ad')
 // 自有精选卡：站方维护的链接，视觉上要一眼和上游结果区分开
 const isOwn = computed(() => !!props.item.isOwn)
 
-// 只放行 http/https，挡掉 javascript: 之类的伪协议
+// 站内跳转地址（/go/xxx）与外部链接都放行；伪协议一律挡掉。
+// 上游结果现在给的都是 /go/ 签名地址——真实链接不再下发到浏览器。
 const safeUrl = computed(() => {
   const url = props.item.shareUrl || ''
+  if (url.startsWith('/go/')) return url
   return /^https?:\/\//i.test(url) ? url : ''
 })
 

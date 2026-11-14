@@ -9,18 +9,21 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import secrets
+import threading
 import time
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, feedback, group, own, providers
+from . import analytics, feedback, group, own, pan, providers, resolver
+from .sdk import registry
 from .config import get_settings
 from .providers import UpstreamError
 
@@ -103,6 +106,78 @@ if OWN_ON:
         log.error("自有精选链接初始化失败，已关闭：%s", exc)
 else:
     log.info("自有精选链接已关闭（OWN_ENABLED=false）")
+
+# ---- 点击时转存（链接不外露）----
+# 用户点开时不给他上游原始链接，而是当场用我们的账号转存一份、建我们名下的分享。
+# 关掉这个开关就退回老行为（直接给原链接），不存在"中间态"。
+def _start_maintenance() -> None:
+    """每 6 小时回收一次冷映射。
+
+    不用 APScheduler：一个守护线程就够。多进程部署时每个进程都会跑一遍，
+    但 cleanup 是幂等的（删文件 + 删行，重复执行只是空转），可以接受。
+    """
+    def _loop() -> None:
+        while True:
+            time.sleep(6 * 3600)
+            try:
+                result = pan.cleanup(resolver.session)
+                if result["rows"] or result["files"]:
+                    log.info(
+                        "空间回收：清 %s 行 / %s 个文件（冷映射阈值 %s 天）",
+                        result["rows"], result["files"], result["coldDays"],
+                    )
+                if result["errors"]:
+                    log.warning("空间回收有 %s 条失败：%s", len(result["errors"]), result["errors"][:3])
+            except Exception:  # noqa: BLE001
+                log.exception("空间回收失败，6 小时后再试")
+
+    threading.Thread(target=_loop, name="pan-maintenance", daemon=True).start()
+
+
+MIRROR_ON = settings.mirror_enabled
+if MIRROR_ON:
+    try:
+        resolver.init(
+            settings.analytics_path,
+            enabled=True,
+            secret=settings.mirror_secret or f"{settings.api_key}|{settings.idr_sign}",
+            fail_ttl=settings.mirror_fail_ttl,
+        )
+        pan.init(
+            settings.analytics_path,
+            timeout=settings.mirror_timeout,
+            max_attempts=settings.mirror_max_attempts,
+            cold_days=settings.mirror_cold_days,
+            max_gb=settings.mirror_max_gb,
+            min_interval=settings.mirror_min_interval,
+        )
+        # 老部署靠 MIRROR_QUARK_COOKIE 一个变量活着。表里没有夸克账号时
+        # 把它导进去，避免升级后"转存突然全挂"——这是唯一的兼容路径，别删
+        if settings.mirror_quark_cookie and not pan.list_accounts("quark"):
+            pan.add_account(
+                "quark",
+                name="默认夸克（从旧配置迁移）",
+                cookie=settings.mirror_quark_cookie,
+            )
+            log.info("已把 MIRROR_QUARK_COOKIE 迁移成账号记录，后续在后台维护")
+        accounts = pan.summary()
+        if accounts["enabled"]:
+            log.info(
+                "点击转存已启用：%s 个账号（%s）",
+                accounts["enabled"],
+                "、".join(f"{k}×{v}" for k, v in accounts["byType"].items()),
+            )
+        else:
+            log.warning(
+                "点击转存已启用，但没有任何网盘账号——所有点击会回退到上游原始链接。"
+                "在 /admin 的「网盘账号」里加一个才会真正生效。"
+            )
+        _start_maintenance()
+    except Exception as exc:  # noqa: BLE001
+        MIRROR_ON = False
+        log.error("点击转存初始化失败，已关闭：%s", exc)
+else:
+    log.info("点击转存已关闭（MIRROR_ENABLED=false），搜索结果直接给上游链接")
 
 # ---- 群入口（二维码弹窗）----
 # 图片落 backend/data/uploads/，前端通过 /uploads/<文件名> 访问。
@@ -302,6 +377,38 @@ def _attach_own(body: dict, own_items: list[dict]) -> dict:
     body["ownCount"] = len(own_items)
     return body
 
+
+def _public_body(body: dict) -> dict:
+    """把上游真实链接换成签名跳转地址，再交给前端。
+
+    这是"链接不外露"的唯一出口，只能在响应时做，**不能写进缓存**：
+    缓存里留着原始链接，_apply_hidden 才有东西可比，改密钥/关开关也能立刻生效。
+
+    自有精选卡不动——那条链接本来就是我们自己的。
+    提取码一并抹掉：落地页会带我们分享的提取码，卡片上留一个上游的码
+    只会让人复制了发现不对。
+
+    `shareCode` 必须一起清：它就是网盘分享 id（实测夸克是 /s/ 后面那串），
+    留着等于把真实链接换个字段发出去，前面做的全都白搭。
+    """
+    if not MIRROR_ON:
+        return body
+    items = []
+    for raw in body.get("items") or []:
+        item = dict(raw)
+        url = item.get("shareUrl") or ""
+        if url and not item.get("isOwn"):
+            item["shareUrl"] = "/go/" + resolver.make_token(
+                url, item.get("sharePwd") or "", item.get("platform") or "",
+                item.get("title") or "",
+            )
+            item["sharePwd"] = ""
+            item["shareCode"] = ""
+        items.append(item)
+    out = dict(body)
+    out["items"] = items
+    return out
+
 # 界面用的平台列表。只放上游实测确认过的 key：
 # 传一个上游不认识的 key 会让整次搜索报 1001，所以宁缺勿滥。
 PLATFORMS = [
@@ -361,6 +468,8 @@ async def health():
         "failed": len(_fail_cache),
         "analytics": ANALYTICS_ON,
         "feedback": FEEDBACK_ON,
+        "mirror": MIRROR_ON,
+        "mirrorAccount": bool(settings.mirror_quark_cookie),
     }
 
 
@@ -422,7 +531,7 @@ async def search(
                 result_count=len(body.get("items") or []),
                 cached=True,
             )
-        return _apply_hidden(_attach_own(body, own_items))
+        return _public_body(_apply_hidden(_attach_own(body, own_items)))
 
     failed = _fail_cache.get(cache_key)
     if failed and now - failed[0] < FAIL_TTL:
@@ -509,7 +618,187 @@ async def search(
         query, page, len(body["items"]), upstream_ms,
     )
     # dict(body)：body 已进缓存，自有卡只在响应时挂，不能污染缓存本体
-    return _apply_hidden(_attach_own(dict(body), own_items))
+    return _public_body(_apply_hidden(_attach_own(dict(body), own_items)))
+
+
+# ---- 点击跳转：/go/<token> ----
+#
+# 上游真实链接不再出现在搜索结果里，前端只拿到这里的签名地址。
+# 这一步是整套机制的关键：链接一旦下发到浏览器，改什么逻辑都晚了——
+# 用户可以直接复制走。签名 token 只解出源链接，解不出我们的账号信息。
+#
+# 为什么不在 /go 里直接 302：转存要 1–3 秒，直接 302 会把这段时间变成
+# 新标签页的白屏，用户以为打不开就关掉了。给一张"正在准备"的过渡页，
+# 期间还能把失败变成"返回重试/反馈"的动作。
+
+_GO_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>正在准备资源 · 盘迹</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;
+  background:#f7f8fa;color:#1b2430;
+  font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.box{width:min(420px,calc(100vw - 40px));padding:34px 30px;background:#fff;
+  border:1px solid #e6e9ef;border-radius:14px;text-align:center;
+  box-shadow:0 10px 30px -18px rgba(20,30,45,.35)}
+.brand{font:600 12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.14em;
+  text-transform:uppercase;color:#00a99d;margin-bottom:22px}
+.ring{width:30px;height:30px;margin:0 auto 18px;border-radius:50%;
+  border:2.5px solid #d9ede9;border-top-color:#00a99d;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+h1{margin:0 0 8px;font-size:17px;font-weight:600;letter-spacing:-.01em}
+p{margin:0;color:#7b8794;font-size:13px}
+.err{color:#b4462f;margin-top:14px;display:none}
+.acts{margin-top:20px;display:none;gap:10px;justify-content:center}
+a.btn{display:inline-flex;align-items:center;height:34px;padding:0 15px;border-radius:8px;
+  font-size:13px;text-decoration:none;color:#1b2430;border:1px solid #dfe3e9}
+a.btn.primary{background:#1b2430;color:#fff;border-color:#1b2430}
+</style></head>
+<body>
+<div class="box">
+  <div class="brand">PanTrace</div>
+  <div class="ring" id="ring"></div>
+  <h1 id="title">正在准备资源</h1>
+  <p id="hint">首次打开需要转存一份，通常 1–3 秒</p>
+  <p class="err" id="err"></p>
+  <div class="acts" id="acts">
+    <a class="btn" href="/">返回搜索</a>
+    <a class="btn primary" id="fb" href="/">提交反馈</a>
+  </div>
+</div>
+<script>
+var TOKEN = __TOKEN__;
+var slow = setTimeout(function () {
+  document.getElementById('hint').textContent = '资源较大，转存稍慢，请再等一会儿…';
+}, 4000);
+function fail(msg) {
+  clearTimeout(slow);
+  document.getElementById('ring').style.display = 'none';
+  document.getElementById('title').textContent = '资源暂时打不开';
+  document.getElementById('hint').textContent = msg || '这条资源可能已失效';
+  var e = document.getElementById('err');
+  e.textContent = '换一个关键词，或者告诉我们你要找什么。';
+  e.style.display = 'block';
+  document.getElementById('acts').style.display = 'flex';
+  document.getElementById('fb').href = '/?fb=' + encodeURIComponent(location.pathname);
+}
+fetch('/api/resolve', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  cache: 'no-store',
+  body: JSON.stringify({ t: TOKEN })
+}).then(function (r) { return r.json() }).then(function (j) {
+  if (j && j.url) { clearTimeout(slow); location.replace(j.url); return }
+  fail(j && j.msg);
+}).catch(function () { fail('网络中断，请返回重试'); });
+</script>
+</body></html>"""
+
+
+@app.get("/go/{token}", include_in_schema=False)
+async def go_page(token: str):
+    """过渡页。真正的解析在 /api/resolve，页面只负责显示状态并跳转。"""
+    if token.lower().startswith("favicon"):
+        return Response(status_code=404)
+    if not MIRROR_ON:
+        # 关掉开关后旧链接不该 404：直接送回首页，别让用户撞墙
+        return RedirectResponse("/", status_code=302)
+    html = _GO_HTML.replace("__TOKEN__", json.dumps(token[:900]))
+    return HTMLResponse(
+        html,
+        headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+    )
+
+
+class ResolveIn(BaseModel):
+    t: str = ""
+
+
+# 单 IP 打开频率。正常用户一分钟点不了十次；脚本扫这个接口是在试我们的账号额度。
+_resolve_hits: dict[str, tuple[float, int]] = {}
+RESOLVE_PER_10MIN = 60
+
+
+def _resolve_allowed(ip: str) -> bool:
+    now = time.time()
+    window, count = _resolve_hits.get(ip, (now, 0))
+    if now - window > 600:
+        window, count = now, 0
+    count += 1
+    _resolve_hits[ip] = (window, count)
+    if len(_resolve_hits) > 4096:
+        for key, (started, _) in list(_resolve_hits.items()):
+            if now - started > 600:
+                _resolve_hits.pop(key, None)
+    return count <= RESOLVE_PER_10MIN
+
+
+@app.post("/api/resolve", include_in_schema=False)
+async def api_resolve(
+    payload: ResolveIn, request: Request, background: BackgroundTasks
+) -> JSONResponse:
+    """把签名 token 换成可跳转的地址。
+
+    成功 → 我们的分享链接；失败 → 按配置回退到上游原链接（带提取码）。
+    这里永远返回 200 + url 字段，除非 token 本身是伪造的——
+    过渡页只认 url，错误码会让它把"已失效"和"转存失败"混成一句网络错误。
+    """
+    if not MIRROR_ON:
+        return JSONResponse(status_code=404, content={"code": 404, "msg": "功能未启用"})
+    if not _resolve_allowed(client_ip(request)):
+        return JSONResponse(status_code=429, content={"code": 429, "msg": "打开太频繁，过几分钟再试"})
+
+    info = resolver.read_token(payload.t)
+    if not info:
+        return JSONResponse(
+            status_code=400, content={"code": 400, "msg": "链接已失效，回到首页重新搜索即可"}
+        )
+
+    started = time.perf_counter()
+    result = await asyncio.to_thread(
+        resolver.mirror, info["url"], info["pwd"], info["platform"], info["title"]
+    )
+    took = int((time.perf_counter() - started) * 1000)
+
+    url, fallback, msg = result["url"], False, result.get("reason") or ""
+    if not result["ok"]:
+        if settings.mirror_fallback:
+            # 回退要带提取码：用户拿到的是一半链接等于没给
+            url, fallback = resolver.with_pwd(info["url"], info["pwd"]), True
+            msg = msg or "资源准备失败"
+        else:
+            url = ""
+
+    if ANALYTICS_ON:
+        background.add_task(
+            analytics.record,
+            "mirror",
+            visitor=_visitor_of(request)[0],
+            ip=client_ip(request),
+            ua=request.headers.get("user-agent", ""),
+            platform=info["platform"],
+            target=info["title"],
+            ok=bool(url),
+            duration_ms=took,
+            source="fallback" if fallback else ("cached" if result.get("cached") else "fresh"),
+            meta={"reason": msg} if msg else {},
+        )
+    if not result["ok"]:
+        log.info("mirror miss platform=%s reason=%s fallback=%s", info["platform"], msg, fallback)
+
+    return JSONResponse(
+        content={
+            "code": 0,
+            "url": url,
+            "fallback": fallback,
+            "cached": bool(result.get("cached")),
+            "msg": "" if url else (msg or "资源暂时不可用"),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 class FeedbackIn(BaseModel):
@@ -538,6 +827,12 @@ async def submit_feedback(payload: FeedbackIn, request: Request) -> JSONResponse
 
     ip = client_ip(request)
     visitor, _, _ = _visitor_of(request)
+    # 前端拿到的是 /go/ 签名地址，不能直接入库：自动隐藏是按真实 URL 比对的，
+    # 存成 /go/xxx 的话下次搜到同一条永远匹配不上，报失效就白报了。
+    report_url = payload.url
+    if report_url.startswith("/go/"):
+        info = resolver.read_token(report_url[4:])
+        report_url = info["url"] if info else ""
     try:
         result = feedback.submit(
             payload.kind,
@@ -545,7 +840,7 @@ async def submit_feedback(payload: FeedbackIn, request: Request) -> JSONResponse
             query=payload.query,
             platform=payload.platform,
             target=payload.target,
-            url=payload.url,
+            url=report_url,
             contact=payload.contact,
             visitor=visitor,
             ip=ip,
@@ -780,6 +1075,157 @@ async def admin_own_delete(lid: int, request: Request):
     if not ok:
         return JSONResponse(status_code=404, content={"code": 404, "msg": "没有这条链接"})
     return {"code": 0, "msg": "已删除"}
+
+
+@app.get("/api/admin/mirror", include_in_schema=False)
+async def admin_mirror(request: Request):
+    """转存映射表：成功/失败/命中数 + 最近 30 条。
+
+    排障主要看两点：fail 里是不是清一色"登录态已失效"（该换 cookie），
+    或者清一色"超出容量阈值"（该调大阈值或换大容量账号）。
+    """
+    if not MIRROR_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "点击转存已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        return {"code": 0, "data": resolver.stats()}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("转存映射查询失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"查询失败：{exc}"})
+
+
+class MirrorTestIn(BaseModel):
+    url: str = ""
+    pwd: str = ""
+
+
+# ---- 网盘账号管理 ----
+#
+# 账号从 .env 搬进了库，后台直接维护。MIRROR_QUARK_COOKIE 只在首次启动时
+# 迁移一次，之后以表为准——两边同时写会互相覆盖，别再加回去。
+
+class AccountIn(BaseModel):
+    type: str = ""
+    name: str = ""
+    cookie: str = ""
+    access_token: str = ""
+    refresh_token: str = ""
+    temp_dir: str = ""
+    expires_at: int = 0
+    status: int = 1
+
+
+@app.get("/api/admin/accounts", include_in_schema=False)
+async def admin_accounts(request: Request):
+    """账号概览。cookie / token 一律不下发，只回 hasCookie / hasToken。"""
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        data = pan.summary()
+        data["supported"] = registry.available()
+        return {"code": 0, "data": data}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("账号列表查询失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"查询失败：{exc}"})
+
+
+@app.post("/api/admin/accounts", include_in_schema=False)
+async def admin_account_add(payload: AccountIn, request: Request):
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    platform = (payload.type or "").strip().lower()
+    if not registry.supported(platform):
+        return JSONResponse(
+            status_code=400,
+            content={"code": 400, "msg": f"不支持的网盘类型：{platform or '空'}"},
+        )
+    if not (payload.cookie.strip() or payload.refresh_token.strip() or payload.access_token.strip()):
+        return JSONResponse(
+            status_code=400,
+            content={"code": 400, "msg": "至少填一项凭据（cookie / refresh_token / access_token）"},
+        )
+    aid = pan.add_account(
+        platform,
+        name=payload.name.strip(),
+        cookie=payload.cookie.strip(),
+        access_token=payload.access_token.strip(),
+        refresh_token=payload.refresh_token.strip(),
+        expires_at=payload.expires_at,
+        temp_dir=payload.temp_dir.strip(),
+    )
+    return {"code": 0, "id": aid, "msg": "已添加"}
+
+
+@app.patch("/api/admin/accounts/{aid}", include_in_schema=False)
+async def admin_account_update(aid: int, payload: AccountIn, request: Request):
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    fields = {
+        key: value
+        for key, value in {
+            "name": payload.name.strip(),
+            "cookie": payload.cookie.strip(),
+            "access_token": payload.access_token.strip(),
+            "refresh_token": payload.refresh_token.strip(),
+            "temp_dir": payload.temp_dir.strip(),
+            "expires_at": payload.expires_at,
+            "status": payload.status,
+        }.items()
+        if value not in ("", 0) or key in ("status",)
+    }
+    if not fields:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "没有要改的字段"})
+    pan.update_account(aid, **fields)
+    return {"code": 0, "msg": "已保存"}
+
+
+@app.delete("/api/admin/accounts/{aid}", include_in_schema=False)
+async def admin_account_delete(aid: int, request: Request):
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    pan.delete_account(aid)
+    return {"code": 0, "msg": "已删除"}
+
+
+@app.post("/api/admin/accounts/{aid}/test", include_in_schema=False)
+async def admin_account_test(aid: int, request: Request):
+    """单账号体检。失败会累加 fail_count，影响后续被选中的顺序。"""
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    result = await asyncio.to_thread(pan.probe, aid)
+    return {"code": 0, "data": result}
+
+
+@app.post("/api/admin/maintain/cleanup", include_in_schema=False)
+async def admin_cleanup(request: Request, cold_days: int = 0):
+    """回收冷映射占用的空间。
+
+    只删两类：失败超过 7 天的行、零点击且超过 cold_days 天的映射（连文件）。
+    有热度的映射一律不动——删了就是把用户手上的链接打死。
+    """
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        result = await asyncio.to_thread(pan.cleanup, resolver.session, cold_days=cold_days)
+        return {"code": 0, "data": result}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("空间回收失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"回收失败：{exc}"})
+
+
+@app.post("/api/admin/mirror/test", include_in_schema=False)
+async def admin_mirror_test(payload: MirrorTestIn, request: Request):
+    """手工验一条链接，不经过前端。填完 cookie 先用它验证，别等真人点击。"""
+    if not MIRROR_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "点击转存已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    url = (payload.url or "").strip()[:500]
+    if not url.startswith("http"):
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "给一条完整分享链接"})
+    result = await asyncio.to_thread(resolver.mirror, url, payload.pwd or "", "", "", True)
+    return {"code": 0, "data": result}
 
 
 @app.get("/api/group", include_in_schema=False)

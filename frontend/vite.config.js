@@ -25,6 +25,12 @@ export default defineConfig({
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
+      // 点击跳转地址由后端签发（/go/<token>），开发时必须代理，
+      // 否则会被 Vite 当成前端路由返回 index.html，点了没反应
+      '/go': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
     },
   },
 })

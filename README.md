@@ -12,6 +12,9 @@ backend/
   app/feedback.py     反馈/求资源：工单表、限流、去重、聚合
   app/group.py        群入口配置：二维码/群号/弹窗策略（app_config 表）
   app/own.py          精选链接：自有资源库、搜索匹配、未命中词日志
+  app/resolver.py     点击时转存：链接映射、单飞、签名跳转（不认识具体网盘）
+  app/pan.py          网盘账号表 + 多账号轮换 + 失败转移 + 空间回收
+  app/sdk/            网盘操作 SDK：夸克/UC/百度/迅雷/光鸭/移动139（见「网盘 SDK」）
   .env                apikey 等敏感配置，已被 gitignore
   requirements.txt
 frontend/
@@ -22,7 +25,7 @@ frontend/
   src/admin/          看板（Vue 应用，独立入口）
     App.vue           壳：口令门、区间切换、60s 自动刷新
     api.js            统一请求层（口令、401、错误处理）
-    components/       Panel/StatGrid/BarList/Pager + 五个业务面板
+    components/       Panel/StatGrid/BarList/Pager + 六个业务面板（含「网盘账号」）
   admin.html          看板的 Vite 入口（与 index.html 一起构建）
   src/api.js          接口封装
   vite.config.js      dev 时 /api、/uploads 代理到 8000；build 双入口
@@ -71,6 +74,8 @@ npm run dev
 | GET | `/api/search?q=关键词&platforms=quark,baidu&page=1&page_size=20` | 搜索 |
 | GET | `/api/platforms` | 平台列表（前端筛选用） |
 | GET | `/api/health` | 健康检查 |
+| GET | `/go/{token}` | 点击跳转过渡页（不缓存、noindex）；解析完自动跳转 |
+| POST | `/api/resolve` | token → 可用地址（我们的分享链接，失败则回退原链接），body `{"t":"..."}` |
 | POST | `/api/track` | 前端行为上报（内部用，见下节） |
 | POST | `/api/feedback` | 提交反馈 / 求资源 |
 | GET | `/api/group` | 群入口配置（进站/获取链接弹窗用，公开） |
@@ -86,10 +91,12 @@ npm run dev
 | POST | `/api/admin/own/bulk` | 批量保存解析结果（逐条校验，坏条不连坐，上限 50 条），需 `X-Admin-Token` |
 | POST | `/api/admin/own` | 新增/更新精选链接（id 为空即新增），需 `X-Admin-Token` |
 | DELETE | `/api/admin/own/{id}` | 删除精选链接，需 `X-Admin-Token` |
+| GET | `/api/admin/mirror` | 转存映射：成功/失败/命中数/占用体积 + 最近 30 条，需 `X-Admin-Token` |
+| POST | `/api/admin/mirror/test` | 手工验一条链接的转存结果（验 cookie 用），需 `X-Admin-Token` |
 | GET | `/admin` | 用户行为看板（Vue 构建产物，`no-store` 不缓存） |
 | GET | `/docs` | FastAPI 自带接口文档 |
 
-前端只拿到清洗后的字段（`platform` / `title` / `shareUrl` / `sharePwd` / `fileCount` / `sizeBytes`），**拿不到 apikey，也拿不到上游的 `highlightedTitle`**（那是远端 HTML，直接渲染就是 XSS 口子；高亮由前端自己按关键词标记，且先转义）。
+前端只拿到清洗后的字段（`platform` / `title` / `shareUrl` / `sharePwd` / `fileCount` / `sizeBytes`），**拿不到 apikey，也拿不到上游的 `highlightedTitle`**（那是远端 HTML，直接渲染就是 XSS 口子；高亮由前端自己按关键词标记，且先转义）。开了点击转存后，`shareUrl` 是 `/go/<签名token>` 而不是真实链接，`sharePwd` 恒为空。
 
 ## 上游实测踩到的坑（改代码前先看）
 
@@ -123,6 +130,7 @@ python -c "import secrets;print(secrets.token_urlsafe(18))"   # 生成
 | `search` | **后端** | 关键词、平台筛选、页码、结果数、耗时、是否缓存、失败原因 |
 | `click` | 前端 | 点开了哪条资源（标题 + 平台），带 `sendBeacon` 保证跳转前发出 |
 | `copy_pwd` | 前端 | 复制了提取码 |
+| `mirror` | **后端** | 点击转存的落地结果：`ok`/耗时/`source=cached/fresh/fallback`/失败原因 |
 | `filter` / `page` / `retry` | 前端 | 换平台、翻页、失败重试 |
 
 搜索走服务端记录，不怕广告拦截插件；点击这类动作必须前端报，所以用 `navigator.sendBeacon`，页面跳走也能发出去。
@@ -267,6 +275,157 @@ sqlite3 backend/data/analytics.db \
 
 `OWN_ENABLED=false` 是总闸，关掉只影响精选卡，埋点和反馈不受影响。
 
+## 点击时转存（链接不外露）
+
+2026-11 的主路径：**不再人工补录关键词库**，改成用户点开时才动手——把上游那条分享用我们自己的网盘账号转存一份，建一个我们名下的分享，再把用户送过去。
+
+### 为什么不补录
+
+补录的前提是"提前知道用户会搜什么"，实际覆盖率永远追不上长尾，而且一条条贴链接是纯人力。改成点击时转存后，**长尾自动被覆盖**：只要有第一个人点，这条资源就进了我们的库，第二个人点开是 0 延迟。
+
+### 链路
+
+```
+搜索 → 返回 /go/<签名token>（不是真实链接）
+  ↓ 用户点开
+过渡页「正在准备资源」
+  ↓ POST /api/resolve
+  ├ 命中 mirrors 表 → 直接给我们的分享链接
+  ├ 未命中 → 转存 → 建分享 → 落库 → 给我们的分享链接
+  └ 失败 → 回退到上游原链接（自动带上提取码）
+```
+
+| 环节 | 位置 | 说明 |
+|---|---|---|
+| 签名 token | `resolver.make_token` | HMAC 签名，只放跳转必需字段。**没有签名就是开放重定向**，别人能拿本站当钓鱼跳板；域名还有白名单，非网盘域名签不出来 |
+| 过渡页 | `GET /go/{token}` | 转存要 1–3 秒，直接 302 会把这段时间变成白屏。页面上有"资源较大，稍等"和失败时的返回/反馈出口 |
+| 转存 | `pan.transfer` → `sdk/adapters/*` | 挑账号（按失败次数升序）→ 解析分享 → 转存进临时目录 → 建永久分享。失败按语义换账号：登录态失效/空间满才换；链接失效、违规、体积超限直接抛，不折腾账号 |
+| 映射表 | `mirrors` | `src_key` 是忽略 `?pwd` 的链接指纹，同一份分享带不同提取码不会重复转存。同时记 `account_id` 和 `fids`，回收时才知道去哪个号删哪些文件 |
+| 结果 | `_public_body` | 只在响应出口替换链接，**不写进缓存**：缓存留着原始 URL，`_apply_hidden` 才有东西可比，改密钥/关开关也立刻生效 |
+
+前端只拿到 `/go/xxx`，拿不到真实链接。提取码也不再下发到卡片上（落地页给的码和上游的码可能不是一个），卡片上的"复制提取码"会自动消失。
+
+### 配置
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MIRROR_ENABLED` | `true` | 总闸。关掉恢复老行为（直接给上游链接） |
+| `MIRROR_MAX_GB` | `30` | 单条资源超过这个体积就不转，直接回退。**别为了多覆盖调大**——网盘空间是硬成本 |
+| `MIRROR_FAIL_TTL` | `600` | 失败结果缓存 10 分钟，避免每个点击都去打接口 |
+| `MIRROR_MAX_ATTEMPTS` | `3` | 一次转存最多试几个账号，失败换下一个 |
+| `MIRROR_MIN_INTERVAL` | `3` | 同一平台两次转存的最小间隔（秒）。**别调小**，并发转存是最容易被风控的行为 |
+| `MIRROR_COLD_DAYS` | `30` | 零点击超过这么多天的映射，连文件一起回收 |
+| `MIRROR_TIMEOUT` | `15` | 单次请求超时（秒） |
+| `MIRROR_SECRET` | 空 | token 签名密钥，留空由 `API_KEY` 派生。换掉 = 已发出的旧链接全部失效（回退，不 404） |
+| `MIRROR_FALLBACK` | `true` | 失败是否回退原链接。`false` 则提示"资源暂时打不开" |
+| `MIRROR_QUARK_COOKIE` | 空 | **只用于升级迁移**：库里一个夸克账号都没有时导入一次，之后以表为准。新部署别填 |
+
+### 账号在哪配
+
+在 `/admin` 的「网盘账号」面板，**不再靠环境变量**。同一个平台可以放多个账号。
+
+- **测试**：发一次轻量请求验登录态，失败会累加 `fail_count` 并记下原因，不会静默失灵
+- **测试与维护 → 手工验一条链接**：绕开失败缓存，真跑一遍「解析 → 转存 → 建分享」。新接的网盘先用它验，别等真人点击
+- **怎么选号**：`fail_count` 升序 + 同分随机打散，最多试 `MIRROR_MAX_ATTEMPTS` 个。只有「登录态失效」和「空间满」会换号；链接失效、内容违规、体积超限换号也没用，直接抛
+- **凭据自动回写**：夸克响应头里的 `__puus`、百度轮换的 refresh_token、迅雷 / 光鸭刷新出的 access_token 都会落库，重启不用重填
+
+| 平台 | 必填 | 备注 |
+|---|---|---|
+| 夸克 / UC | Cookie（含 `__puus`、`__uid`） | 请求中自动续期 |
+| 百度 | Cookie（含 BDUSS + STOKEN）或 refresh_token | 有 refresh_token 可自愈过期 |
+| 迅雷 | refresh_token | 每请求都要现换 access_token 并带 `x-captcha-token` |
+| 光鸭 | refresh_token 或 access_token | 转存不回 fid，靠目录前后 diff 找文件，别并发 |
+| 移动 139 | Cookie（含 `authorization`）+ 临时目录 | 请求体 AES-128-CBC 加密，临时目录必须先在盘里建好 |
+
+抓 cookie：浏览器登录对应网盘 → F12 → Network → 任意接口请求 → 复制整条 `Cookie` 请求头。填完先验一条：
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/admin/mirror/test \
+  -H "X-Admin-Token: $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"url":"https://pan.quark.cn/s/xxxx","pwd":""}'
+# {"code":0,"data":{"ok":true,"url":"https://pan.quark.cn/s/yyyy","reason":"","cached":false}}
+```
+
+看映射表状态：`GET /api/admin/mirror` → `ok` / `fail` / `hits` / `bytes` + 最近 30 条。
+`fail` 里清一色"资源不存在或已失效"就是源链接烂了，不用管账号；清一色"登录态"才该换 cookie；清一色"超出转存容量阈值"就调 `MIRROR_MAX_GB` 或换大容量账号。
+
+### 接口从哪来（改之前必读）
+
+夸克**没有**这套 API 的开放文档。`sharepage/token`、`save`、`task`、`share` 全部来自社区逆向，公开出处是 alist 的夸克驱动与 issue（贴过完整请求/响应体）、`Cp0204/quark-auto-save` 这类转存脚本。可信度分档：
+
+| 接口 | 可信度 | 依据 |
+|---|---|---|
+| `sharepage/token`、`detail` | 高 | `own._quark_meta` 已在线上跑了几个月，公开接口、无需登录 |
+| `sharepage/save`、`task` | 高 | alist issue #2968 里有原始请求体，参数逐字对得上（fid_list / fid_token_list / stoken / pdir_save_all / status=2 / save_as_top_fids） |
+| `POST /share` | 中 | 路径确定，但 `url_type` / `expired_type` 的取值各来源**说法冲突**（有资料写 1 = 永久，代码用的是 4） |
+| cookie 字段 | 中 | `__pus`/`__puus` 是社区共识，实际可能还需要 `__kp` |
+
+正因为中可信度那两行，代码里有到期时间自检：建完分享读回真实 `expired_at`，不是永久就写日志并在 `/api/admin/mirror` 的 `reason` 里留一条。**别凭记忆改这些常量**——没有文档，唯一可信的是在自己账号上跑一次。
+
+要自己核实时抓一次包就行：DevTools → Network → 手动转存一次 → 看 `/share/sharepage/save` 的请求体和 `/task` 的响应，和我们代码里的字段逐条比。
+
+### 三个必须知道的约束
+
+1. **容量是硬成本**。转存永久占我们账号空间，而且**分享出去后不能删源文件**（删了分享立刻断）。30G 阈值就是为这个设的——宁可这一条给原链接，也不要把账号塞爆。
+2. **账号会一起死**。同一个平台的多个账号往往是用同一批小号一起注册的，风控一波带走一片。多账号能扛住"单个号被限"，扛不住"平台清场"。cookie 全失效时点击会回退到原链接——这比签名过期更隐蔽（用户照样能打开，只是链接不是我们的），所以看板把 `mirror` 事件单独记了 `source=cached/fresh/fallback`，`fallback` 占比突然升高就是账号出事了。
+3. **责任主体变了**。上游链接的性质是"网友随手分享"，转存后是**我们名下的分享**——违规内容、侵权投诉的接收方从别人变成你。这一条在技术上无解，只能靠验货时把关。
+
+### 与精选链接的关系
+
+`own_links` 那套（人工补录 + 置顶卡）保留但不再是主路径：它现在只用于"我愿意为这个词做站方担保"的高价值词。**未命中榜和上架清单的运营逻辑照旧**，只是不必再为了覆盖率一条条补——长尾交给点击转存兜。
+
+## 网盘 SDK（`backend/app/sdk/`）
+
+把"下载分享 → 转存到自己盘 → 建新分享"这套动作抽象成统一接口，业务层不认识任何一家网盘。目前接入了 **夸克 / UC / 百度 / 迅雷 / 光鸭 / 移动 139**。
+
+```
+sdk/
+  errors.py     语义异常（按"该做什么"分类，不按网盘、不按错误码）
+  types.py      Account / ShareInfo / File / ShareLink / TaskResult
+  cookie.py     cookie 解析、合并、脱敏
+  http.py       请求层：注入公共头、回收 Set-Cookie、网络重试
+  urls.py       分享链接识别（7 种 URL 形态 + 域名白名单）
+  base.py       PanClient 抽象基类 + mirror() 统一流水线
+  registry.py   类型注册表 + 工厂
+  adapters/
+    quark/  baidu/  xunlei/  guangya/  c139/
+```
+
+### 唯一要记住的东西：异常决定动作
+
+上层只判断四件事，不查任何错误码：
+
+| 异常 | `account_bad` | `share_bad` | 上层动作 |
+|---|---|---|---|
+| `AuthError` | ✓ | | 标记账号失效，换下一个，别重试 |
+| `QuotaExceededError` | ✓ | | 换账号，不重试 |
+| `ShareInvalidError` / `ShareExpiredError` | | ✓ | 下架这条资源，回退原链接 |
+| `PasscodeRequired/WrongError` | | ✓ | 提示用户补码，**不下架** |
+| `ViolationError` | | ✓ | 下架 + 删已转存的文件 |
+| `TooLargeError` | | | 直接回退。换账号没用，也别记在账号头上 |
+| `TaskTimeoutError` / `UpstreamError` | | | 可以重试一次 |
+| `ConfigError` / `UnsupportedError` | | | 我们自己的问题，重试没意义，要报警 |
+
+新增网盘时**只做一件事**：在它的 `ERROR_MAP` 里把码映射到上面已有的类。映射不出来说明遇到了新情况——先加类，别塞进 `UpstreamError`，否则线上排查又只剩一句"转存失败"。
+
+### 加一个网盘
+
+1. 新建 `sdk/adapters/<名字>/client.py`，继承 `PanClient`，实现 `share_info` / `transfer` / `list_files` / `delete` / `_build_requester`，建议覆盖 `probe`
+2. 类上写 `type = "<名字>"`，加 `@register`
+3. 在 `sdk/adapters/__init__.py` 里 import 一次
+4. 如果搜索上游用的平台 key 和这里的 type 不一致，在 `registry._ALIASES` 里对齐（比如 `yidong → c139`）
+
+业务层、后台面板、清理任务都不用改——注册表就是为这个存在的。
+
+### 几条踩出来的坑（改之前必读）
+
+- **顺序敏感的 cookie 串**：`cookie.merge` 用 dict 保序。乱序会导致明明填了正确 cookie 却一直 401。
+- **`trust_env = False`**：本机开着代理时 requests 会走代理，表现成"读超时"而不是连接失败，排查半天看不出是代理。
+- **每线程一个 Session**：`requests.Session` 不是线程安全的（cookie jar 会竞争），但每请求新建又丢掉连接复用。转存一次要打六七次同一个域名，复用很值。
+- **HTTP 404 ≠ 上游故障**：分享被删时夸克直接回 404。分享侧的请求要传 `gone_error=ShareInvalidError`，否则会变成"上游故障"，还会把账号的失败计数加上去。
+- **转存失败要能看出来是哪一头坏了**：后台「手工验链」默认绕开失败缓存，否则改完配置再验，拿到的还是上次那句缓存原因。
+
+
 ## 群入口（进站 / 获取链接弹二维码）
 
 两个触发点，配置全在 `/admin` 看板的「群入口配置」面板里改，**改完即时生效，不用重启**：
@@ -293,6 +452,8 @@ sqlite3 backend/data/analytics.db \
 
 - [ ] `backend/.env` 不要提交到任何仓库
 - [ ] 设 `ADMIN_TOKEN`，否则公网打不开 `/admin` 看板
+- [ ] 在 `/admin` 的「网盘账号」里至少加一个账号并点「测试」通过，否则点击转存全走回退（等于没开）
+- [ ] 用「测试与维护 → 手工验一条链接」跑通一次完整转存，别等真人点击来发现配置错了
 - [ ] 关掉 `--reload`，保持 `--workers 1`（多进程会让缓存和串行锁各自独立，详见下文 Linux 部署说明）
 - [ ] 前面挂 Nginx，加 HTTPS
 - [ ] 加访问频率限制，否则一个脚本就能把 apikey 的余额刷空

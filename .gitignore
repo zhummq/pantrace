@@ -1,8 +1,9 @@
 # 密钥与依赖
 backend/.env
 backend/.venv/
-backend/__pycache__/
-backend/app/__pycache__/
+# 字节码：sdk/ 与 adapters/*/ 都是新目录，逐个写路径会漏，直接按名字通配
+__pycache__/
+*.py[cod]
 frontend/node_modules/
 # frontend/dist 特意入库：服务器用 git pull 部署、不装 Node，
 # 构建只在本地做，产物跟着仓库走。每次 build 产生一次提交即可。
@@ -13,3 +14,6 @@ backend/data/
 # 临时文件
 *.log
 _preview.html
+
+# 竞品参考源码（只读借鉴，绝不入库）
+xiageba2/
