@@ -33,6 +33,9 @@ const PLATFORM_COLORS = {
 
 const color = computed(() => PLATFORM_COLORS[props.item.platform] || '#96a1ad')
 
+// 自有精选卡：站方维护的链接，视觉上要一眼和上游结果区分开
+const isOwn = computed(() => !!props.item.isOwn)
+
 // 只放行 http/https，挡掉 javascript: 之类的伪协议
 const safeUrl = computed(() => {
   const url = props.item.shareUrl || ''
@@ -76,6 +79,7 @@ const copied = ref('')
 
 // 点击走 beacon：链接是 target=_blank，但用户可能秒关标签页，
 // 常规 fetch 不保证发得出去。这是转化率指标的源头，不能丢。
+// source 区分自有精选卡与上游结果——看板上的"自有占比"由此而来。
 function onClick() {
   track(
     'click',
@@ -83,6 +87,7 @@ function onClick() {
       target: props.item.title || '',
       platform: props.item.platform || '',
       query: props.keyword,
+      source: props.item.isOwn ? 'own' : 'upstream',
     },
     { beacon: true }
   )
@@ -133,11 +138,17 @@ async function onCopyPwd() {
 </script>
 
 <template>
-  <article class="card">
+  <article class="card" :class="{ own: isOwn }">
     <span class="bar" :style="{ background: color }" aria-hidden="true"></span>
 
     <div class="main">
       <div class="head">
+        <span v-if="isOwn" class="own-badge">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20 6 9 17l-5-5" />
+          </svg>
+          本站精选
+        </span>
         <span class="badge" :style="{ color, borderColor: color + '40' }">
           {{ item.platformName || '未知平台' }}
         </span>
@@ -160,6 +171,10 @@ async function onCopyPwd() {
         <template v-if="item.sharePwd">
           <i class="dot"></i>
           <span class="pwd">提取码 <b>{{ item.sharePwd }}</b></span>
+        </template>
+        <template v-if="item.note">
+          <i class="dot"></i>
+          <span class="own-note">{{ item.note }}</span>
         </template>
         <!-- 纠错入口挂在卡片内部：用户判断"这条有问题"的时机只在这一屏，
              放到页脚或者独立页面就等于没有 -->
@@ -220,6 +235,39 @@ async function onCopyPwd() {
   bottom: 12px;
   width: 2px;
   border-radius: 0 2px 2px 0;
+}
+
+/* ---- 自有精选卡：站方担保的视觉语言 ---- */
+.card.own {
+  border-color: rgba(0, 169, 157, 0.4);
+  background: linear-gradient(180deg, rgba(0, 169, 157, 0.045), transparent 55%), var(--surface);
+}
+
+.card.own:hover {
+  border-color: rgba(0, 169, 157, 0.6);
+}
+
+.card.own .bar {
+  background: var(--accent) !important;
+}
+
+.own-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px 1px 5px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  transform: translateY(-1px);
+}
+
+.own-note {
+  color: var(--accent-deep);
 }
 
 .main {

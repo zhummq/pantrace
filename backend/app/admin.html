@@ -303,6 +303,46 @@
     </div>
   </details>
 
+  <!-- 精选链接：自有资源库的录入与未命中词榜 -->
+  <details class="panel" id="own-panel">
+    <summary>精选链接 <span class="tag" id="own-tag">自有资源库</span><span class="arrow">▾</span></summary>
+    <div class="body">
+      <div class="substats" id="own-stats" style="margin:10px 0 14px"></div>
+      <div class="grid2">
+        <section class="rank">
+          <h2>搜过但没接住的词 <span>点「补录」直接填进表单</span></h2>
+          <div id="own-misses"></div>
+        </section>
+        <section class="rank">
+          <h2>已上架 <span>命中即置顶展示</span></h2>
+          <div id="own-links"></div>
+        </section>
+      </div>
+      <div class="rank" style="margin-top:16px">
+        <h2 id="own-form-title">新增链接 <span>转存到自己网盘后，把分享链接录进来</span></h2>
+        <div class="grp-grid">
+          <label>主关键词 <span style="color:var(--red)">*</span><input id="own-keyword" maxlength="60" placeholder="例：尸兄" /></label>
+          <label>别名（逗号分隔，可空）<input id="own-aliases" maxlength="300" placeholder="例：尸兄动漫,尸兄漫画" /></label>
+          <label>分享标题（卡片上显示，可空则用主关键词）<input id="own-title" maxlength="200" placeholder="例：尸兄 1-4季 全集合集" /></label>
+          <label>平台<select id="own-platform"></select></label>
+          <label>分享链接 <span style="color:var(--red)">*</span><input id="own-url" maxlength="500" placeholder="https://pan.quark.cn/s/…" /></label>
+          <label>提取码（可空）<input id="own-pwd" maxlength="20" /></label>
+          <div class="grp-grid3" style="margin-bottom:0">
+            <label>文件数<input id="own-files" type="number" min="0" /></label>
+            <label>大小（GB，可小数）<input id="own-size" type="number" min="0" step="0.1" /></label>
+            <label>备注（卡片小字，可空）<input id="own-note" maxlength="200" placeholder="例：每周更新" /></label>
+          </div>
+        </div>
+        <div class="grp-actions" style="margin-top:10px">
+          <label style="flex-direction:row;align-items:center;gap:6px;font-size:13px;color:var(--ink-2)"><input type="checkbox" id="own-enabled" checked /> 启用</label>
+          <button class="grp-save" id="own-save">保存</button>
+          <button class="grp-btn hidden" id="own-cancel">取消编辑</button>
+          <span class="grp-msg" id="own-msg"></span>
+        </div>
+      </div>
+    </div>
+  </details>
+
   <!-- 健康层：出问题才看 -->
   <details class="panel">
     <summary>健康指标 <span class="tag">出问题才看</span><span class="arrow">▾</span></summary>
@@ -440,6 +480,7 @@
         hideGate();
         render(r.body.data);
         loadFeedback(silent);
+        loadOwn(silent);
       })
       .catch(function (e) {
         if (!silent) $('meta').innerHTML = '<span class="err">网络错误：' + esc(e.message) + '</span>';
@@ -456,6 +497,7 @@
   // ---------------- 渲染 ----------------
   function render(d) {
     var o = d.overview || {};
+    lastOverview = o;
     var rangeText = d.days === 1 ? '今天' : '近 ' + d.days + ' 天';
     $('meta').innerHTML = rangeText + ' · 自动刷新 60 秒 · 机器人流量已剔除';
 
@@ -475,6 +517,9 @@
     $('overview').innerHTML =
       stat('搜索次数', Number(o.searches) || 0, 'hi', '业务核心量') +
       stat('点击转化率', pct(o.ctr), '', '点开资源 / 搜索次数') +
+      stat('自有占比', pct(o.own_ratio),
+           (Number(o.own_ratio) || 0) > 0 ? 'hi' : '',
+           '精选卡点击 / 总点击 · 越高越好') +
       stat('零结果率', pct(o.zero_rate),
            (Number(o.zero_rate) || 0) > 0.3 ? 'hi' : '',
            '搜了但没结果 · 越低越好');
@@ -630,8 +675,175 @@
       .catch(function () {});
   }
 
-  function barRows(rows, fillCls) {
-    var max = 1;
+  // ---------------- 精选链接（自有资源库） ----------------
+  var ownCache = [];
+  var ownEditingId = null;
+  var lastOverview = null;
+
+  // 平台下拉框：选项和搜索接口的平台表保持同一份来源
+  (function () {
+    var html = '<option value="">（不指定平台）</option>';
+    Object.keys(PLATFORM_NAMES).forEach(function (k) {
+      html += '<option value="' + k + '">' + PLATFORM_NAMES[k] + '</option>';
+    });
+    $('own-platform').innerHTML = html;
+  })();
+
+  function ownHeaders(json) {
+    var h = {};
+    var t = token();
+    if (t) h['x-admin-token'] = t;
+    if (json) h['content-type'] = 'application/json';
+    return h;
+  }
+
+  function ownMsg(text, isErr) {
+    var el = $('own-msg');
+    el.textContent = text;
+    el.className = 'grp-msg' + (isErr ? ' err' : '');
+    if (text) setTimeout(function () { el.textContent = ''; }, 4000);
+  }
+
+  function loadOwn(silent) {
+    fetch('/api/admin/own?days=' + days, { headers: ownHeaders(false) })
+      .then(function (res) { return res.json(); })
+      .then(function (b) {
+        if (b && b.code === 0) renderOwn(b.data || {});
+        else if (!silent && b && b.code !== 503) ownMsg((b && b.msg) || '读取失败', true);
+      })
+      .catch(function (e) { if (!silent) ownMsg('读取失败：' + e.message, true); });
+  }
+
+  function ownLinkRow(l) {
+    var meta = [PLATFORM_NAMES[l.platform] || l.platform || '-'];
+    if (l.share_pwd) meta.push('码 ' + l.share_pwd);
+    if (Number(l.file_count) > 0) meta.push(l.file_count + ' 个文件');
+    var gb = (Number(l.size_bytes) || 0) / 1073741824;
+    if (gb > 0) meta.push(gb >= 1 ? gb.toFixed(1) + ' GB' : (gb * 1024).toFixed(0) + ' MB');
+    var words = [l.keyword].concat((l.aliases || '').split(',')).filter(Boolean).join(' / ');
+    return '<div class="fb-item' + (l.enabled ? '' : ' done') + '">' +
+      '<div class="fb-head">' +
+      '<span class="fb-kind missing">精选</span>' +
+      '<span class="fb-title" title="' + esc(l.title || l.keyword) + '">' + esc(l.title || l.keyword) + '</span>' +
+      '<span class="t">' + (l.enabled ? '启用中' : '已停用') + '</span>' +
+      '</div>' +
+      '<div class="fb-meta">' + esc(meta.join(' · ')) + '</div>' +
+      '<div class="fb-meta">词：' + esc(words) + '</div>' +
+      '<div class="fb-actions">' +
+      '<button class="fb-btn" data-edit="' + l.id + '">编辑</button>' +
+      '<button class="fb-btn" data-del="' + l.id + '">删除</button>' +
+      '</div></div>';
+  }
+
+  function renderOwn(d) {
+    var s = d.stats || {};
+    var o = lastOverview || {};
+    $('own-tag').textContent = (s.enabled || 0) + ' / ' + (s.total || 0) + ' 条启用';
+    $('own-stats').innerHTML =
+      fbSmall('链接总数', s.total || 0) +
+      fbSmall('启用中', s.enabled || 0) +
+      fbSmall('未接住的词', s.misses || 0) +
+      fbSmall('自有点击占比', pct(o.own_ratio));
+
+    var misses = d.misses || [];
+    $('own-misses').innerHTML = misses.length
+      ? misses.map(function (m) {
+          return '<div class="bar-row">' +
+            '<span class="name" title="' + esc(m.q) + '">' + esc(m.q) + '</span>' +
+            '<span class="n">' + m.n + '</span>' +
+            '<button class="fb-btn" data-q="' + esc(m.q) + '">补录</button>' +
+            '</div>';
+        }).join('')
+      : '<div class="empty">最近没有接不住的词</div>';
+    Array.prototype.forEach.call($('own-misses').querySelectorAll('button[data-q]'), function (btn) {
+      btn.addEventListener('click', function () {
+        $('own-keyword').value = btn.getAttribute('data-q');
+        $('own-keyword').focus();
+        $('own-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    });
+
+    ownCache = d.links || [];
+    $('own-links').innerHTML = ownCache.length
+      ? ownCache.map(ownLinkRow).join('')
+      : '<div class="empty">还没有链接——转存第一条资源，录进来</div>';
+    Array.prototype.forEach.call($('own-links').querySelectorAll('button[data-edit]'), function (btn) {
+      btn.addEventListener('click', function () { startOwnEdit(Number(btn.getAttribute('data-edit'))); });
+    });
+    Array.prototype.forEach.call($('own-links').querySelectorAll('button[data-del]'), function (btn) {
+      btn.addEventListener('click', function () {
+        if (!window.confirm('删除这条精选链接？删除后立刻从搜索结果消失。')) return;
+        fetch('/api/admin/own/' + btn.getAttribute('data-del'), { method: 'DELETE', headers: ownHeaders(false) })
+          .then(function (res) { return res.json(); })
+          .then(function (b) {
+            if (b && b.code === 0) { ownMsg('已删除'); loadOwn(true); }
+            else ownMsg((b && b.msg) || '删除失败', true);
+          })
+          .catch(function (e) { ownMsg('删除失败：' + e.message, true); });
+      });
+    });
+  }
+
+  function startOwnEdit(id) {
+    var link = null;
+    ownCache.forEach(function (l) { if (l.id === id) link = l; });
+    if (!link) return;
+    ownEditingId = id;
+    $('own-form-title').innerHTML = '编辑 #' + id + ' <span>改完保存即时生效</span>';
+    $('own-keyword').value = link.keyword || '';
+    $('own-aliases').value = link.aliases || '';
+    $('own-title').value = link.title || '';
+    $('own-platform').value = link.platform || '';
+    $('own-url').value = link.share_url || '';
+    $('own-pwd').value = link.share_pwd || '';
+    $('own-files').value = Number(link.file_count) || 0;
+    var gb = (Number(link.size_bytes) || 0) / 1073741824;
+    $('own-size').value = gb > 0 ? gb.toFixed(2) : '';
+    $('own-note').value = link.note || '';
+    $('own-enabled').checked = !!link.enabled;
+    $('own-cancel').classList.remove('hidden');
+  }
+
+  function resetOwnForm() {
+    ownEditingId = null;
+    $('own-form-title').innerHTML = '新增链接 <span>转存到自己网盘后，把分享链接录进来</span>';
+    ['own-keyword', 'own-aliases', 'own-title', 'own-url', 'own-pwd', 'own-files', 'own-size', 'own-note']
+      .forEach(function (id) { $(id).value = ''; });
+    $('own-platform').value = '';
+    $('own-enabled').checked = true;
+    $('own-cancel').classList.add('hidden');
+  }
+
+  $('own-cancel').addEventListener('click', resetOwnForm);
+
+  $('own-save').addEventListener('click', function () {
+    var gb = Number($('own-size').value);
+    var payload = {
+      id: ownEditingId || null,
+      keyword: $('own-keyword').value.trim(),
+      aliases: $('own-aliases').value.trim(),
+      title: $('own-title').value.trim(),
+      platform: $('own-platform').value,
+      shareUrl: $('own-url').value.trim(),
+      sharePwd: $('own-pwd').value.trim(),
+      fileCount: Number($('own-files').value) || 0,
+      sizeBytes: Number.isFinite(gb) && gb > 0 ? Math.round(gb * 1073741824) : 0,
+      note: $('own-note').value.trim(),
+      enabled: $('own-enabled').checked,
+    };
+    if (!payload.keyword) { ownMsg('主关键词不能为空', true); return; }
+    if (!payload.shareUrl) { ownMsg('分享链接不能为空', true); return; }
+    ownMsg('保存中…');
+    fetch('/api/admin/own', { method: 'POST', headers: ownHeaders(true), body: JSON.stringify(payload) })
+      .then(function (res) { return res.json(); })
+      .then(function (b) {
+        if (b && b.code === 0) { ownMsg('已保存，下次搜索即生效'); resetOwnForm(); loadOwn(true); }
+        else ownMsg((b && b.msg) || '保存失败', true);
+      })
+      .catch(function (e) { ownMsg('保存失败：' + e.message, true); });
+  });
+
+  function barRows(rows, fillCls) {    var max = 1;
     rows.forEach(function (r) { if (r.n > max) max = r.n; });
     var html = '';
     rows.forEach(function (r) {

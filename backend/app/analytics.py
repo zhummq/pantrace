@@ -111,6 +111,7 @@ def _ensure_schema() -> None:
                 device       TEXT    NOT NULL DEFAULT '',
                 is_new       INTEGER NOT NULL DEFAULT 0,
                 bot          INTEGER NOT NULL DEFAULT 0,
+                source       TEXT    NOT NULL DEFAULT '',
                 meta         TEXT    NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_events_ts      ON events(ts);
@@ -123,6 +124,9 @@ def _ensure_schema() -> None:
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
         if "bot" not in cols:
             conn.execute("ALTER TABLE events ADD COLUMN bot INTEGER NOT NULL DEFAULT 0")
+        # source 区分点击落在自有精选卡还是上游结果（own / upstream / 空）
+        if "source" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT ''")
 
 
 def _day_of(ts: float) -> str:
@@ -162,6 +166,7 @@ def record(
     result_count: int = -1,
     cached: bool = False,
     is_new: bool = False,
+    source: str = "",
     meta: dict | None = None,
 ) -> None:
     """写一条事件。任何字段问题都吞掉——埋点绝不能影响主业务。"""
@@ -190,6 +195,7 @@ def record(
         "mobile" if re.search(r"Mobile|Android|iPhone|iPad", ua or "") else "desktop",
         1 if is_new else 0,
         1 if (ua and _BOT_RE.search(ua)) else 0,
+        _clip(source, 20),
         json.dumps(meta, ensure_ascii=False)[:500] if meta else "",
     )
 
@@ -200,8 +206,8 @@ def record(
                     """INSERT INTO events
                        (ts, day, kind, visitor, session, ip, ua, referer, path,
                         query, platform, target, ok, duration_ms, result_count,
-                        cached, device, is_new, bot, meta)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        cached, device, is_new, bot, source, meta)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     row,
                 )
                 # 每天最多清理一次，顺手把过期数据删掉，避免库无限长大
@@ -290,6 +296,7 @@ def summary(days: int = 7) -> dict:
                  COUNT(DISTINCT CASE WHEN visitor<>'' THEN visitor END) AS uv,
                  SUM(CASE WHEN kind='search' THEN 1 ELSE 0 END) AS searches,
                  SUM(CASE WHEN kind='click' THEN 1 ELSE 0 END) AS clicks,
+                 SUM(CASE WHEN kind='click' AND source='own' THEN 1 ELSE 0 END) AS own_clicks,
                  SUM(CASE WHEN kind='search' AND ok=1 AND result_count=0
                           THEN 1 ELSE 0 END) AS zero,
                  SUM(CASE WHEN kind='search' AND ok=0 THEN 1 ELSE 0 END) AS fails,
@@ -367,6 +374,7 @@ def summary(days: int = 7) -> dict:
 
     searches = overview["searches"] or 0
     clicks = overview["clicks"] or 0
+    own_clicks = overview["own_clicks"] or 0
     zero = overview["zero"] or 0
     fails = overview["fails"] or 0
     cached_hits = overview["cached_hits"] or 0
@@ -387,6 +395,8 @@ def summary(days: int = 7) -> dict:
             "searches": searches,
             "clicks": clicks,
             "ctr": round(clicks / searches, 4) if searches else 0,
+            "own_clicks": own_clicks,
+            "own_ratio": round(own_clicks / clicks, 4) if clicks else 0,
             "zero_rate": round(zero / successful, 4) if successful else 0,
             "fail_rate": round(fails / searches, 4) if searches else 0,
             "cache_rate": round(cached_hits / successful, 4) if successful else 0,

@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     # 配置存在同一个 SQLite 里，/admin 看板可改，这个开关是总闸。
     group_enabled: bool = True
 
+    # ---- 自有精选链接 ----
+    # 站方维护的网盘资源库：搜索命中时置顶展示，未命中词落日志。
+    # 和埋点、反馈共用同一个 SQLite，开关独立——关掉只影响精选卡。
+    own_enabled: bool = True
+
     # ---- 看板口令 ----
     # 留空时 /admin 只允许本机访问（经 Nginx 反代后就是谁都不行），
     # 部署到公网必须设一个，否则看板打不开。

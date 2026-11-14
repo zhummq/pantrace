@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, feedback, group, providers
+from . import analytics, feedback, group, own, providers
 from .config import get_settings
 from .providers import UpstreamError
 
@@ -80,6 +80,20 @@ else:
     log.info("反馈工单已关闭（FEEDBACK_ENABLED=false）")
 
 ADMIN_HTML = Path(__file__).resolve().parent / "admin.html"
+
+# ---- 自有精选链接 ----
+# 站方维护的资源库：搜索命中时置顶展示"本站精选"卡，未命中词落日志。
+# 数据和埋点、反馈共用同一个 SQLite，开关独立。
+OWN_ON = settings.own_enabled
+if OWN_ON:
+    try:
+        own.init(settings.analytics_path)
+        log.info("自有精选链接已启用：%s", settings.analytics_path)
+    except Exception as exc:  # noqa: BLE001
+        OWN_ON = False
+        log.error("自有精选链接初始化失败，已关闭：%s", exc)
+else:
+    log.info("自有精选链接已关闭（OWN_ENABLED=false）")
 
 # ---- 群入口（二维码弹窗）----
 # 图片落 backend/data/uploads/，前端通过 /uploads/<文件名> 访问。
@@ -158,6 +172,7 @@ class TrackEvent(BaseModel):
     ok: bool = True
     resultCount: int = -1
     isNew: bool = False
+    source: str = ""
     meta: dict = Field(default_factory=dict)
 
 
@@ -199,6 +214,7 @@ async def track(payload: TrackPayload, request: Request, background: BackgroundT
             duration_ms=event.durationMs,
             result_count=event.resultCount,
             is_new=event.isNew or is_new,
+            source=event.source,
             meta=event.meta,
         )
     return Response(status_code=204)
@@ -263,6 +279,20 @@ def _apply_hidden(body: dict) -> dict:
     out["hidden"] = len(items) - len(kept)
     return out
 
+
+def _attach_own(body: dict, own_items: list[dict]) -> dict:
+    """自有精选卡插到结果集最顶部，不参与任何排序。
+
+    命中即置顶：不存在"匹配上了但被上游结果淹没"的情况。
+    上游结果照常列在下面——自有库覆盖率撑不起全站流量，
+    砍掉上游等于把没命中的搜索词直接送走。
+    """
+    if not own_items:
+        return body
+    body["items"] = own_items + list(body.get("items") or [])
+    body["ownCount"] = len(own_items)
+    return body
+
 # 界面用的平台列表。只放上游实测确认过的 key：
 # 传一个上游不认识的 key 会让整次搜索报 1001，所以宁缺勿滥。
 PLATFORMS = [
@@ -283,6 +313,10 @@ PLATFORMS = [
 ]
 PLATFORM_NAME = {p["key"]: p["name"] for p in PLATFORMS}
 VALID_PLATFORM_KEYS = set(PLATFORM_NAME)
+# 自有卡的 platformName 展示用这张表；模块导入时机早于平台表定义，
+# 所以在这里注入（own.set_platforms 只是赋值，开销为零）
+if OWN_ON:
+    own.set_platforms(PLATFORM_NAME)
 
 # ---- 缓存 ----
 _cache: dict[str, tuple[float, dict]] = {}
@@ -359,6 +393,13 @@ async def search(
         "is_new": is_new,
     }
 
+    # 自有精选卡：命中即在顶部展示。匹配在响应时做、不进缓存——
+    # 改链接配置/补别名立刻生效，不用等缓存过期。
+    # 第一页没接住的词落未命中日志，翻页不记（同一个词重复计数没有意义）。
+    own_items = own.match(query, platform_list or None) if OWN_ON else []
+    if OWN_ON and not own_items and page == 1:
+        background.add_task(own.record_miss, query)
+
     cached = _cache.get(cache_key)
     if cached and now - cached[0] < CACHE_TTL:
         body = dict(cached[1])
@@ -372,7 +413,7 @@ async def search(
                 result_count=len(body.get("items") or []),
                 cached=True,
             )
-        return _apply_hidden(body)
+        return _apply_hidden(_attach_own(body, own_items))
 
     failed = _fail_cache.get(cache_key)
     if failed and now - failed[0] < FAIL_TTL:
@@ -458,7 +499,8 @@ async def search(
         "search q=%s page=%s items=%s %sms",
         query, page, len(body["items"]), upstream_ms,
     )
-    return _apply_hidden(body)
+    # dict(body)：body 已进缓存，自有卡只在响应时挂，不能污染缓存本体
+    return _apply_hidden(_attach_own(dict(body), own_items))
 
 
 class FeedbackIn(BaseModel):
@@ -589,6 +631,75 @@ async def admin_feedback_update(fid: int, payload: FeedbackUpdate, request: Requ
     if not ok:
         return JSONResponse(status_code=404, content={"code": 404, "msg": "没有这条反馈"})
     return {"code": 0, "msg": "已更新"}
+
+
+@app.get("/api/admin/own", include_in_schema=False)
+async def admin_own_list(request: Request, days: int = Query(30, ge=1, le=365)):
+    """自有精选链接管理：全量链接 + 未命中词榜 + 小数字。
+
+    未命中榜是"搜过但没接住"的纯待办——补了别名的词自动从榜单消失。
+    """
+    if not OWN_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        return {
+            "code": 0,
+            "data": {
+                "links": own.list_links(),
+                "misses": own.misses(days=days),
+                "stats": own.stats(),
+            },
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.exception("精选链接查询失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"查询失败：{exc}"})
+
+
+class OwnLinkIn(BaseModel):
+    """新增 / 更新一条自有链接。id 为空 = 新增。字段校验在 own.save 里做。"""
+
+    id: int | None = None
+    keyword: str = ""
+    aliases: str = ""
+    title: str = ""
+    platform: str = ""
+    shareUrl: str = ""
+    sharePwd: str = ""
+    fileCount: int = 0
+    sizeBytes: int = 0
+    note: str = ""
+    enabled: bool = True
+
+
+@app.post("/api/admin/own", include_in_schema=False)
+async def admin_own_save(payload: OwnLinkIn, request: Request):
+    if not OWN_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        saved = own.save(payload.model_dump())
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+    except Exception as exc:  # noqa: BLE001
+        log.exception("精选链接保存失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存失败：{exc}"})
+    log.info("own link saved id=%s kw=%s", saved["id"], payload.keyword)
+    return {"code": 0, "data": saved, "msg": "已保存，下次搜索即生效"}
+
+
+@app.delete("/api/admin/own/{lid}", include_in_schema=False)
+async def admin_own_delete(lid: int, request: Request):
+    if not OWN_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    ok = own.delete(lid)
+    if not ok:
+        return JSONResponse(status_code=404, content={"code": 404, "msg": "没有这条链接"})
+    return {"code": 0, "msg": "已删除"}
 
 
 @app.get("/api/group", include_in_schema=False)

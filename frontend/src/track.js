@@ -146,6 +146,7 @@ export function track(kind, data = {}, opts = {}) {
       query: data.query || '',
       platform: data.platform || '',
       target: data.target || '',
+      source: data.source || '',
       durationMs: Number(data.durationMs) || 0,
       ok: data.ok !== false,
       resultCount: Number.isFinite(data.resultCount) ? data.resultCount : -1,
