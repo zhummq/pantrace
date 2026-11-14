@@ -268,6 +268,22 @@
     </div>
   </details>
 
+  <!-- 上架清单：点击榜 / 零结果 / 求资源 / 未命中，合成一份待办 -->
+  <details class="panel" id="plan-panel">
+    <summary>上架清单 <span class="tag" id="plan-tag">统计中</span><span class="arrow">▾</span></summary>
+    <div class="body">
+      <div class="substats" id="plan-stats" style="margin:10px 0 14px"></div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+        <button class="fb-btn" id="plan-copy">复制本周清单</button>
+        <span class="grp-msg" id="plan-msg"></span>
+      </div>
+      <div class="rank">
+        <h2>按优先级排序 <span>替换型（已有点击）排在补位型前面 · 已上架的自动剔除</span></h2>
+        <div id="plan-list"></div>
+      </div>
+    </div>
+  </details>
+
   <!-- 群入口：改二维码 / 群号 / 弹窗策略，保存后前端即时生效，不用重启 -->
   <details class="panel" id="grp-panel">
     <summary>群入口配置 <span class="tag">改二维码 / 群号 / 弹窗</span><span class="arrow">▾</span></summary>
@@ -481,6 +497,7 @@
         render(r.body.data);
         loadFeedback(silent);
         loadOwn(silent);
+        loadPlan(silent);
       })
       .catch(function (e) {
         if (!silent) $('meta').innerHTML = '<span class="err">网络错误：' + esc(e.message) + '</span>';
@@ -841,6 +858,104 @@
         else ownMsg((b && b.msg) || '保存失败', true);
       })
       .catch(function (e) { ownMsg('保存失败：' + e.message, true); });
+  });
+
+  // ---------------- 上架清单（四路需求合成一份待办） ----------------
+  var planCache = [];
+
+  function loadPlan(silent) {
+    fetch('/api/admin/plan?days=' + days, { headers: ownHeaders(false) })
+      .then(function (res) { return res.json(); })
+      .then(function (b) {
+        if (b && b.code === 0) renderPlan(b.data || {});
+        else if (!silent && b && b.code !== 503) planMsg((b && b.msg) || '读取失败', true);
+      })
+      .catch(function (e) { if (!silent) planMsg('读取失败：' + e.message, true); });
+  }
+
+  function planMsg(text, isErr) {
+    var el = $('plan-msg');
+    el.textContent = text;
+    el.className = 'grp-msg' + (isErr ? ' err' : '');
+    if (text) setTimeout(function () { el.textContent = ''; }, 4000);
+  }
+
+  function renderPlan(d) {
+    planCache = d.items || [];
+    var replace = Number(d.replace) || 0;
+    var fill = Number(d.fill) || 0;
+    $('plan-tag').textContent = planCache.length
+      ? replace + ' 个替换 + ' + fill + ' 个补位'
+      : '暂时没有待办';
+
+    $('plan-stats').innerHTML =
+      fbSmall('替换型', replace) +
+      fbSmall('补位型', fill) +
+      fbSmall('已上架剔除', Number(d.covered) || 0) +
+      fbSmall('区间', d.days + ' 天');
+
+    if (!planCache.length) {
+      $('plan-list').innerHTML = '<div class="empty">清单是空的——要么都上架了，要么还没有搜索数据</div>';
+      return;
+    }
+
+    $('plan-list').innerHTML = planCache.map(function (it, i) {
+      var badge = it.type === 'replace'
+        ? '<span class="fb-kind missing">替换</span>'
+        : '<span class="fb-kind other">补位</span>';
+      var meta = (it.sources || []).join(' + ')
+        + (it.platform ? ' · ' + platformName(it.platform) : '')
+        + ' · 合计 ' + it.n + ' 次';
+      return '<div class="fb-item">' +
+        '<div class="fb-head">' + badge +
+        '<span class="fb-title" title="' + esc(it.q) + '">' +
+          (i + 1) + '. ' + esc(it.q) + '</span></div>' +
+        '<div class="fb-meta">' + esc(meta) + '</div>' +
+        '<div class="fb-actions">' +
+        '<a class="fb-btn" href="/?q=' + encodeURIComponent(it.q) + '" target="_blank" ' +
+          'rel="noopener noreferrer">去上游看一眼</a>' +
+        '<button class="fb-btn" data-plan-q="' + esc(it.q) + '">补录</button>' +
+        '</div></div>';
+    }).join('');
+
+    Array.prototype.forEach.call($('plan-list').querySelectorAll('button[data-plan-q]'), function (btn) {
+      btn.addEventListener('click', function () {
+        $('own-keyword').value = btn.getAttribute('data-plan-q');
+        $('own-keyword').focus();
+        $('own-panel').setAttribute('open', '');
+        $('own-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    });
+  }
+
+  $('plan-copy').addEventListener('click', function () {
+    if (!planCache.length) { planMsg('清单是空的', true); return; }
+    var lines = [];
+    var group = '';
+    planCache.forEach(function (it) {
+      var g = it.type === 'replace' ? '替换（已有点击，优先做）' : '补位（需求已验证，现在接不住）';
+      if (g !== group) { group = g; lines.push('', g + '：'); }
+      lines.push('- ' + it.q + '  [' + (it.sources || []).join('/') + ' ' + it.n + ' 次]');
+    });
+    var text = '上架清单 · 近 ' + days + ' 天\n' + lines.join('\n');
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); planMsg('已复制 ' + planCache.length + ' 条'); }
+      catch (e) { planMsg('复制失败，请手动选', true); }
+      document.body.removeChild(ta);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        planMsg('已复制 ' + planCache.length + ' 条');
+      }).catch(fallback);
+    } else {
+      fallback();
+    }
   });
 
   function barRows(rows, fillCls) {    var max = 1;

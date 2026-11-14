@@ -306,6 +306,116 @@ def misses(days: int = 30, limit: int = 20) -> list[dict]:
     return out
 
 
+PLAN_SOURCES = {
+    "click": "点击榜",
+    "zero": "零结果",
+    "request": "求资源",
+    "miss": "未命中",
+}
+
+
+def plan(days: int = 30, limit: int = 40) -> dict:
+    """上架清单：把四处需求合成一份可执行待办，已上架的自动剔除。
+
+    来源：
+    - click   被点开最多的资源（只算上游链接）→ 替换型，转化已验证
+    - zero    搜了 0 结果的词 → 补位型
+    - request 求资源工单 → 补位型，用户主动举手
+    - miss    没接住自有链接的搜索词 → 给前面几项补次数
+
+    判定"已上架"复用 match()：现在能命中的词直接从清单消失，不用人工对。
+    """
+    if not _inited:
+        return {"days": days, "items": [], "covered": 0, "replace": 0, "fill": 0}
+
+    days = max(1, min(365, int(days or 30)))
+    limit = max(1, min(100, int(limit or 40)))
+    start = time.time() - days * 86400
+    buckets: dict[str, dict] = {}
+
+    def add(query: object, kind: str, n: object, platform: str = "") -> None:
+        q = str(query or "").strip()[:100]
+        if len(normalize(q)) < 2:
+            return
+        key = normalize(q)
+        b = buckets.get(key)
+        if b is None:
+            b = buckets[key] = {"q": q, "n": 0, "sources": {}, "platform": ""}
+        hits = int(n or 0)
+        b["n"] += hits
+        b["sources"][kind] = b["sources"].get(kind, 0) + hits
+        if platform and not b["platform"]:
+            b["platform"] = platform
+
+    # 单张表缺失不该让整个清单挂掉：新装库还没产生某类数据是常态
+    queries = (
+        (
+            "zero",
+            """SELECT query AS q, COUNT(*) AS n FROM events
+               WHERE kind='search' AND ok=1 AND result_count=0 AND bot=0
+                     AND ts >= ? AND query<>''
+               GROUP BY query ORDER BY n DESC LIMIT 100""",
+            False,
+        ),
+        (
+            "click",
+            """SELECT target AS q, platform, COUNT(*) AS n FROM events
+               WHERE kind='click' AND bot=0 AND ts >= ? AND target<>''
+                     AND COALESCE(source,'') <> 'own'
+               GROUP BY target, platform ORDER BY n DESC LIMIT 100""",
+            True,
+        ),
+        (
+            "request",
+            """SELECT query AS q, COUNT(*) AS n FROM feedback
+               WHERE kind='missing' AND ts >= ? AND query<>''
+               GROUP BY query ORDER BY n DESC LIMIT 100""",
+            False,
+        ),
+        (
+            "miss",
+            """SELECT query AS q, n FROM own_misses
+               WHERE last_ts >= ? ORDER BY n DESC LIMIT 100""",
+            False,
+        ),
+    )
+    with _session() as conn:
+        for kind, sql, has_platform in queries:
+            try:
+                for r in conn.execute(sql, (start,)).fetchall():
+                    add(r["q"], kind, r["n"], r["platform"] if has_platform else "")
+            except sqlite3.Error:
+                continue
+
+    items = []
+    covered = 0
+    for b in buckets.values():
+        if match(b["q"]):  # 已经接得住了，不是待办
+            covered += 1
+            continue
+        is_replace = "click" in b["sources"]
+        # 点击是"已经发生的转化"，比搜索需求更值钱，同分时排前面
+        items.append(
+            {
+                "q": b["q"],
+                "type": "replace" if is_replace else "fill",
+                "n": b["n"],
+                "score": b["n"] * (2 if is_replace else 1),
+                "sources": [PLAN_SOURCES.get(k, k) for k in b["sources"]],
+                "platform": b["platform"],
+            }
+        )
+
+    items.sort(key=lambda x: (-x["score"], -x["n"], x["q"]))
+    return {
+        "days": days,
+        "items": items[:limit],
+        "covered": covered,
+        "replace": sum(1 for i in items if i["type"] == "replace"),
+        "fill": sum(1 for i in items if i["type"] == "fill"),
+    }
+
+
 def save(payload: dict) -> dict:
     """新增 / 更新一条链接。校验失败抛 ValueError，接口层转 400。"""
     if not _inited:

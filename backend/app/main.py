@@ -633,6 +633,20 @@ async def admin_feedback_update(fid: int, payload: FeedbackUpdate, request: Requ
     return {"code": 0, "msg": "已更新"}
 
 
+@app.get("/api/admin/plan", include_in_schema=False)
+async def admin_plan(request: Request, days: int = Query(30, ge=1, le=365)):
+    """上架清单：点击榜 + 零结果榜 + 求资源工单 + 未命中词，已上架的自动剔除。"""
+    if not OWN_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        return {"code": 0, "data": own.plan(days=days)}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("上架清单生成失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"生成失败：{exc}"})
+
+
 @app.get("/api/admin/own", include_in_schema=False)
 async def admin_own_list(request: Request, days: int = Query(30, ge=1, le=365)):
     """自有精选链接管理：全量链接 + 未命中词榜 + 小数字。
