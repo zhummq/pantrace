@@ -469,6 +469,16 @@ onBeforeUnmount(() => {
           <span>第 {{ page }} 页 · 共 {{ totalPages }} 页</span>
         </div>
 
+        <!-- 时效说明整页只出现一次：贴着结果头，信息完整但不刷屏；
+             每张卡片内的「30 分钟内有效」徽标负责就近提醒 -->
+        <p class="ttl-note">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 7.5V12l3 2" />
+          </svg>
+          <span>网盘链接有效期为 <b>30 分钟</b>，请及时转存；失效后可重新获取。</span>
+        </p>
+
         <div class="result-list">
           <ResultCard
             v-for="item in items"
@@ -1005,6 +1015,28 @@ onBeforeUnmount(() => {
 
 .rh-sep {
   color: var(--line-2);
+}
+
+/* 一次性时效说明：弱化正文色，重点数字用暖色 */
+.ttl-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -4px 0 12px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.ttl-note svg {
+  flex-shrink: 0;
+  color: var(--warn);
+  opacity: 0.85;
+}
+
+.ttl-note b {
+  font-weight: 600;
+  color: var(--warn);
 }
 
 .result-list {

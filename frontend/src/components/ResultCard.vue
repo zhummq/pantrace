@@ -160,6 +160,19 @@ async function onCopyPwd() {
           <span v-if="fileCountText">{{ fileCountText }}</span>
           <i v-if="fileCountText" class="dot"></i>
           <span>{{ sizeText }}</span>
+          <!-- 时效提示收敛成一个小徽标：完整说明整页只出现一次（列表顶部），
+               悬停可看全文；一页十条整句提示等于免责声明刷屏 -->
+          <span
+            v-if="safeUrl"
+            class="ttl-chip"
+            title="网盘链接有效期为 30 分钟，请及时转存；失效后可重新获取。"
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M12 7.5V12l3 2" />
+            </svg>
+            <b>30 分钟</b>内有效
+          </span>
           <template v-if="item.sharePwd">
             <i class="dot"></i>
             <span class="pwd">提取码 <b>{{ item.sharePwd }}</b></span>
@@ -194,16 +207,6 @@ async function onCopyPwd() {
         </a>
       </div>
     </article>
-
-    <!-- 时效提示挂在卡片下方：用户点开链接前的最后一秒才会犹豫，
-         提示必须贴着按钮，而不是堆在页面底部当免责声明 -->
-    <p v-if="safeUrl" class="ttl-hint">
-      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <circle cx="12" cy="12" r="9" />
-        <path d="M12 7.5V12l3 2" />
-      </svg>
-      <span>网盘链接有效期为 <b>30 分钟</b>，请及时转存，失效后可重新获取。</span>
-    </p>
   </div>
 </template>
 
@@ -230,27 +233,28 @@ async function onCopyPwd() {
   transform: translateY(-1px);
 }
 
-/* 拉线对齐卡片正文（卡片 padding-left 20px），不跟色条抢位置 */
-.ttl-hint {
-  display: flex;
+/* 时效徽标：弱化的暖色药丸，悬停出全文提示 */
+.ttl-chip {
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
-  margin: 6px 0 0;
-  padding-left: 21px;
-  font-size: 11.5px;
-  line-height: 1.5;
+  gap: 4px;
+  padding: 1.5px 8px;
+  border-radius: 999px;
+  background: rgba(201, 106, 9, 0.07);
+  font-size: 11px;
+  line-height: 1.6;
   color: var(--warn);
+  cursor: help;
+  user-select: none;
 }
 
-.ttl-hint svg {
+.ttl-chip svg {
   flex-shrink: 0;
-  opacity: 0.9;
-  transform: translateY(0.5px);
+  opacity: 0.85;
 }
 
-.ttl-hint b {
+.ttl-chip b {
   font-weight: 600;
-  letter-spacing: 0.01em;
 }
 
 /* 平台色只留一条 2px 标记，不做整块染色 */
@@ -417,9 +421,8 @@ a.title:hover {
     font-size: 11.5px;
   }
 
-  .ttl-hint {
-    padding-left: 19px;
-    font-size: 11px;
+  .ttl-chip {
+    font-size: 10.5px;
   }
 
   .flag {
