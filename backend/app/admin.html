@@ -862,9 +862,10 @@
 
   // ---------------- 上架清单（按搜索次数排的待上架词） ----------------
   var planCache = [];
+  var lastPlanTotal = 0;
 
   function loadPlan(silent) {
-    fetch('/api/admin/plan?days=' + days, { headers: ownHeaders(false) })
+    fetch('/api/admin/plan?days=' + days + '&limit=100', { headers: ownHeaders(false) })
       .then(function (res) { return res.json(); })
       .then(function (b) {
         if (b && b.code === 0) renderPlan(b.data || {});
@@ -882,12 +883,16 @@
 
   function renderPlan(d) {
     planCache = d.items || [];
-    $('plan-tag').textContent = planCache.length
-      ? planCache.length + ' 个词待上架'
+    var total = Number(d.total) || planCache.length;
+    lastPlanTotal = total;
+    $('plan-tag').textContent = total
+      ? (planCache.length < total
+          ? '展示 ' + planCache.length + ' / 共 ' + total + ' 个词'
+          : total + ' 个词待上架')
       : '暂时没有待办';
 
     $('plan-stats').innerHTML =
-      fbSmall('待上架词', planCache.length) +
+      fbSmall('待上架词', total) +
       fbSmall('已上架剔除', Number(d.covered) || 0) +
       fbSmall('区间', d.days + ' 天');
 
@@ -911,6 +916,11 @@
         '</div></div>';
     }).join('');
 
+    if (planCache.length < total) {
+      $('plan-list').innerHTML += '<div class="empty">只列出人数最多的前 ' + planCache.length +
+        ' 个（共 ' + total + ' 个）——前面的够做几周了</div>';
+    }
+
     Array.prototype.forEach.call($('plan-list').querySelectorAll('button[data-plan-q]'), function (btn) {
       btn.addEventListener('click', function () {
         $('own-keyword').value = btn.getAttribute('data-plan-q');
@@ -927,7 +937,10 @@
       var u = Number(it.u) || 0;
       return (i + 1) + '. ' + it.q + '  [' + (u > 0 ? u + ' 人 / ' : '') + it.n + ' 次]';
     });
-    var text = '上架清单 · 近 ' + days + ' 天（按搜索人数）\n' + lines.join('\n');
+    var text = '上架清单 · 近 ' + days + ' 天（按搜索人数）\n'
+      + (lastPlanTotal > planCache.length
+          ? '（只取前 ' + planCache.length + ' 个 / 共 ' + lastPlanTotal + ' 个）\n' : '')
+      + lines.join('\n');
     function fallback() {
       var ta = document.createElement('textarea');
       ta.value = text;

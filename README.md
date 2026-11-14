@@ -70,7 +70,7 @@ npm run dev
 | POST | `/api/admin/feedback/{id}` | 标记反馈状态，body `{"status":"done"}` |
 | GET | `/api/admin/stats?days=7` | 看板数据，需 `X-Admin-Token` |
 | GET | `/api/admin/own?days=30` | 精选链接列表 + 未命中词榜 + 小数字，需 `X-Admin-Token` |
-| GET | `/api/admin/plan?days=30` | 上架清单（点击榜/零结果/求资源/未命中合并，已上架自动剔除），需 `X-Admin-Token` |
+| GET | `/api/admin/plan?days=30&limit=100` | 上架清单（按搜索人数排序，已上架自动剔除；`limit` 默认 100、最大 500，返回 `total`），需 `X-Admin-Token` |
 | POST | `/api/admin/own` | 新增/更新精选链接（id 为空即新增），需 `X-Admin-Token` |
 | DELETE | `/api/admin/own/{id}` | 删除精选链接，需 `X-Admin-Token` |
 | GET | `/admin` | 用户行为看板（HTML） |
@@ -220,7 +220,7 @@ sqlite3 backend/data/analytics.db \
 | 未命中日志 | 第一页搜索没接住任何精选卡的词全部落 `own_misses` 表（去重计数，翻页不记）。看板"搜过但没接住的词"榜按次数降序，**补了别名的词自动从榜上消失**——榜单永远是纯待办。补录按钮直接把词填进表单 |
 | 埋点 | `click` 事件带 `source`（own / upstream），看板首屏"自有占比" = 精选卡点击 / 总点击。这是这套机制唯一的北极星指标 |
 | 失效兜底 | 复用 dead_link 自动隐藏机制：精选卡和上游卡一样带 shareUrl，被 ≥2 个独立访客报失效后由 `_apply_hidden` 统一摘掉，"已被自动隐藏"区块里能看到。**没有单独做永久停用**——30 天窗口过了会回来，所以看板出现提醒要当天补新分享 |
-| 上架清单 | `GET /api/admin/plan`：近 N 天被搜过的词，**按去重人数从高到低排**。不看点击、不看有没有结果、不分类。**用 `match()` 判定覆盖，已上架的词直接从清单消失**。看板面板可「复制本周清单」或点「补录」填表 |
+| 上架清单 | `GET /api/admin/plan`：近 N 天被搜过的词，**按去重人数从高到低排**。不看点击、不看有没有结果、不分类。**用 `match()` 判定覆盖，已上架的词直接从清单消失**。面板展示人数最多的前 100 个，标题显示 `展示 100 / 共 N 个词`。可「复制本周清单」或点「补录」填表 |
 | 计数口径 | 排序按 `u`（`COUNT(DISTINCT visitor)`，多少人搜过），`n`（搜索次数）只做同分排序——一个人刷 20 次不该压过 5 个人各搜一次；同一词的不同写法按归一化合并。全库都没有访客号时（老数据）退回按 `n` 排 |
 
 ### 运营节奏（每周 30-60 分钟）
