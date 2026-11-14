@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import Panel from './Panel.vue'
 import BarList from './BarList.vue'
 import StatGrid from './StatGrid.vue'
-import { KIND_NAMES, clock, ms, pct, platformName } from '../format'
+import { ms, pct, platformName } from '../format'
 
 const props = defineProps({
   data: { type: Object, default: () => ({}) },
@@ -11,7 +11,6 @@ const props = defineProps({
 
 const o = computed(() => props.data.overview || {})
 const hourly = computed(() => props.data.hourly || [])
-const recent = computed(() => props.data.recent || [])
 
 const health = computed(() => [
   { k: '失败率', v: pct(o.value.fail_rate) },
@@ -40,17 +39,6 @@ const visitorRows = computed(() => [
 const hourMax = computed(() => hourly.value.reduce((m, n) => Math.max(m, Number(n) || 0), 1))
 function hourHeight(n) {
   return Math.max(2, Math.round(((Number(n) || 0) / hourMax.value) * 100)) + '%'
-}
-
-function contentOf(r) {
-  if (r.kind === 'click' || r.kind === 'copy_pwd') return r.target || '-'
-  if (['search', 'filter', 'page', 'retry'].includes(r.kind)) return r.query || '-'
-  return '-'
-}
-
-function kindClass(r) {
-  if (r.kind === 'search' && !r.ok) return 'kind fail'
-  return 'kind ' + r.kind
 }
 </script>
 
@@ -105,24 +93,5 @@ function kindClass(r) {
         <BarList :rows="visitorRows" />
       </section>
     </div>
-  </Panel>
-
-  <Panel title="最近行为流水" tag="最新 30 条">
-    <div v-if="!recent.length" class="empty">这个区间没有行为记录</div>
-    <table v-else class="stream">
-      <thead>
-        <tr><th>时间</th><th>行为</th><th>内容</th><th>平台</th><th>设备</th><th>IP</th></tr>
-      </thead>
-      <tbody>
-        <tr v-for="(r, i) in recent" :key="i">
-          <td class="t">{{ clock(r.ts) }}</td>
-          <td><span :class="kindClass(r)">{{ KIND_NAMES[r.kind] || r.kind }}</span></td>
-          <td class="ellip" :title="contentOf(r)">{{ contentOf(r) }}</td>
-          <td>{{ platformName(r.platform) }}</td>
-          <td>{{ r.device === 'mobile' ? '手机' : '桌面' }}</td>
-          <td class="t">{{ r.ip || '-' }}</td>
-        </tr>
-      </tbody>
-    </table>
   </Panel>
 </template>

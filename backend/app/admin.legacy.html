@@ -420,14 +420,6 @@
       </div>
     </div>
   </details>
-
-  <!-- 流水 -->
-  <details class="panel">
-    <summary>最近行为流水 <span class="tag">最新 30 条</span><span class="arrow">▾</span></summary>
-    <div class="body">
-      <div id="recent"></div>
-    </div>
-  </details>
 </div>
 
 <div class="gate hidden" id="gate">
@@ -573,9 +565,6 @@
     renderReferers(d.referers || []);
     renderPlatforms(d.platforms || []);
     renderVisitors(o);
-
-    // 流水
-    renderRecent(d.recent || []);
   }
 
   // ---------------- 反馈 / 求资源 ----------------
@@ -1092,36 +1081,6 @@
     }
     $('hours').innerHTML = bars;
     $('hours-label').innerHTML = labels;
-  }
-
-  function renderRecent(rows) {
-    var el = $('recent');
-    if (!rows.length) {
-      el.innerHTML = '<div class="empty">这个区间没有行为记录</div>';
-      return;
-    }
-    var html = '<table class="stream"><thead><tr>' +
-      '<th>时间</th><th>行为</th><th>内容</th><th>平台</th><th>设备</th><th>IP</th>' +
-      '</tr></thead><tbody>';
-    rows.forEach(function (r) {
-      var kind = KIND_NAMES[r.kind] || r.kind;
-      var cls = 'kind ' + r.kind;
-      if (r.kind === 'search' && !r.ok) cls = 'kind fail';
-      var content = r.kind === 'click' || r.kind === 'copy_pwd' ? (r.target || '-')
-        : r.kind === 'search' || r.kind === 'filter' || r.kind === 'page' || r.kind === 'retry'
-          ? (r.query || '-')
-          : '-';
-      html += '<tr>' +
-        '<td class="t">' + hhmmss(r.ts) + '</td>' +
-        '<td><span class="' + esc(cls) + '">' + esc(kind) + '</span></td>' +
-        '<td class="ellip" title="' + esc(content) + '">' + esc(content) + '</td>' +
-        '<td>' + esc(platformName(r.platform)) + '</td>' +
-        '<td>' + esc(r.device === 'mobile' ? '手机' : '桌面') + '</td>' +
-        '<td class="t">' + esc(r.ip || '-') + '</td>' +
-        '</tr>';
-    });
-    html += '</tbody></table>';
-    el.innerHTML = html;
   }
 
   // ---------------- 群入口配置 ----------------
