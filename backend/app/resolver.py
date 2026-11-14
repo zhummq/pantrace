@@ -5,16 +5,19 @@
 把用户送到那个地址。好处是链接不再外露、失效可控、来源可统计；
 代价是三件事，代码里都做了硬约束，改之前先读这一节：
 
-1. **容量**：转存永久占用我们账号的空间，且分享出去后不能删源文件
-   （删了分享就断）。所以有 `max_bytes` 阈值，超了直接判失败走回退，
-   宁可这一条给原链接，也不要把账号塞爆。
+1. **容量**：转存要占我们账号的空间。文件只留 30 分钟（到点回收，分享跟着断），
+   所以不是永久占用；但同一资源每半小时要重转一次，热资源同时在号里的副本不少。
+   所以有 `max_bytes` 阈值，超了直接判失败走回退，宁可这一条给原链接，
+   也不要把账号塞爆。
 2. **频控**：网盘对连续转存有风控。所有转存走全局串行 + 最小间隔，
    同一源链接并发点击用单飞锁合并成一次。
 3. **失效**：源分享过期、提取码错、被举报，都会导致转存失败。
    失败结果短缓存（默认 10 分钟），避免每个点击都去打一次接口。
 
 映射落 `mirrors` 表（和埋点、反馈共用同一个 SQLite）：源链接 → 我们的链接。
-一次成功永久复用，第二个人点开是 0 延迟——这是这套机制能扛住流量的关键。
+窗口内复用，第二个人点开是 0 延迟——这是这套机制能扛住流量的关键；过了窗口
+重新转存，链接随之后移。分享本身按 1 天建（不是永久），回收任务失灵时由
+网盘那边兜底失效。
 
 安全：返回给前端的不是真实链接，而是 `make_token()` 生成的签名串。
 不做签名就是开放重定向，别人能拿本站当钓鱼跳板。
@@ -51,6 +54,9 @@ _cfg: dict = {
     "enabled": True,
     "secret": "",
     "fail_ttl": 600,
+    # 我们自己发的链接活多久（秒）。30 分钟后回收文件，再点会重转。
+    # 用竞品那套：不靠网盘的有效期（最短 1 天），靠删除源文件。
+    "link_ttl": 1800,
 }
 
 # 单飞锁：同一个源链接被 N 个人同时点，只转一次，其余等结果
@@ -68,20 +74,6 @@ _ALLOWED_HOST_RE = re.compile(
     r")$",
     re.IGNORECASE,
 )
-
-_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
-
-_QUARK = "https://drive-pc.quark.cn/1/clouddrive"
-_QUARK_TOKEN = f"{_QUARK}/share/sharepage/token?pr=ucpro&fr=pc"
-_QUARK_DETAIL = f"{_QUARK}/share/sharepage/detail"
-_QUARK_SAVE = f"{_QUARK}/share/sharepage/save?pr=ucpro&fr=pc"
-_QUARK_TASK = f"{_QUARK}/task"
-_QUARK_SHARE = f"{_QUARK}/share?pr=ucpro&fr=pc"
-_FOREVER = 4  # expired_type=4 → 永久
-
 
 def init(db_path: str | Path, **cfg) -> None:
     global _db_path, _inited
@@ -149,17 +141,32 @@ def _ensure_schema() -> None:
                 hits       INTEGER NOT NULL DEFAULT 0,
                 account_id INTEGER NOT NULL DEFAULT 0,
                 fids       TEXT NOT NULL DEFAULT '[]',
+                expires_at INTEGER NOT NULL DEFAULT -1,
                 created_ts REAL NOT NULL,
                 updated_ts REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_mirrors_status ON mirrors(status);
             CREATE INDEX IF NOT EXISTS idx_mirrors_ts ON mirrors(updated_ts DESC);
+
+            -- 换新链接后，上一轮的转存文件没人指向了。mirrors 只存得下最新一组
+            -- fids，不排进这张表就等于每 30 分钟漏一份，账号一天就满。
+            CREATE TABLE IF NOT EXISTS mirror_trash (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id   INTEGER NOT NULL DEFAULT 0,
+                fids         TEXT NOT NULL DEFAULT '[]',
+                delete_after REAL NOT NULL,
+                created_ts   REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_trash_due ON mirror_trash(delete_after);
             """
         )
         # 老库补列。SQLite 没有 ADD COLUMN IF NOT EXISTS，只能试一次吞异常
         for column, ddl in (
             ("account_id", "INTEGER NOT NULL DEFAULT 0"),
             ("fids", "TEXT NOT NULL DEFAULT '[]'"),
+            # -1 = 老数据没记过窗口（下次点击校验一次）；0 = 没有窗口（旧版本写的，
+            # 或者回收任务已把窗口抹掉）；>0 = 秒级时间戳
+            ("expires_at", "INTEGER NOT NULL DEFAULT -1"),
         ):
             try:
                 conn.execute(f"ALTER TABLE mirrors ADD COLUMN {column} {ddl}")
@@ -304,26 +311,63 @@ def _bump_hit(key: str) -> None:
         pass
 
 
+def _stash_old(row: dict) -> None:
+    """刷新映射前，把上一轮转存的文件排进待删队列。
+
+    为什么不能当场删：`_needs_refresh` 会提前 60 秒动手（避免用户拿到一条马上
+    断的链接），这 60 秒里旧链接还有人可能正在打开。所以约到旧窗口结束 + 5 分钟
+    宽限，由回收任务删。
+
+    为什么要删：`_store` 会覆盖 fids，旧文件就再没人指向了。30 分钟重转一次，
+    不清理的话一天就是几十份副本，账号撑不过一天。
+    """
+    fids = []
+    try:
+        fids = json.loads(row.get("fids") or "[]")
+    except (TypeError, ValueError):
+        return
+    account_id = int(row.get("account_id") or 0)
+    if not fids or not account_id:
+        return
+    now = time.time()
+    deadline = max(now, float(row.get("expires_at") or 0)) + 300
+    try:
+        with _session() as conn:
+            conn.execute(
+                "INSERT INTO mirror_trash (account_id, fids, delete_after, created_ts)"
+                " VALUES (?,?,?,?)",
+                (account_id, json.dumps(fids, ensure_ascii=False), deadline, now),
+            )
+    except sqlite3.Error:
+        log.warning("旧副本入队失败：%s 个文件（账号 %s），只有等手工清", len(fids), account_id)
+
+
 def _store(key: str, src_url: str, platform: str, our_url: str,
            status: str, reason: str = "", size: int = 0,
-           account_id: int = 0, fids: list[str] | None = None) -> None:
+           account_id: int = 0, fids: list[str] | None = None,
+           expires_at: int = -1) -> None:
     """落映射。fids / account_id 是给清理任务留的：没有它们，回收空间时
-    只能靠列目录去猜哪几个文件是我们的，代价大且容易删错。"""
+    只能靠列目录去猜哪几个文件是我们的，代价大且容易删错。
+
+    expires_at 记我们自己那条分享的有效期（秒）。没有它就只能等用户
+    点开一条死链才知道分享过期了——2026-11 就是这么踩的。
+    """
     now = time.time()
     with _session() as conn:
         conn.execute(
             """INSERT INTO mirrors
                (src_key, src_url, platform, our_url, status, reason, bytes,
-                hits, account_id, fids, created_ts, updated_ts)
-               VALUES (?,?,?,?,?,?,?,0,?,?,?,?)
+                hits, account_id, fids, expires_at, created_ts, updated_ts)
+               VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?)
                ON CONFLICT(src_key) DO UPDATE SET
                  our_url=excluded.our_url, status=excluded.status,
                  reason=excluded.reason, bytes=excluded.bytes,
                  account_id=excluded.account_id, fids=excluded.fids,
+                 expires_at=excluded.expires_at,
                  updated_ts=excluded.updated_ts""",
             (key, src_url[:500], platform[:20], our_url[:500], status,
              reason[:200], int(size), int(account_id),
-             json.dumps(fids or [], ensure_ascii=False), now, now),
+             json.dumps(fids or [], ensure_ascii=False), int(expires_at), now, now),
         )
 
 
@@ -340,13 +384,41 @@ def _lock_for(key: str) -> threading.Lock:
         return lock
 
 
-def _ms_to_ts(value) -> float | None:
-    """夸克的时间戳是毫秒，0 / 空值一律当"不知道"。"""
+#: 距离到期还剩这么多秒就提前重建。留 60 秒缓冲，别让用户正好在截止前
+#: 拿到一条马上断的链接。
+_REFRESH_AHEAD = 60
+
+
+def _needs_refresh(row: dict) -> bool:
+    """这条映射要不要重新转存。
+
+    链接只活 `link_ttl`（默认 30 分钟），到期必须重转——竞品的逻辑是
+    "文件到点就删"，旧链接留着也是死链，不能用。"老数据"（expires_at=-1，
+    没记过窗口）一律翻新一次，把之前依赖分享有效期的那批换掉。
+    """
+    expires = int(row.get("expires_at", -1))
+    if expires < 0:
+        return True
+    if expires == 0:
+        return False   # 0 = 没有窗口（旧数据 / 已回收），不当成可复用
+    return expires <= time.time() + _REFRESH_AHEAD
+
+
+def _defer_refresh(key: str, seconds: int = 300) -> None:
+    """重建失败但旧链接还能用时，把下一次重试推后。
+
+    不改 status / our_url：旧链接还在，用户照常能打开；只是别再每次点击
+    都去打一次接口（网盘最烦的就是这个）。窗口本身只有半小时，推迟太久
+    等于一直给死链，所以默认 5 分钟。
+    """
     try:
-        num = float(value or 0)
-    except (TypeError, ValueError):
-        return None
-    return num / 1000 if num > 10_000_000_000 else (num or None)
+        with _session() as conn:
+            conn.execute(
+                "UPDATE mirrors SET expires_at=? WHERE src_key=?",
+                (int(time.time() + seconds), key),
+            )
+    except sqlite3.Error:
+        pass
 
 
 # ---- 对外主入口 ----
@@ -360,9 +432,9 @@ def mirror(url: str, pwd: str = "", platform: str = "", title: str = "", force: 
     这里只管三件事：查映射、单飞、落库。真正的转存在 `pan.transfer`——
     挑账号、换账号、各网盘的七步流程都在那边，这块不再认识任何网盘。
 
-    force：跳过**失败**缓存。后台手工验链走这条，否则改完账号配置再验，
-    拿到的还是上次那句缓存下来的失败原因，验了个寂寞。成功映射不跳过——
-    已经有能用的链接，再转一次只会在临时目录里留一份孤儿文件。
+    force：忽略**成功和失败**缓存，强制重转一次。后台「手工验链」走这条——
+    否则改完账号配置再验，拿到的还是上次缓存的结果；存量映射（老版本建的
+    永久/30 天分享）也只能靠它逐条翻新成 1 天 + 30 分钟窗口。
     """
     if not _inited or not _cfg.get("enabled"):
         return {"ok": False, "url": "", "reason": "转存未启用", "cached": False}
@@ -373,7 +445,7 @@ def mirror(url: str, pwd: str = "", platform: str = "", title: str = "", force: 
         return {"ok": False, "url": "", "reason": "链接无法识别", "cached": False}
 
     row = _get_row(key)
-    if row and row["status"] == "ok" and row["our_url"]:
+    if row and row["status"] == "ok" and row["our_url"] and not force and not _needs_refresh(row):
         _bump_hit(key)
         return {"ok": True, "url": row["our_url"], "reason": "", "cached": True}
     if row and row["status"] == "fail" and not force and time.time() - row["updated_ts"] < float(_cfg["fail_ttl"]):
@@ -387,9 +459,10 @@ def mirror(url: str, pwd: str = "", platform: str = "", title: str = "", force: 
     with lock:
         # 拿到锁后再查一次：等锁期间可能已经被别人转好了
         row = _get_row(key)
-        if row and row["status"] == "ok" and row["our_url"]:
+        keep = row if (row and row["status"] == "ok" and row["our_url"]) else None
+        if keep and not force and not _needs_refresh(keep):
             _bump_hit(key)
-            return {"ok": True, "url": row["our_url"], "reason": "", "cached": True}
+            return {"ok": True, "url": keep["our_url"], "reason": "", "cached": True}
         if row and row["status"] == "fail" and not force and time.time() - row["updated_ts"] < float(_cfg["fail_ttl"]):
             return {"ok": False, "url": "", "reason": row["reason"] or "转存失败", "cached": True}
 
@@ -400,19 +473,50 @@ def mirror(url: str, pwd: str = "", platform: str = "", title: str = "", force: 
                 raise UpstreamError("转存没返回可用链接")
         except NetdiskError as exc:
             reason = str(exc) or "转存失败"
+            if _still_alive(keep):
+                # 旧链接还没到期，重建失败不该把用户从"我们的链接"降级到"上游原链接"
+                _defer_refresh(key)
+                log.warning("重建分享失败，沿用旧链接：%s → %s", url[:100], reason)
+                return {"ok": True, "url": keep["our_url"], "reason": reason, "cached": True}
             _store(key, url, platform, "", "fail", reason)
             return {"ok": False, "url": "", "reason": reason, "cached": False}
         except Exception as exc:  # noqa: BLE001
             msg = f"转存异常：{exc.__class__.__name__}"
+            if _still_alive(keep):
+                _defer_refresh(key)
+                return {"ok": True, "url": keep["our_url"], "reason": msg, "cached": True}
             _store(key, url, platform, "", "fail", msg)
             log.exception("转存未捕获异常：%s", url[:120])
             return {"ok": False, "url": "", "reason": msg, "cached": False}
 
+        # 窗口从"建好这一刻"起算，跟竞品一致：30 分钟后文件回收，分享跟着断。
+        # 网盘那边的分享有效期（1 天）只用来兜底，不落库——真正决定链接活多久
+        # 的是我们自己的回收任务。
+        if keep:
+            # 先排队再覆盖：_store 之后这一行的 fids 就换成新的了
+            _stash_old(keep)
         _store(
-            key, url, platform, our_url, "ok", link.note, link.size,
+            key, url, platform, our_url, "ok",
+            _display_note(link.note), link.size,
             account_id=_account_id_of(link), fids=link.fids,
+            expires_at=int(time.time() + float(_cfg["link_ttl"])),
         )
-        return {"ok": True, "url": our_url, "reason": link.note, "cached": False}
+        return {"ok": True, "url": our_url, "reason": _display_note(link.note), "cached": False}
+
+
+def _still_alive(row: dict | None) -> bool:
+    """旧映射还能不能用（只在重建失败时用它决定要不要兜底）。"""
+    if not row:
+        return False
+    expires = int(row.get("expires_at", -1))
+    if expires == 0:
+        return True    # 没有窗口（永久/读不到），没法判断，按还活着处理
+    return expires > time.time()
+
+
+def _display_note(note: str) -> str:
+    """note 里混着 `account=N`（给清理任务用的），展示前摘掉。"""
+    return re.sub(r"\s*\|?\s*account=\d+", "", note or "").strip(" |")
 
 
 def _account_id_of(link) -> int:
@@ -433,22 +537,25 @@ def _platform_of(url: str) -> str:
 def stats() -> dict:
     """看板 / 排障用的小数字。"""
     if not _inited:
-        return {"ok": 0, "fail": 0, "hits": 0, "bytes": 0, "recent": []}
+        return {"ok": 0, "fail": 0, "expired": 0, "hits": 0, "bytes": 0, "recent": []}
     with _session() as conn:
         row = conn.execute(
             """SELECT
                  SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok,
                  SUM(CASE WHEN status='fail' THEN 1 ELSE 0 END) AS fail,
+                 SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END) AS expired,
                  SUM(hits) AS hits, SUM(bytes) AS bytes
                FROM mirrors"""
         ).fetchone()
         recent = conn.execute(
-            """SELECT src_url, our_url, platform, status, reason, bytes, hits, updated_ts
+            """SELECT src_url, our_url, platform, status, reason, bytes, hits,
+                      expires_at, updated_ts
                FROM mirrors ORDER BY updated_ts DESC LIMIT 30"""
         ).fetchall()
     return {
         "ok": int(row["ok"] or 0),
         "fail": int(row["fail"] or 0),
+        "expired": int(row["expired"] or 0),
         "hits": int(row["hits"] or 0),
         "bytes": int(row["bytes"] or 0),
         "recent": [dict(r) for r in recent],

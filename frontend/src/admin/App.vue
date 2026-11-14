@@ -3,8 +3,6 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import Gate from './components/Gate.vue'
 import StatGrid from './components/StatGrid.vue'
 import FeedbackPanel from './components/FeedbackPanel.vue'
-import PlanPanel from './components/PlanPanel.vue'
-import OwnPanel from './components/OwnPanel.vue'
 import AccountsPanel from './components/AccountsPanel.vue'
 import GroupPanel from './components/GroupPanel.vue'
 import InsightsPanel from './components/InsightsPanel.vue'
@@ -26,19 +24,15 @@ const errorMsg = ref('')
 const lastLoaded = ref('')
 
 const feedbackPanel = ref(null)
-const planPanel = ref(null)
-const ownPanel = ref(null)
 const accountsPanel = ref(null)
 const groupPanel = ref(null)
 
 const o = computed(() => data.value.overview || {})
-const ownRatio = computed(() => Number(o.value.own_ratio) || 0)
 const rangeText = computed(() => (days.value === 1 ? '今天' : `近 ${days.value} 天`))
 
 const overviewStats = computed(() => [
   { k: '搜索次数', v: Number(o.value.searches) || 0, hi: true, hint: '业务核心量' },
   { k: '点击转化率', v: pct(o.value.ctr), hint: '点开资源 / 搜索次数' },
-  { k: '自有占比', v: pct(o.value.own_ratio), hi: ownRatio.value > 0, hint: '精选卡点击 / 总点击 · 越高越好' },
   {
     k: '零结果率',
     v: pct(o.value.zero_rate),
@@ -74,7 +68,7 @@ async function loadStats(silent = false) {
 
 function loadAll() {
   loadStats()
-  for (const p of [feedbackPanel, planPanel, ownPanel, accountsPanel]) {
+  for (const p of [feedbackPanel, accountsPanel]) {
     if (p.value) p.value.reload()
   }
 }
@@ -100,10 +94,6 @@ function logout() {
   data.value = {}
 }
 
-function fillOwn(q) {
-  if (ownPanel.value) ownPanel.value.fillForm(q)
-}
-
 let timer = null
 onMounted(() => {
   api.setToken(api.readToken())
@@ -113,8 +103,6 @@ onMounted(() => {
     loadStats(true)
     // 只静默刷新列表，不动用户正在编辑的表单和群配置
     if (feedbackPanel.value) feedbackPanel.value.reload()
-    if (planPanel.value) planPanel.value.reload()
-    if (ownPanel.value) ownPanel.value.reload()
   }, 60000)
 })
 
@@ -157,8 +145,6 @@ onUnmounted(() => {
       <StatGrid :items="subStats" />
 
       <FeedbackPanel ref="feedbackPanel" :days="days" />
-      <PlanPanel ref="planPanel" :days="days" @fill="fillOwn" />
-      <OwnPanel ref="ownPanel" :days="days" :own-ratio="ownRatio" />
       <AccountsPanel ref="accountsPanel" />
       <GroupPanel ref="groupPanel" />
       <InsightsPanel :data="data" />

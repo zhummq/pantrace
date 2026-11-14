@@ -66,11 +66,6 @@ class Settings(BaseSettings):
     # 配置存在同一个 SQLite 里，/admin 看板可改，这个开关是总闸。
     group_enabled: bool = True
 
-    # ---- 自有精选链接 ----
-    # 站方维护的网盘资源库：搜索命中时置顶展示，未命中词落日志。
-    # 和埋点、反馈共用同一个 SQLite，开关独立——关掉只影响精选卡。
-    own_enabled: bool = True
-
     # ---- 点击时转存（链接不外露）----
     # 用户点开资源时，用我们自己的网盘账号把上游分享转存一份，
     # 再把我们名下的分享链接给他。关掉则恢复成直接给上游原始链接。
@@ -79,8 +74,9 @@ class Settings(BaseSettings):
     # 由于这是最后一跳，失效比签名过期更致命——见 README「点击时转存」。
     mirror_quark_cookie: str = ""
     # 单条资源允许转存的最大体积。超过就不转、直接给原链接。
-    # 这是容量闸门：转存永久占用账号空间，且分享出去后不能删源文件。
-    # 现在由各网盘 adapter 的 max_file_bytes 管，这里只留兼容默认值
+    # 这是容量闸门：虽然文件只留 30 分钟，但同一资源每半小时要重转一次，
+    # 热资源同时在账号里的副本并不少。现在由各网盘 adapter 的 max_file_bytes
+    # 管，这里只留兼容默认值
     mirror_max_gb: float = 30.0
     # 转存失败结果缓存秒数：避免每个点击都去打一次接口
     mirror_fail_ttl: int = 600
@@ -91,6 +87,11 @@ class Settings(BaseSettings):
     mirror_max_attempts: int = 3
     # 冷映射回收：超过这么多天零点击的映射，连文件一起删，把空间还回来
     mirror_cold_days: int = 30
+    # 给用户的链接有效分钟数。竞品的做法是缓存 25–30 分钟就删源文件，
+    # 逼用户当场转存到自己的网盘（夸克没有"30 分钟"这种分享有效期选项，
+    # 只能我们自己删文件实现；分享本身按 1 天建，不是永久——见 quark/const.py）。
+    # 到点后旧文件回收，再次点击会重新转存。
+    mirror_link_minutes: int = 30
     # /go/ 跳转 token 的签名密钥。留空则由 API_KEY 派生（重启不变）；
     # 换掉它 = 所有已发出的旧链接失效（会走回退，不会 404）
     mirror_secret: str = ""

@@ -382,6 +382,117 @@ def probe(account_id: int) -> dict:
 
 # ---- 空间回收 ----
 
+def recycle_expired(mirrors_session, *, grace_seconds: int = 300) -> dict:
+    """回收过了有效窗口的转存文件（竞品模式：链接只活半小时）。
+
+    不靠网盘自己的分享有效期——夸克最短只给 1 天，做不到 30 分钟。
+    真正让链接失效的是**删掉源文件**，这是竞品验证过的路子。
+
+    行保留、状态改 `expired`：下次点击走重转，hits 统计也不丢。
+    宽限 grace_seconds 是给"刚好在截止前点开"的人留的余量——
+    文件不能卡着 30:00 删，否则他正在转存时源就没了。
+    """
+    now = time.time()
+    with _session() as conn:
+        rows = conn.execute(
+            """SELECT src_key, platform, account_id, fids, expires_at FROM mirrors
+               WHERE status='ok' AND expires_at > 0 AND expires_at < ?""",
+            (now - grace_seconds,),
+        ).fetchall()
+
+    removed_rows = 0
+    removed_files = 0
+    errors: list[str] = []
+    accounts = {a.id: a for a in list_accounts()}
+
+    for row in rows:
+        account_id = int(row["account_id"] or 0)
+        fids = _parse_fids(row["fids"])
+        key = row["src_key"]
+        if not fids:
+            # 没有 fids 说明转存时就没拿到（老数据），删不了文件，直接标记回收
+            with mirrors_session() as conn:
+                conn.execute(
+                    "UPDATE mirrors SET status='expired' WHERE src_key=?", (key,)
+                )
+            removed_rows += 1
+            continue
+
+        account = accounts.get(account_id)
+        if account is None or not account.enabled:
+            # 账号没了就删不了，留着自己过不去；标记出来让人在后台看见
+            errors.append(f"{key[:8]}: 账号 {account_id} 不可用，文件未回收")
+            continue
+
+        try:
+            client = registry.create(account.type, account, timeout=float(_cfg["timeout"]))
+            try:
+                client.delete(fids)
+                removed_files += len(fids)
+            finally:
+                client.close()
+        except NetdiskError as exc:
+            errors.append(f"{key[:8]}: {exc}")
+            continue
+
+        with mirrors_session() as conn:
+            conn.execute(
+                "UPDATE mirrors SET status='expired', fids='[]' WHERE src_key=?", (key,)
+            )
+        removed_rows += 1
+
+    return {"rows": removed_rows, "files": removed_files, "errors": errors}
+
+
+def recycle_trash(mirrors_session, *, limit: int = 50) -> dict:
+    """删掉"换新链接之后剩下来的旧副本"。
+
+    `mirrors` 每行只存得下最新一组 fids：窗口到期重转一次，上一轮的文件就
+    失去引用了，recycle_expired 永远扫不到它们。30 分钟一转，一天几十份，
+    账号撑不过一天，所以重转时必须把旧 fids 排进 `mirror_trash` 队列。
+
+    到点就删；删不掉也出队——留在队列里只会每 5 分钟重试一次，永远删不掉的
+    条目会把队头堵死。失败写在返回值里，由日志暴露出来人工处理。
+    """
+    now = time.time()
+    with mirrors_session() as conn:
+        rows = conn.execute(
+            """SELECT id, account_id, fids FROM mirror_trash
+               WHERE delete_after <= ? ORDER BY id LIMIT ?""",
+            (now, int(limit)),
+        ).fetchall()
+
+    removed_files = 0
+    errors: list[str] = []
+    accounts = {a.id: a for a in list_accounts()}
+
+    for row in rows:
+        rid = int(row["id"])
+        account_id = int(row["account_id"] or 0)
+        fids = _parse_fids(row["fids"])
+        account = accounts.get(account_id)
+
+        if fids and account is not None and account.enabled:
+            try:
+                client = registry.create(account.type, account, timeout=float(_cfg["timeout"]))
+                try:
+                    client.delete(fids)
+                    removed_files += len(fids)
+                finally:
+                    client.close()
+            except NetdiskError as exc:
+                errors.append(f"旧副本 {rid}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"旧副本 {rid}: {exc.__class__.__name__}")
+        elif fids:
+            errors.append(f"旧副本 {rid}: 账号 {account_id} 不可用，文件未回收")
+
+        with mirrors_session() as conn:
+            conn.execute("DELETE FROM mirror_trash WHERE id=?", (rid,))
+
+    return {"rows": len(rows), "files": removed_files, "errors": errors}
+
+
 def cleanup(mirrors_session, *, cold_days: int = 0) -> dict:
     """回收冷映射占用的空间。
 

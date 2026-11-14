@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, feedback, group, own, pan, providers, resolver
+from . import analytics, feedback, group, pan, providers, resolver
 from .sdk import registry
 from .config import get_settings
 from .providers import UpstreamError
@@ -93,43 +93,56 @@ DIST = (
 ADMIN_DIST_HTML = DIST / "admin.html"
 ADMIN_HTML = Path(__file__).resolve().parent / "admin.legacy.html"
 
-# ---- 自有精选链接 ----
-# 站方维护的资源库：搜索命中时置顶展示"本站精选"卡，未命中词落日志。
-# 数据和埋点、反馈共用同一个 SQLite，开关独立。
-OWN_ON = settings.own_enabled
-if OWN_ON:
-    try:
-        own.init(settings.analytics_path)
-        log.info("自有精选链接已启用：%s", settings.analytics_path)
-    except Exception as exc:  # noqa: BLE001
-        OWN_ON = False
-        log.error("自有精选链接初始化失败，已关闭：%s", exc)
-else:
-    log.info("自有精选链接已关闭（OWN_ENABLED=false）")
-
 # ---- 点击时转存（链接不外露）----
 # 用户点开时不给他上游原始链接，而是当场用我们的账号转存一份、建我们名下的分享。
 # 关掉这个开关就退回老行为（直接给原链接），不存在"中间态"。
 def _start_maintenance() -> None:
-    """每 6 小时回收一次冷映射。
+    """回收循环：链接只活 30 分钟，到点删文件。
+
+    竞品就是这套——缓存半小时，逼用户当场转存到自己的网盘。区别在于
+    我们不做"25 分钟无脑清空"，而是按每条映射自己的窗口（`MIRROR_LINK_MINUTES`）
+    回收，并在删除前留 5 分钟宽限，避免把正在转存的用户打断。
 
     不用 APScheduler：一个守护线程就够。多进程部署时每个进程都会跑一遍，
-    但 cleanup 是幂等的（删文件 + 删行，重复执行只是空转），可以接受。
+    但回收是幂等的（删文件 + 改状态，重复执行只是空转），可以接受。
     """
     def _loop() -> None:
+        cold_tick = 0
+        last_err = ""
         while True:
-            time.sleep(6 * 3600)
             try:
-                result = pan.cleanup(resolver.session)
+                result = pan.recycle_expired(resolver.session)
                 if result["rows"] or result["files"]:
                     log.info(
-                        "空间回收：清 %s 行 / %s 个文件（冷映射阈值 %s 天）",
-                        result["rows"], result["files"], result["coldDays"],
+                        "到期回收：%s 条链接 / %s 个文件（窗口 %s 分钟）",
+                        result["rows"], result["files"], settings.mirror_link_minutes,
                     )
-                if result["errors"]:
-                    log.warning("空间回收有 %s 条失败：%s", len(result["errors"]), result["errors"][:3])
+                # 账号被删/停用时会一直删不掉，同样的错别每 5 分钟刷一遍
+                err = "；".join(result["errors"][:2])
+                if err and err != last_err:
+                    log.warning("到期回收有 %s 条失败：%s", len(result["errors"]), result["errors"][:3])
+                last_err = err
+
+                # 重转后剩下的旧副本：没有映射行指向它们，只能走这条队列
+                trash = pan.recycle_trash(resolver.session)
+                if trash["rows"]:
+                    log.info("旧副本清理：%s 批 / %s 个文件", trash["rows"], trash["files"])
+                if trash["errors"]:
+                    log.warning("旧副本清理有 %s 条失败：%s", len(trash["errors"]), trash["errors"][:3])
             except Exception:  # noqa: BLE001
-                log.exception("空间回收失败，6 小时后再试")
+                log.exception("到期回收失败，5 分钟后再试")
+
+            # 冷映射兜底（长时间没人点、也没有 fids 的残余行），一小时一次就够
+            cold_tick += 1
+            if cold_tick % 12 == 0:
+                try:
+                    cold = pan.cleanup(resolver.session)
+                    if cold["rows"] or cold["files"]:
+                        log.info("空间回收：清 %s 行 / %s 个文件", cold["rows"], cold["files"])
+                except Exception:  # noqa: BLE001
+                    log.exception("空间回收失败，一小时后重试")
+
+            time.sleep(300)
 
     threading.Thread(target=_loop, name="pan-maintenance", daemon=True).start()
 
@@ -142,6 +155,7 @@ if MIRROR_ON:
             enabled=True,
             secret=settings.mirror_secret or f"{settings.api_key}|{settings.idr_sign}",
             fail_ttl=settings.mirror_fail_ttl,
+            link_ttl=settings.mirror_link_minutes * 60,
         )
         pan.init(
             settings.analytics_path,
@@ -364,20 +378,6 @@ def _apply_hidden(body: dict) -> dict:
     return out
 
 
-def _attach_own(body: dict, own_items: list[dict]) -> dict:
-    """自有精选卡插到结果集最顶部，不参与任何排序。
-
-    命中即置顶：不存在"匹配上了但被上游结果淹没"的情况。
-    上游结果照常列在下面——自有库覆盖率撑不起全站流量，
-    砍掉上游等于把没命中的搜索词直接送走。
-    """
-    if not own_items:
-        return body
-    body["items"] = own_items + list(body.get("items") or [])
-    body["ownCount"] = len(own_items)
-    return body
-
-
 def _public_body(body: dict) -> dict:
     """把上游真实链接换成签名跳转地址，再交给前端。
 
@@ -429,10 +429,6 @@ PLATFORMS = [
 ]
 PLATFORM_NAME = {p["key"]: p["name"] for p in PLATFORMS}
 VALID_PLATFORM_KEYS = set(PLATFORM_NAME)
-# 自有卡的 platformName 展示用这张表；模块导入时机早于平台表定义，
-# 所以在这里注入（own.set_platforms 只是赋值，开销为零）
-if OWN_ON:
-    own.set_platforms(PLATFORM_NAME)
 
 # ---- 缓存 ----
 _cache: dict[str, tuple[float, dict]] = {}
@@ -511,13 +507,6 @@ async def search(
         "is_new": is_new,
     }
 
-    # 自有精选卡：命中即在顶部展示。匹配在响应时做、不进缓存——
-    # 改链接配置/补别名立刻生效，不用等缓存过期。
-    # 第一页没接住的词落未命中日志，翻页不记（同一个词重复计数没有意义）。
-    own_items = own.match(query, platform_list or None) if OWN_ON else []
-    if OWN_ON and not own_items and page == 1:
-        background.add_task(own.record_miss, query)
-
     cached = _cache.get(cache_key)
     if cached and now - cached[0] < CACHE_TTL:
         body = dict(cached[1])
@@ -531,7 +520,7 @@ async def search(
                 result_count=len(body.get("items") or []),
                 cached=True,
             )
-        return _public_body(_apply_hidden(_attach_own(body, own_items)))
+        return _public_body(_apply_hidden(body))
 
     failed = _fail_cache.get(cache_key)
     if failed and now - failed[0] < FAIL_TTL:
@@ -617,8 +606,7 @@ async def search(
         "search q=%s page=%s items=%s %sms",
         query, page, len(body["items"]), upstream_ms,
     )
-    # dict(body)：body 已进缓存，自有卡只在响应时挂，不能污染缓存本体
-    return _public_body(_apply_hidden(_attach_own(dict(body), own_items)))
+    return _public_body(_apply_hidden(dict(body)))
 
 
 # ---- 点击跳转：/go/<token> ----
@@ -635,7 +623,7 @@ _GO_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
-<title>正在准备资源 · 盘迹</title>
+<title>正在打开 · 盘迹</title>
 <style>
 *{box-sizing:border-box}
 body{margin:0;min-height:100vh;display:grid;place-items:center;
@@ -652,6 +640,8 @@ body{margin:0;min-height:100vh;display:grid;place-items:center;
 h1{margin:0 0 8px;font-size:17px;font-weight:600;letter-spacing:-.01em}
 p{margin:0;color:#7b8794;font-size:13px}
 .err{color:#b4462f;margin-top:14px;display:none}
+.ttl{margin:14px 0 0;padding:8px 10px;border-radius:8px;background:#fff7e6;color:#9a6700;
+  border:1px solid #ffe1a8;font-size:12.5px;line-height:1.5}
 .acts{margin-top:20px;display:none;gap:10px;justify-content:center}
 a.btn{display:inline-flex;align-items:center;height:34px;padding:0 15px;border-radius:8px;
   font-size:13px;text-decoration:none;color:#1b2430;border:1px solid #dfe3e9}
@@ -661,8 +651,9 @@ a.btn.primary{background:#1b2430;color:#fff;border-color:#1b2430}
 <div class="box">
   <div class="brand">PanTrace</div>
   <div class="ring" id="ring"></div>
-  <h1 id="title">正在准备资源</h1>
-  <p id="hint">首次打开需要转存一份，通常 1–3 秒</p>
+  <h1 id="title">正在为你打开</h1>
+  <p id="hint">正在准备这条资源，通常几秒内完成</p>
+  <p class="ttl" id="ttl">链接只保留 __TTL__ 分钟，打开后请先转存到自己的网盘</p>
   <p class="err" id="err"></p>
   <div class="acts" id="acts">
     <a class="btn" href="/">返回搜索</a>
@@ -671,29 +662,75 @@ a.btn.primary{background:#1b2430;color:#fff;border-color:#1b2430}
 </div>
 <script>
 var TOKEN = __TOKEN__;
-var slow = setTimeout(function () {
-  document.getElementById('hint').textContent = '资源较大，转存稍慢，请再等一会儿…';
-}, 4000);
+var START = Date.now();
+var MIN_SHOW = 1200;  // 最短停留：给"30 分钟内有效"那行留出可读时间
+var RING = document.getElementById('ring');
+var TITLE = document.getElementById('title');
+var HINT = document.getElementById('hint');
+
+// 分阶段给话。原来一句"首次打开需要转存一份"有三个毛病：暴露我们在替用户
+// 转存别人的分享、"首次"并不准（缓存命中是秒开，非首次也可能重建）、
+// 4 秒就说"资源较大"是假信息。按真实耗时给提示，且只说用户视角的事。
+var t1 = setTimeout(function () {
+  HINT.textContent = '还在准备，好了会自动跳过去，不用重复点';
+}, 5000);
+var t2 = setTimeout(function () {
+  HINT.textContent = '来源站响应偏慢，请再等一下，别关这个页面';
+}, 15000);
+var t3 = setTimeout(function () {
+  HINT.textContent = '等得有点久了，可以返回换一条，或者告诉我们这条打不开';
+}, 30000);
+function stopTimers() { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); }
+
+// 后端的 msg 是写给我们排障看的（"转存未启用""账号没有可用账号"），
+// 原样展示等于骂用户。这里翻成人话，认不出来才用兜底那句。
+function reasonText(msg) {
+  var m = String(msg || '');
+  if (/失效|删除|取消|不存在|过期/.test(m)) return '这条分享已经被删除或过期了';
+  if (/违规|侵权/.test(m)) return '这条资源被来源站下架了';
+  if (/提取码|密码|验证码/.test(m)) return '这条资源需要提取码，暂时打不开';
+  if (/容量|空间|账号|登录|cookie/i.test(m)) return '资源准备服务正忙，过一会儿再试';
+  if (/体积|太大|阈值/.test(m)) return '这条资源太大，暂时打不开';
+  if (/频繁|限流/.test(m)) return '操作太频繁了，过一两分钟再试';
+  return '这条资源可能已经失效了';
+}
+
 function fail(msg) {
-  clearTimeout(slow);
-  document.getElementById('ring').style.display = 'none';
-  document.getElementById('title').textContent = '资源暂时打不开';
-  document.getElementById('hint').textContent = msg || '这条资源可能已失效';
+  stopTimers();
+  RING.style.display = 'none';
+  TITLE.textContent = '这条资源打不开';
+  HINT.textContent = reasonText(msg);
   var e = document.getElementById('err');
-  e.textContent = '换一个关键词，或者告诉我们你要找什么。';
+  e.textContent = '换一个关键词试试；实在找不到，就点下面告诉我们，我们去找。';
   e.style.display = 'block';
   document.getElementById('acts').style.display = 'flex';
   document.getElementById('fb').href = '/?fb=' + encodeURIComponent(location.pathname);
 }
+
+// 不给超时的话，后端卡在上游那 75 秒里，用户就对着转圈干等
+var ctl = new AbortController();
+var hardStop = setTimeout(function () { ctl.abort() }, 75000);
 fetch('/api/resolve', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   cache: 'no-store',
+  signal: ctl.signal,
   body: JSON.stringify({ t: TOKEN })
 }).then(function (r) { return r.json() }).then(function (j) {
-  if (j && j.url) { clearTimeout(slow); location.replace(j.url); return }
+  clearTimeout(hardStop);
+  if (j && j.url) {
+    stopTimers();
+    HINT.textContent = '好了，正在跳转…';
+    // 准备太快时会一闪而过，"30 分钟有效"这句等于没说，压到 1.2 秒
+    var wait = Math.max(0, MIN_SHOW - (Date.now() - START));
+    setTimeout(function () { location.replace(j.url) }, wait);
+    return;
+  }
   fail(j && j.msg);
-}).catch(function () { fail('网络中断，请返回重试'); });
+}).catch(function () {
+  clearTimeout(hardStop);
+  fail('网络中断，请返回重试');
+});
 </script>
 </body></html>"""
 
@@ -706,7 +743,11 @@ async def go_page(token: str):
     if not MIRROR_ON:
         # 关掉开关后旧链接不该 404：直接送回首页，别让用户撞墙
         return RedirectResponse("/", status_code=302)
-    html = _GO_HTML.replace("__TOKEN__", json.dumps(token[:900]))
+    html = (
+        _GO_HTML
+        .replace("__TOKEN__", json.dumps(token[:900]))
+        .replace("__TTL__", str(max(1, settings.mirror_link_minutes)))
+    )
     return HTMLResponse(
         html,
         headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
@@ -935,146 +976,6 @@ async def admin_feedback_update(fid: int, payload: FeedbackUpdate, request: Requ
     if not ok:
         return JSONResponse(status_code=404, content={"code": 404, "msg": "没有这条反馈"})
     return {"code": 0, "msg": "已更新"}
-
-
-@app.get("/api/admin/plan", include_in_schema=False)
-async def admin_plan(
-    request: Request,
-    days: int = Query(30, ge=1, le=365),
-    page: int = Query(1, ge=1, le=10000),
-    pageSize: int = Query(20, ge=1, le=100),
-):
-    """上架清单：按搜索人数排序的待上架词，已上架的自动剔除，支持分页。"""
-    if not OWN_ON:
-        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
-    if not _admin_allowed(request):
-        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
-    try:
-        return {"code": 0, "data": own.plan(days=days, page=page, page_size=pageSize)}
-    except Exception as exc:  # noqa: BLE001
-        log.exception("上架清单生成失败")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"生成失败：{exc}"})
-
-
-@app.get("/api/admin/own", include_in_schema=False)
-async def admin_own_list(request: Request, days: int = Query(30, ge=1, le=365)):
-    """自有精选链接管理：全量链接 + 未命中词榜 + 小数字。
-
-    未命中榜是"搜过但没接住"的纯待办——补了别名的词自动从榜单消失。
-    """
-    if not OWN_ON:
-        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
-    if not _admin_allowed(request):
-        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
-    try:
-        return {
-            "code": 0,
-            "data": {
-                "links": own.list_links(),
-                "misses": own.misses(days=days),
-                "stats": own.stats(),
-            },
-        }
-    except Exception as exc:  # noqa: BLE001
-        log.exception("精选链接查询失败")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"查询失败：{exc}"})
-
-
-class OwnLinkIn(BaseModel):
-    """新增 / 更新一条自有链接。id 为空 = 新增。字段校验在 own.save 里做。"""
-
-    id: int | None = None
-    keyword: str = ""
-    aliases: str = ""
-    title: str = ""
-    platform: str = ""
-    shareUrl: str = ""
-    sharePwd: str = ""
-    fileCount: int = 0
-    sizeBytes: int = 0
-    note: str = ""
-    enabled: bool = True
-
-
-@app.post("/api/admin/own", include_in_schema=False)
-async def admin_own_save(payload: OwnLinkIn, request: Request):
-    if not OWN_ON:
-        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
-    if not _admin_allowed(request):
-        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
-    try:
-        saved = own.save(payload.model_dump())
-    except ValueError as exc:
-        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
-    except Exception as exc:  # noqa: BLE001
-        log.exception("精选链接保存失败")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存失败：{exc}"})
-    log.info("own link saved id=%s kw=%s", saved["id"], payload.keyword)
-    return {"code": 0, "data": saved, "msg": "已保存，下次搜索即生效"}
-
-
-class ParseIn(BaseModel):
-    """补录解析输入：一段分享文案 / 链接（可多行），外加清单里点进来的那个词。"""
-
-    text: str = ""
-    keyword: str = ""
-
-
-class BulkIn(BaseModel):
-    items: list[OwnLinkIn] = []
-
-
-@app.post("/api/admin/own/parse", include_in_schema=False)
-async def admin_own_parse(payload: ParseIn, request: Request):
-    """把粘贴的分享文案解析成可入库的字段，不写库。
-
-    纯本地正则 + 夸克公开接口补元信息；解析慢的是夸克那两次请求，
-    所以丢线程池，别占事件循环。
-    """
-    if not OWN_ON:
-        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
-    if not _admin_allowed(request):
-        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
-    text = (payload.text or "")[:8000]
-    try:
-        items = await asyncio.to_thread(own.parse_share, text, payload.keyword or "")
-    except Exception as exc:  # noqa: BLE001
-        log.exception("分享文案解析失败")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"解析失败：{exc}"})
-    return {"code": 0, "data": {"items": items}}
-
-
-@app.post("/api/admin/own/bulk", include_in_schema=False)
-async def admin_own_bulk(payload: BulkIn, request: Request):
-    """批量补录：逐条保存，返回成功条数与失败原因，不整批回滚。"""
-    if not OWN_ON:
-        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
-    if not _admin_allowed(request):
-        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
-    items = payload.items[:50]
-    if not items:
-        return JSONResponse(status_code=400, content={"code": 400, "msg": "没有可保存的条目"})
-    try:
-        result = await asyncio.to_thread(own.save_many, [i.model_dump() for i in items])
-    except Exception as exc:  # noqa: BLE001
-        log.exception("批量补录失败")
-        return JSONResponse(status_code=500, content={"code": 500, "msg": f"保存失败：{exc}"})
-    ok, failed = len(result["saved"]), result["errors"]
-    log.info("own bulk saved=%s failed=%s", ok, len(failed))
-    msg = f"已保存 {ok} 条" + (f"，{len(failed)} 条失败" if failed else "，下次搜索即生效")
-    return {"code": 0, "data": result, "msg": msg}
-
-
-@app.delete("/api/admin/own/{lid}", include_in_schema=False)
-async def admin_own_delete(lid: int, request: Request):
-    if not OWN_ON:
-        return JSONResponse(status_code=503, content={"code": 503, "msg": "精选链接已关闭"})
-    if not _admin_allowed(request):
-        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
-    ok = own.delete(lid)
-    if not ok:
-        return JSONResponse(status_code=404, content={"code": 404, "msg": "没有这条链接"})
-    return {"code": 0, "msg": "已删除"}
 
 
 @app.get("/api/admin/mirror", include_in_schema=False)
