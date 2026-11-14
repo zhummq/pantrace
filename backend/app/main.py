@@ -79,7 +79,16 @@ if FEEDBACK_ON:
 else:
     log.info("反馈工单已关闭（FEEDBACK_ENABLED=false）")
 
-ADMIN_HTML = Path(__file__).resolve().parent / "admin.html"
+# 前端构建产物目录。看板页面（Vue 构建的 admin.html）也从这里取。
+DIST = (
+    Path(settings.frontend_dist).expanduser()
+    if settings.frontend_dist
+    else Path(__file__).resolve().parents[2] / "frontend" / "dist"
+)
+
+# 看板页面：优先用 Vue 构建产物；构建缺失时回退到单文件旧版（admin.legacy.html）
+ADMIN_DIST_HTML = DIST / "admin.html"
+ADMIN_HTML = Path(__file__).resolve().parent / "admin.legacy.html"
 
 # ---- 自有精选链接 ----
 # 站方维护的资源库：搜索命中时置顶展示"本站精选"卡，未命中词落日志。
@@ -808,18 +817,15 @@ async def admin_page(request: Request):
     # 没配口令 + 远程访问：当作不存在，不暴露这里有个后台
     if not settings.admin_token and not _admin_allowed(request):
         return Response(status_code=404)
-    if not ADMIN_HTML.is_file():
-        return JSONResponse(status_code=404, content={"code": 404, "msg": "admin.html 缺失"})
-    return FileResponse(ADMIN_HTML)
+    page = ADMIN_DIST_HTML if ADMIN_DIST_HTML.is_file() else ADMIN_HTML
+    if not page.is_file():
+        return JSONResponse(status_code=404, content={"code": 404, "msg": "看板页面缺失"})
+    # 看板页面必须不缓存：否则改了代码你还在看旧页面（翻页控件"消失"就是这么来的）
+    return FileResponse(page, headers={"Cache-Control": "no-store, must-revalidate"})
 
 
 # 生产环境：把前端构建产物一起托管（frontend/dist 存在时生效）
 # 如果前端交给 Nginx 直接托管，把 SERVE_FRONTEND 设为 false 即可
-DIST = (
-    Path(settings.frontend_dist).expanduser()
-    if settings.frontend_dist
-    else Path(__file__).resolve().parents[2] / "frontend" / "dist"
-)
 if settings.serve_frontend and DIST.is_dir():
     # 上传的二维码先挂，再挂前端兜底路由，顺序不能反
     app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")

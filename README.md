@@ -19,11 +19,22 @@ frontend/
   src/components/ResultCard.vue
   src/components/FeedbackDialog.vue   反馈弹层（纠错 / 求资源 / 报错）
   src/components/QqGroupDialog.vue    群入口弹层（进站 / 获取链接拦截）
+  src/admin/          看板（Vue 应用，独立入口）
+    App.vue           壳：口令门、区间切换、60s 自动刷新
+    api.js            统一请求层（口令、401、错误处理）
+    components/       Panel/StatGrid/BarList/Pager + 五个业务面板
+  admin.html          看板的 Vite 入口（与 index.html 一起构建）
   src/api.js          接口封装
-  vite.config.js      dev 时 /api、/uploads 代理到 8000
+  vite.config.js      dev 时 /api、/uploads 代理到 8000；build 双入口
 start.bat             生产模式：构建前端 + 单端口 8000
 start-dev.bat         开发模式：后端 8000 + 前端 5173
 ```
+
+看板架构说明：
+
+- `/admin` 页面是 Vue 构建产物（`dist/admin.html`），与主站共用一次 `npm run build`；构建产物入库，服务器 `git pull` 即生效，**不需要在服务器上装 Node**
+- 后端优先返回 `dist/admin.html`；构建产物缺失时回退到单文件旧版 `backend/app/admin.legacy.html`（仅作回滚保留，不再维护）
+- `/admin` 响应带 `Cache-Control: no-store`，改版后不会看到旧页面；assets 文件名带 hash，长期缓存不受影响
 
 ## 启动
 
@@ -73,7 +84,7 @@ npm run dev
 | GET | `/api/admin/plan?days=30&page=1&pageSize=20` | 上架清单（按搜索人数排序，已上架自动剔除；返回 `total`/`totalPages`），需 `X-Admin-Token` |
 | POST | `/api/admin/own` | 新增/更新精选链接（id 为空即新增），需 `X-Admin-Token` |
 | DELETE | `/api/admin/own/{id}` | 删除精选链接，需 `X-Admin-Token` |
-| GET | `/admin` | 用户行为看板（HTML） |
+| GET | `/admin` | 用户行为看板（Vue 构建产物，`no-store` 不缓存） |
 | GET | `/docs` | FastAPI 自带接口文档 |
 
 前端只拿到清洗后的字段（`platform` / `title` / `shareUrl` / `sharePwd` / `fileCount` / `sizeBytes`），**拿不到 apikey，也拿不到上游的 `highlightedTitle`**（那是远端 HTML，直接渲染就是 XSS 口子；高亮由前端自己按关键词标记，且先转义）。
