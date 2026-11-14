@@ -309,11 +309,9 @@ def misses(days: int = 30, limit: int = 20) -> list[dict]:
 def plan(days: int = 30, limit: int = 40) -> dict:
     """上架清单：近 N 天被搜得最多的词，已上架的自动剔除。
 
-    口径只有一条——**搜索次数**。不看点击、不看有没有结果、不分类：
-    搜得越多越先上架，就这么简单。
-
-    u（去重访客数）只是附带展示，用来识别"一个人反复搜"，
-    不参与排序；排序严格按次数 n。
+    排序按**去重人数 u**（多少人搜过），不是动作次数：
+    一个人刷 20 次不代表需求大，8 个人各搜一次才是真需求。
+    次数 n 只做同分排序；u=0（老数据没带访客号）时退回按次数排。
     """
     if not _inited:
         return {"days": days, "items": [], "covered": 0}
@@ -346,7 +344,7 @@ def plan(days: int = 30, limit: int = 40) -> dict:
         if b is None:
             b = buckets[key] = {"q": raw, "n": 0, "u": 0, "last": 0.0}
         b["n"] += int(r["n"] or 0)
-        b["u"] = max(b["u"], int(r["u"] or 0))
+        b["u"] = max(b["u"], int(r["u"] or 0))  # 同词不同写法取并集上限
         b["last"] = max(b["last"], float(r["last"] or 0))
 
     items = []
@@ -364,8 +362,12 @@ def plan(days: int = 30, limit: int = 40) -> dict:
             }
         )
 
-    # 只看搜索次数；次数相同按最近被搜的时间
-    items.sort(key=lambda x: (-x["n"], -x["last"], x["q"]))
+    # 人数优先，次数同分；整库都没有访客号时退回按次数排
+    has_uv = any(i["u"] for i in items)
+    if has_uv:
+        items.sort(key=lambda x: (-x["u"], -x["n"], x["q"]))
+    else:
+        items.sort(key=lambda x: (-x["n"], -x["last"], x["q"]))
     return {"days": days, "items": items[:limit], "covered": covered}
 
 

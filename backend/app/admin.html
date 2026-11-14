@@ -278,7 +278,7 @@
         <span class="grp-msg" id="plan-msg"></span>
       </div>
       <div class="rank">
-        <h2>按搜索次数排序 <span>搜得越多越先做 · 已上架的自动剔除</span></h2>
+        <h2>按搜索人数排序 <span>搜的人越多越先做 · 已上架的自动剔除</span></h2>
         <div id="plan-list"></div>
       </div>
     </div>
@@ -897,8 +897,8 @@
     }
 
     $('plan-list').innerHTML = planCache.map(function (it, i) {
-      var meta = it.n + ' 次搜索'
-        + (Number(it.u) > 0 ? ' · ' + it.u + ' 人' : '');
+      var u = Number(it.u) || 0;
+      var meta = (u > 0 ? u + ' 人 · ' : '') + it.n + ' 次搜索';
       return '<div class="fb-item">' +
         '<div class="fb-head">' +
         '<span class="fb-title" title="' + esc(it.q) + '">' +
@@ -924,9 +924,10 @@
   $('plan-copy').addEventListener('click', function () {
     if (!planCache.length) { planMsg('清单是空的', true); return; }
     var lines = planCache.map(function (it, i) {
-      return (i + 1) + '. ' + it.q + '  [' + it.n + ' 次]';
+      var u = Number(it.u) || 0;
+      return (i + 1) + '. ' + it.q + '  [' + (u > 0 ? u + ' 人 / ' : '') + it.n + ' 次]';
     });
-    var text = '上架清单 · 近 ' + days + ' 天（按搜索次数）\n' + lines.join('\n');
+    var text = '上架清单 · 近 ' + days + ' 天（按搜索人数）\n' + lines.join('\n');
     function fallback() {
       var ta = document.createElement('textarea');
       ta.value = text;
