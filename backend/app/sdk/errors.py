@@ -98,6 +98,19 @@ class QuotaExceededError(NetdiskError):
     kind = "quota"
 
 
+class VerifyRequiredError(NetdiskError):
+    """上游要求人工身份验证才能继续（百度 errno 132 + authwidget）。
+
+    不是鉴权失效——那会是 -6 / 104，换 cookie 能解决。这一类是风控：
+    短时间内删得太多、或者请求环境与常用环境不一致，百度要求过验证码。
+    **原地重试不会好转，反而会把风控越撞越死**，只能人去网页端/客户端
+    手动删一次、把验证过掉。所以上层该做的是"退避 + 记下来给人看"，
+    不是每 5 分钟再打一次接口。
+    """
+
+    kind = "verify_required"
+
+
 class NotFoundError(NetdiskError):
     kind = "not_found"
 

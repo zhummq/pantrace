@@ -457,6 +457,22 @@ def _scrub_ads(client, link) -> None:
     log.info("广告文件已清 %s 个，分享里只剩正片", len(removed))
 
 
+def _client_for(account: Account):
+    """建一个**带凭据回写**的客户端。
+
+    以前这里（体检 / 到期回收 / 旧副本 / 冷回收）都只传三个参数，现在补上
+    `on_cookie` 是硬要求，不是顺手：百度的 refresh_token 是**轮换式**的，
+    续期后旧的立刻作废，不落库下次刷新就是 invalid_grant，OAuth 通道当场废掉。
+    这几条路径原来都不回写，配了 OAuth 也会在第一次回收后失效。
+    """
+    return registry.create(
+        account.type,
+        account,
+        timeout=float(_cfg["timeout"]),
+        on_cookie=_credential_hook(account),
+    )
+
+
 def probe(account_id: int) -> dict:
     """单账号体检。后台"测试"按钮和巡检都用它。"""
     accounts = [a for a in list_accounts() if a.id == account_id]
@@ -464,7 +480,7 @@ def probe(account_id: int) -> dict:
         return {"ok": False, "reason": "账号不存在"}
     account = accounts[0]
     try:
-        client = registry.create(account.type, account, timeout=float(_cfg["timeout"]))
+        client = _client_for(account)
     except NetdiskError as exc:
         return {"ok": False, "reason": str(exc)}
     try:
@@ -488,6 +504,37 @@ def probe(account_id: int) -> dict:
 
 # ---- 空间回收 ----
 
+#: 回收失败后的冷却秒数，按错误种类分。默认 15 分钟：不是每次失败都值得
+#: 5 分钟后再撞一次。这两类重试无用，退避一小时：风控验证（百度 errno 132）
+#: 得人去网页端过验证；配置/权限问题（OpenAPI 20020 授权目录）得人去改配置
+_RETRY_AFTER = {"verify_required": 3600, "config": 3600}
+_RETRY_DEFAULT = 900
+
+
+def _mark_recycle_fail(mirrors_session, key: str, exc: NetdiskError) -> None:
+    """把回收失败的原因和下次重试时刻写进 mirrors。
+
+    以前只 `log.warning`，线上排障得去 journald 里捞（2026-11 那次百度
+    errno 132 就是这么耗掉的）。落库之后后台「转存映射」直接能看到
+    卡住的是哪几条、卡在什么错上。
+    """
+    delay = _RETRY_AFTER.get(getattr(exc, "kind", ""), _RETRY_DEFAULT)
+    try:
+        with mirrors_session() as conn:
+            conn.execute(
+                "UPDATE mirrors SET last_error=?, retry_after=? WHERE src_key=?",
+                (str(exc)[:300], int(time.time()) + delay, key),
+            )
+    except Exception:  # noqa: BLE001
+        log.warning("回收失败原因未能落库：%s", key[:8])
+    if getattr(exc, "kind", "") == "verify_required":
+        log.warning(
+            "上游要求人工验证（%s），%s 暂停回收 %s 分钟；"
+            "去网页端手动删一次文件、过掉验证即可恢复",
+            exc, key[:8], delay // 60,
+        )
+
+
 def recycle_expired(mirrors_session, *, grace_seconds: int = 300) -> dict:
     """回收过了有效窗口的转存文件（竞品模式：链接只活半小时）。
 
@@ -502,8 +549,9 @@ def recycle_expired(mirrors_session, *, grace_seconds: int = 300) -> dict:
     with _session() as conn:
         rows = conn.execute(
             """SELECT src_key, platform, account_id, fids, expires_at FROM mirrors
-               WHERE status='ok' AND expires_at > 0 AND expires_at < ?""",
-            (now - grace_seconds,),
+               WHERE status='ok' AND expires_at > 0 AND expires_at < ?
+                 AND retry_after <= ?""",
+            (now - grace_seconds, now),
         ).fetchall()
 
     removed_rows = 0
@@ -531,13 +579,14 @@ def recycle_expired(mirrors_session, *, grace_seconds: int = 300) -> dict:
             continue
 
         try:
-            client = registry.create(account.type, account, timeout=float(_cfg["timeout"]))
+            client = _client_for(account)
             try:
                 client.delete(fids)
                 removed_files += len(fids)
             finally:
                 client.close()
         except NetdiskError as exc:
+            _mark_recycle_fail(mirrors_session, key, exc)
             errors.append(f"{key[:8]}: {exc}")
             continue
 
@@ -580,7 +629,7 @@ def recycle_trash(mirrors_session, *, limit: int = 50) -> dict:
 
         if fids and account is not None and account.enabled:
             try:
-                client = registry.create(account.type, account, timeout=float(_cfg["timeout"]))
+                client = _client_for(account)
                 try:
                     client.delete(fids)
                     removed_files += len(fids)
@@ -637,7 +686,7 @@ def cleanup(mirrors_session, *, cold_days: int = 0) -> dict:
             continue
         account = accounts[0]
         try:
-            client = registry.create(account.type, account, timeout=float(_cfg["timeout"]))
+            client = _client_for(account)
             try:
                 client.delete(fids)
                 removed_files += len(fids)

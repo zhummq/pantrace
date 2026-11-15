@@ -34,6 +34,7 @@ from ...errors import (
     TaskTimeoutError,
     UnsupportedError,
     UpstreamError,
+    VerifyRequiredError,
     ViolationError,
     map_error,
     message_of,
@@ -64,7 +65,10 @@ ERRNO_MAP: dict[object, type[NetdiskError]] = {
     # 分享不存在/已被删除。必须是负数：百度对分享侧用 -130，正数 130 是"文件不存在"，
     # 两者混在一起时，一条死链会被当成我们账号的文件问题，排查方向整个跑偏
     -130: ShareInvalidError,
-    132: QuotaExceededError,
+    # 132 不是容量问题，是风控：百度返回 {"errno":132,"authwidget":{...}}，
+    # 含义是"删除文件需要验证您的身份"。以前映射成 QuotaExceededError，
+    # 日志里只剩一句"删除文件失败（code=132）"，排查方向整个带偏（2026-11 踩过）
+    132: VerifyRequiredError,
     31066: QuotaExceededError,
     9007: ViolationError,
 }
@@ -528,21 +532,40 @@ class BaiduClient(PanClient):
         if not fids:
             return
         paths = [f"/{f}" for f in fids]
-        resp = self.http.post(
-            "/api/filemanager",
-            params={
-                "async": 2,
-                "onnest": "fail",
-                "opera": "delete",
-                "bdstoken": self.bdstoken(),
-                "newVerify": 1,
-                "clienttype": 0,
-                **_query_auth_safe(self),
-            },
-            data={"filelist": json.dumps(paths)},
-            action="删除文件",
-        )
-        self._ok(resp, "删除文件")
+        # 配了 OAuth 就直接走官方 OpenAPI：那条通道不弹 authwidget 验证。
+        # 顺序很重要——旧写法是"先撞网页端，132 了再切"，可网页端每撞一次
+        # 风控都会记账，切过去也白搭（竞品 clean_temp.ts 就是 accessToken 优先）。
+        if self.openapi.configured:
+            try:
+                self.openapi.delete(paths)
+                return
+            except NetdiskError as exc:
+                # token 过期/权限没开/接口抖动，退回 cookie 那条主链路，
+                # 不能因为"官方通道暂时不通"就整条回收停摆
+                log.info("OAuth 通道删除失败（%s），退回网页端", exc)
+        try:
+            resp = self.http.post(
+                "/api/filemanager",
+                params={
+                    "async": 2,
+                    "onnest": "fail",
+                    "opera": "delete",
+                    "bdstoken": self.bdstoken(),
+                    "newVerify": 1,
+                    "clienttype": 0,
+                    **_query_auth_safe(self),
+                },
+                data={"filelist": json.dumps(paths)},
+                action="删除文件",
+            )
+            self._ok(resp, "删除文件")
+        except VerifyRequiredError:
+            # 网页端删除撞到风控（errno 132 + authwidget）：重试只会更糟，
+            # 而且每撞一次都会加重风控记录。配了 OAuth 的情况上面已经先走过
+            # 官方通道了，这里再试一遍没有意义；直接抛上去，由回收任务退避
+            # 并把原因写进 mirrors.last_error，等人工过验证后再恢复。
+            log.warning("删除被百度要求人工验证（errno 132），需在网页端手动删一次")
+            raise
 
     def keepalive(self) -> None:
         self._bdstoken_at = 0.0

@@ -142,6 +142,8 @@ def _ensure_schema() -> None:
                 account_id INTEGER NOT NULL DEFAULT 0,
                 fids       TEXT NOT NULL DEFAULT '[]',
                 expires_at INTEGER NOT NULL DEFAULT -1,
+                last_error TEXT NOT NULL DEFAULT '',
+                retry_after INTEGER NOT NULL DEFAULT 0,
                 created_ts REAL NOT NULL,
                 updated_ts REAL NOT NULL
             );
@@ -167,6 +169,11 @@ def _ensure_schema() -> None:
             # -1 = 老数据没记过窗口（下次点击校验一次）；0 = 没有窗口（旧版本写的，
             # 或者回收任务已把窗口抹掉）；>0 = 秒级时间戳
             ("expires_at", "INTEGER NOT NULL DEFAULT -1"),
+            # 回收失败的**原因**。以前只打日志，线上排障得隔着 journald 猜
+            # （2026-11 百度 errno 132 就是这么排查了半天）
+            ("last_error", "TEXT NOT NULL DEFAULT ''"),
+            # 下次允许重试的时刻。风控类错误重试无用，退避一小时比每 5 分钟撞一次强
+            ("retry_after", "INTEGER NOT NULL DEFAULT 0"),
         ):
             try:
                 conn.execute(f"ALTER TABLE mirrors ADD COLUMN {column} {ddl}")
@@ -397,13 +404,15 @@ def _store(key: str, src_url: str, platform: str, our_url: str,
         conn.execute(
             """INSERT INTO mirrors
                (src_key, src_url, platform, our_url, status, reason, bytes,
-                hits, account_id, fids, expires_at, created_ts, updated_ts)
-               VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?)
+                hits, account_id, fids, expires_at, last_error, retry_after,
+                created_ts, updated_ts)
+               VALUES (?,?,?,?,?,?,?,0,?,?,?,'',0,?,?)
                ON CONFLICT(src_key) DO UPDATE SET
                  our_url=excluded.our_url, status=excluded.status,
                  reason=excluded.reason, bytes=excluded.bytes,
                  account_id=excluded.account_id, fids=excluded.fids,
                  expires_at=excluded.expires_at,
+                 last_error='', retry_after=0,
                  updated_ts=excluded.updated_ts""",
             (key, src_url[:500], platform[:20], our_url[:500], status,
              reason[:200], int(size), int(account_id),
@@ -584,18 +593,21 @@ def stats() -> dict:
                  SUM(CASE WHEN status='ok' THEN 1 ELSE 0 END) AS ok,
                  SUM(CASE WHEN status='fail' THEN 1 ELSE 0 END) AS fail,
                  SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END) AS expired,
+                 SUM(CASE WHEN status='ok' AND retry_after > strftime('%s','now')
+                          THEN 1 ELSE 0 END) AS blocked,
                  SUM(hits) AS hits, SUM(bytes) AS bytes
                FROM mirrors"""
         ).fetchone()
         recent = conn.execute(
             """SELECT src_url, our_url, platform, status, reason, bytes, hits,
-                      expires_at, updated_ts
+                      expires_at, last_error, retry_after, updated_ts
                FROM mirrors ORDER BY updated_ts DESC LIMIT 30"""
         ).fetchall()
     return {
         "ok": int(row["ok"] or 0),
         "fail": int(row["fail"] or 0),
         "expired": int(row["expired"] or 0),
+        "blocked": int(row["blocked"] or 0),
         "hits": int(row["hits"] or 0),
         "bytes": int(row["bytes"] or 0),
         "recent": [dict(r) for r in recent],
