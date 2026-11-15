@@ -64,6 +64,11 @@ _cfg: dict = {
     "ad_keywords": "",
     # 往下探几层。1 = 只看转存内容的直接子项，2 = 再进一层
     "ad_depth": 2,
+    # 建出去那条分享本身的有效期（小时）。真正让链接失效的是 link_ttl 到点
+    # 删源文件，这里只是安全网：回收任务没跑时，分享到期自己断。
+    # 各平台档位不同，见各适配器 create_share；0 在这里没有"永久"的含义——
+    # 配置层已经夹到 24～168，别再往下传 0
+    "share_hours": 24,
 }
 
 # 换账号有意义的两类错。其余错换了也白换，直接抛
@@ -392,7 +397,9 @@ def transfer(url: str, pwd: str = "", platform: str = "", title: str = "") -> Sh
             max_bytes=max_bytes,
         )
         try:
-            link = client.mirror(url, pwd, title)
+            # 有效期一路传下去：以前这里只传三个参数，各适配器的默认值谁都不管，
+            # 百度那边 0 就是永久分享。见 config.mirror_share_hours
+            link = client.mirror(url, pwd, title, expire_hours=int(_cfg["share_hours"]))
             _reset_fail(account)
             _scrub_ads(client, link)
             link.note = (link.note + f"|account={account.id}").strip("|")

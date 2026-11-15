@@ -40,26 +40,51 @@ from ...errors import (
 from ...http import Requester
 from ...registry import register
 from ...types import Account, File, ShareBrief, ShareInfo, ShareLink, TaskResult
-from .const import EXPIRE_CANDIDATES, PROFILES
+from .const import EXPIRE_TIERS, PROFILES
 
 log = logging.getLogger("pantrace.sdk.quark")
 
-# 回读的 expired_at 该落在"12～36 小时后"。给这个带宽而不是卡死 24 小时，
-# 是因为上游算的是分享时刻 + 1 天，且偶尔有几秒到几分钟的偏差。
-_EXPECT_MIN = 12 * 3600
-_EXPECT_MAX = 36 * 3600
+
+def _norm_hours(expire_hours: int) -> int:
+    """0 / 负数 = 调用方没配，按 24 小时（我们对外宣称的默认档）处理。
+
+    别按 1 小时算：那会让 `_expiry_ok` 拿"1 小时"的带宽去校验一条 1 天的分享，
+    每次都判不符、白建三份分享，日志里还全是"有效期异常"。
+    """
+    hours = int(expire_hours or 0)
+    return hours if hours > 0 else 24
 
 
-def _expiry_ok(seconds: int) -> bool:
-    """回读的有效期是不是我们要的 1 天。
+def _candidates(expire_hours: int) -> tuple[tuple[int, int], ...]:
+    """按请求的小时数选出候选链 `((该档的小时数, expired_type), ...)`。
 
-    读不到（0）时按"没法校验"放过——接口偶尔不返回这个字段，为它重建一次
-    只会白留一份分享。
+    `expired_type` 没有官方文档，只能按社区实测的档位近似（1 天 / 7 天 / 30 天），
+    所以永远给一条"往后降级"的链路：首选不对就试更长的，至少能建出来。
+    请求超过 30 天时只试最长档——再往后没有已知取值。
+
+    返回里带上**该档**的小时数（不是请求值）：校验到期时间要用档位算，
+    否则请求 72 小时、实际落到 7 天档，会被自己的自检判成"异常"再白建一份。
+    """
+    want = _norm_hours(expire_hours)
+    start = next(
+        (i for i, (hours, _) in enumerate(EXPIRE_TIERS) if hours >= want),
+        len(EXPIRE_TIERS) - 1,
+    )
+    return EXPIRE_TIERS[start:]
+
+
+def _expiry_ok(seconds: int, expect_hours: int) -> bool:
+    """回读的有效期是不是我们要的那一档（按 0.5～1.5 倍容差）。
+
+    给带宽而不是卡死，是因为上游算的是"分享时刻 + N 天"，偶尔有几秒到几分钟
+    的偏差。读不到（0）时按"没法校验"放过——接口偶尔不返回这个字段，
+    为它重建一次只会白留一份分享。
     """
     if not seconds:
         return True
+    expect = _norm_hours(expect_hours) * 3600
     left = int(seconds) - time.time()
-    return _EXPECT_MIN <= left <= _EXPECT_MAX
+    return expect * 0.5 <= left <= expect * 1.5
 
 # 上游错误码 → 语义异常。这张表是整套 SDK 的价值所在：
 # 上层只需要问"该换账号还是该下架资源"，不需要认识 41012 是什么
@@ -239,22 +264,24 @@ class QuarkClient(PanClient):
             raise UpstreamError("转存完成但没有文件 id", raw=result.extra)
         return result.fids
 
-    def create_share(self, fids: list[str], title: str, expire_hours: int = 0) -> ShareLink:
-        """建分享，并**回读真实有效期**，确认它确实是 1 天。
+    def create_share(self, fids: list[str], title: str, expire_hours: int = 24) -> ShareLink:
+        """建分享，并**回读真实有效期**，确认它确实落在请求的那一档。
 
-        要 1 天不要永久：给用户的链接只活 30 分钟（到点删源文件），1 天够用；
+        不建永久分享：给用户的链接只活 30 分钟（到点删源文件），1 天够用；
         万一回收任务没跑，分享也会自己到期，不会把资源永久挂在我们账号上。
 
         `expired_type` 没有官方文档、社区资料互相冲突，所以不盲信常量：
-        建完读一次 `expired_at`，落在 12～36 小时之外就换下一个候选值重建。
+        先按 `expire_hours` 选出最接近的档位（默认 24 小时 → 1 天），建完读一次
+        `expired_at`，落在该档 0.5～1.5 倍之外就换下一个（更长）候选值重建。
         某个候选值直接报参数错也继续换；但登录态失效、空间满这类错换了也
         没用，原样抛给上层去换账号。
         """
+        candidates = _candidates(expire_hours)
         last: ShareLink | None = None
         error: NetdiskError | None = None
-        for index, expire_type in enumerate(EXPIRE_CANDIDATES):
+        for index, (tier_hours, expire_type) in enumerate(candidates):
             try:
-                link = self._create_share_once(fids, title, expire_type)
+                link = self._create_share_once(fids, title, expire_type, tier_hours)
             except (AuthError, QuotaExceededError):
                 raise
             except NetdiskError as exc:
@@ -265,26 +292,29 @@ class QuarkClient(PanClient):
                 )
                 continue
 
-            if _expiry_ok(link.expired_at):
+            if _expiry_ok(link.expired_at, tier_hours):
                 if index:
                     log.warning(
                         "%s 分享有效期回落到 expired_type=%s（%s），expired_type=%s 可能已失效",
                         self.display, expire_type, link.note or "未返回到期时间",
-                        EXPIRE_CANDIDATES[0],
+                        candidates[0][1],
                     )
                 return link
 
             last = link
             log.error(
-                "%s 分享有效期不是 1 天（expired_type=%s，%s），换下一个候选值重建",
-                self.display, expire_type, link.note or f"expired_at={link.expired_at}",
+                "%s 分享有效期不是约 %s 小时（expired_type=%s，%s），换下一个候选值重建",
+                self.display, tier_hours, expire_type,
+                link.note or f"expired_at={link.expired_at}",
             )
         if last:
             # 候选值都试过了仍不符预期：用最后建成的那个（至少能打开），日志里已记实情
             return last
         raise error or UpstreamError("创建分享失败")
 
-    def _create_share_once(self, fids: list[str], title: str, expire_type: int) -> ShareLink:
+    def _create_share_once(
+        self, fids: list[str], title: str, expire_type: int, expect_hours: int = 24
+    ) -> ShareLink:
         resp = self.http.post(
             "/share",
             json_body={
@@ -316,15 +346,15 @@ class QuarkClient(PanClient):
         raw_expired = int(pwd_data.get("expired_at") or 0)
         expired_at = raw_expired // 1000 if raw_expired > 10_000_000_000 else raw_expired
 
-        # 1 天到期是预期结果，不写 note（note 会进 mirrors.reason，后台里一条条
+        # 到期时间符合预期就不写 note（note 会进 mirrors.reason，后台里一条条
         # "分享 1 天后到期"纯属噪音）；只有对不上才留字，给排障用。
         note = ""
-        if expired_at and not _expiry_ok(expired_at):
+        if expired_at and not _expiry_ok(expired_at, expect_hours):
             hours = max(0, int((expired_at - time.time()) / 3600))
             note = f"分享有效期异常：约 {hours} 小时后到期"
             log.error(
-                "%s 分享有效期不是 1 天（expired_type=%s，约 %s 小时）：%s",
-                self.display, expire_type, hours, url,
+                "%s 分享有效期不是约 %s 小时（expired_type=%s，实际约 %s 小时）：%s",
+                self.display, expect_hours, expire_type, hours, url,
             )
 
         return ShareLink(

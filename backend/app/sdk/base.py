@@ -83,8 +83,13 @@ class PanClient(ABC):
 
     # ---- 默认实现 ----
 
-    def create_share(self, fids: list[str], title: str, expire_hours: int = 0) -> ShareLink:
-        """建分享。不支持建分享的盘（如迅雷）由上层直接用原链接兜底。"""
+    def create_share(self, fids: list[str], title: str, expire_hours: int = 24) -> ShareLink:
+        """建分享。不支持建分享的盘（如迅雷）由上层直接用原链接兜底。
+
+        `expire_hours` 是**分享本身**的有效期，不是我们给用户的链接窗口
+        （那个由回收任务删文件实现）。默认 1 天：回收任务没跑时分享自己到期，
+        资源不会永久挂在账号上。传 0 不代表永久，各适配器会按最短档处理。
+        """
         raise UnsupportedError(f"{self.display or self.type} 不支持创建分享")
 
     def list_shares(self, *, only_violated: bool = False, page: int = 1, size: int = 200) -> list[ShareBrief]:
@@ -149,7 +154,7 @@ class PanClient(ABC):
 
     # ---- 统一流水线 ----
 
-    def mirror(self, url: str, pwd: str = "", title: str = "", expire_hours: int = 0) -> ShareLink:
+    def mirror(self, url: str, pwd: str = "", title: str = "", expire_hours: int = 24) -> ShareLink:
         """源分享 → 我们自己的分享。这是业务层唯一需要调的方法。
 
         失败不在这里兜底：异常原样抛给上层，由上层决定"换账号"还是

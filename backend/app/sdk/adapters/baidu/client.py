@@ -399,8 +399,13 @@ class BaiduClient(PanClient):
 
         return [_target_path(item.get("to")) for item in pairs if item.get("to")]
 
-    def create_share(self, fids: list[str], title: str, expire_hours: int = 0) -> ShareLink:
-        period = 0 if not expire_hours else (1 if expire_hours <= 24 else 7)
+    def create_share(self, fids: list[str], title: str, expire_hours: int = 24) -> ShareLink:
+        # period 只认三档：0=永久、1=1天、7=7天。**0 不再使用**：这个参数以前
+        # 从没被上层传过，默认 0 就等于给每条资源建永久分享——回收任务一旦没跑
+        # （进程挂了、mirrors 行丢了），分享会一直挂在我们账号上，外人随时能打开，
+        # 本地也没有 fids 可删。传 0/负数一律按 1 天建，不把默认值交回上游语义
+        hours = int(expire_hours or 0)
+        period = 7 if hours > 24 else 1
         # 这里收的可能是 fs_id，也可能是 transfer 返回的**路径**。
         # /share/set 两个字段都认：fid_list 收数字 id，path_list 收绝对路径，
         # 但绝不能不分类就往 fid_list 里塞——isdigit() 一过滤就成了空数组，

@@ -264,7 +264,11 @@ class GuangyaClient(PanClient):
             raise UpstreamError(str(resp.get("msg") or "光鸭任务失败"), raw=resp)
         return TaskResult(task_id=task_id, status=status, done=status == 2, extra={"raw": resp})
 
-    def create_share(self, fids: list[str], title: str, expire_hours: int = 0) -> ShareLink:
+    def create_share(self, fids: list[str], title: str, expire_hours: int = 24) -> ShareLink:
+        # 光鸭的建分享接口不收有效期参数，链接建出来就是长期的，没法像百度那样
+        # 指定"1 天"。所以这条链上**只有**"到点删源文件"这一道闸：回收任务没跑
+        # 就会一直挂着（见 README「点击时转存」）。expire_hours 这里只能收下不用，
+        # 别以为传了就会生效。
         resp = self._post(
             f"{API_RES_V2}/share_file",
             {"fileIds": fids, "title": (title or "资源分享")[:60]},

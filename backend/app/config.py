@@ -93,6 +93,14 @@ class Settings(BaseSettings):
     # 只能我们自己删文件实现；分享本身按 1 天建，不是永久——见 quark/const.py）。
     # 到点后旧文件回收，再次点击会重新转存。
     mirror_link_minutes: int = 30
+    # 我们建出去的那条分享**本身**的有效期（小时）。这是安全网，不是主闸门：
+    # 正常由 mirror_link_minutes 到点删源文件让链接失效；这里只兜住"回收任务
+    # 没跑"的情况（进程挂了、数据库丢了、账号被禁用），免得资源永久挂在我们
+    # 账号上。各平台支持的最短档位不同，适配器会取最接近的一档（百度 1 天、
+    # 夸克/迅雷/139 按天）。
+    # **不要填 0**：百度 period=0 就是永久分享，正是这条配置要避免的事。
+    # 取值范围见 _share_hours 校验器（24～168 小时，即 1～7 天）。
+    mirror_share_hours: int = 24
     # /go/ 跳转 token 的签名密钥。留空则由 API_KEY 派生（重启不变）；
     # 换掉它 = 所有已发出的旧链接失效（会走回退，不会 404）
     mirror_secret: str = ""
@@ -144,6 +152,23 @@ class Settings(BaseSettings):
         for ch in _INVISIBLE:
             value = value.replace(ch, "")
         return value.strip()
+
+    @field_validator("mirror_share_hours", mode="after")
+    @classmethod
+    def _share_hours(cls, value: int) -> int:
+        """把分享有效期夹到 24～168 小时（1 天～7 天）。
+
+        下限是真的下限：0 传到百度就是 `period=0`＝**永久分享**，回收任务一旦
+        没跑，资源就永久挂在账号上，而且没有任何本地记录能追（mirrors 行丢了
+        就再也找不到要删什么）。而且这几家网盘最短的分享有效期都是 1 天，
+        填比 24 小的数值只会被适配器悄悄抬到 1 天，不如在这里就说清楚。
+        上限 168 是因为百度最长只给 7 天，填更大没有平台能兑现。
+        """
+        try:
+            hours = int(value)
+        except (TypeError, ValueError):
+            return 24
+        return max(24, min(hours, 168))
 
     @property
     def api_key_problem(self) -> str:

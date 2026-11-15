@@ -251,8 +251,11 @@ class XunleiClient(PanClient):
             raise UpstreamError("迅雷任务完成但没有 trace_file_ids", raw=resp)
         return TaskResult(task_id=task_id, status=progress, done=True, fids=fids, extra={"raw": resp})
 
-    def create_share(self, fids: list[str], title: str, expire_hours: int = 0) -> ShareLink:
-        days = 1 if not expire_hours else max(1, min(int(expire_hours // 24) or 1, 7))
+    def create_share(self, fids: list[str], title: str, expire_hours: int = 24) -> ShareLink:
+        # 迅雷按天，向上取整：请求 30 小时就给 2 天，不是 1 天（截断会让安全网
+        # 比配置更早失效）。上限 7 天是接口自己的限制，填更大也只能给 7 天
+        hours = max(0, int(expire_hours or 0))
+        days = max(1, min((hours + 23) // 24, 7))
         resp = self._call(
             "POST",
             "/drive/v1/share",

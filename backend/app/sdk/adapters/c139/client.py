@@ -278,8 +278,11 @@ class C139Client(PanClient):
                     fids.append(rid)
         return TaskResult(task_id=task_id, done=done, fids=fids, extra={"raw": resp})
 
-    def create_share(self, fids: list[str], title: str, expire_hours: int = 0) -> ShareLink:
-        period = max(1, int(expire_hours // 24) or 1)
+    def create_share(self, fids: list[str], title: str, expire_hours: int = 24) -> ShareLink:
+        # 按天向上取整，别截断：请求 30 小时应该是 2 天。最小 1 天，
+        # 这个接口没有"永久"以外的更长档位可选
+        hours = max(0, int(expire_hours or 0))
+        period = max(1, (hours + 23) // 24)
         resp = self._cloud_post(
             CREATE_SHARE_URL,
             {

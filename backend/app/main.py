@@ -192,6 +192,7 @@ if MIRROR_ON:
             ad_filter=settings.mirror_ad_filter,
             ad_keywords=settings.mirror_ad_keywords,
             ad_depth=settings.mirror_ad_depth,
+            share_hours=settings.mirror_share_hours,
         )
         # 老部署靠 MIRROR_QUARK_COOKIE 一个变量活着。表里没有夸克账号时
         # 把它导进去，避免升级后"转存突然全挂"——这是唯一的兼容路径，别删
