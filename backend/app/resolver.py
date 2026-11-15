@@ -36,7 +36,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
 
 from . import pan
 from .sdk import registry, urls
@@ -218,22 +218,62 @@ def _pwd_of(url: str, pwd: str = "") -> str:
     return ""
 
 
-def with_pwd(url: str, pwd: str) -> str:
-    """把提取码并进 URL（夸克/百度/迅雷/阿里打开即自动填充）。
+#: 各家把提取码拼进 URL 的参数名不一样，能自动填充的只有这些。
+#: 没列进来的（天翼、移动云盘、微云、光鸭……）不是漏了——它们不认 URL 里的码，
+#: 硬拼一个参数只会得到一条更长的链接，用户照样要手输。这类由落地页显式展示。
+_PWD_PARAM: tuple[tuple[str, str], ...] = (
+    (r"(^|\.)pan\.quark\.cn$", "pwd"),
+    (r"(^|\.)drive\.uc\.cn$", "pwd"),
+    (r"(^|\.)fast\.uc\.cn$", "pwd"),
+    (r"(^|\.)pan\.baidu\.com$", "pwd"),
+    (r"(^|\.)pan\.xunlei\.com$", "pwd"),
+    (r"(^|\.)(alipan|aliyundrive)\.com$", "pwd"),
+    (r"(^|\.)115\.com$", "password"),
+    (r"(^|\.)lanzou[a-z]*\.com$", "pwd"),
+    (r"(^|\.)ilanzou\.com$", "pwd"),
+    (r"(^|\.)ctfile\.com$", "pwd"),
+    (r"(^|\.)(123pan|123684|123865)\.(com|cn)$", "pwd"),
+    (r"(^|\.)pan\.wo\.cn$", "pwd"),
+)
 
-    回退到原链接时也走它——否则用户拿到的链接没提取码，等于给了一半。
+_PWD_HOSTS = tuple((re.compile(pattern, re.I), param) for pattern, param in _PWD_PARAM)
+
+
+def embed_pwd(url: str, pwd: str) -> tuple[str, bool]:
+    """把提取码拼进 URL，并告诉调用方拼上了没有。
+
+    返回 (url, applied)。applied=False 有两种情况：本来就有码，或者这个平台
+    不认 URL 传码——后者要求调用方把码用别的方式交给用户，否则他打开的是
+    一个要密码的页面，而密码在他手上没有。
     """
     if not pwd:
-        return url
+        return url, False
     if _pwd_of(url):
-        return url
+        return url, True
     try:
         host = (urlparse(url).hostname or "").lower()
     except ValueError:
-        return url
-    if not re.search(r"pan\.quark\.cn|pan\.baidu\.com|pan\.xunlei\.com|alipan|aliyundrive", host):
-        return url
-    return f"{url}{'&' if '?' in url else '?'}pwd={pwd}"
+        return url, False
+    if not host:
+        return url, False
+    for pattern, param in _PWD_HOSTS:
+        if pattern.search(host):
+            # 用重构 query 的方式，而不是直接拼 "&pwd="——115 那类链接常自带
+            # 一个空的 `password=`，直接拼会变成 `password=&password=x7k2`，
+            # 平台取到的是空值，等于没给
+            parts = urlparse(url)
+            kept = [
+                (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                if k.lower() != param.lower()
+            ]
+            kept.append((param, pwd))
+            return parts._replace(query=urlencode(kept)).geturl(), True
+    return url, False
+
+
+def with_pwd(url: str, pwd: str) -> str:
+    """兼容旧调用：只要 URL。"""
+    return embed_pwd(url, pwd)[0]
 
 
 # ---- 签名 token ----

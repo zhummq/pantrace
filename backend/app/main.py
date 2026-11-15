@@ -378,6 +378,27 @@ def _apply_hidden(body: dict) -> dict:
     return out
 
 
+def _can_mirror(platform: str, size_bytes: int = 0) -> bool:
+    """这条结果点开以后，有没有可能落到我们自己的链接上。
+
+    三个条件缺一不可：有 adapter、该平台有启用账号、体积没超阈值（配了才查）。
+    任一不满足，点击必然回退到上游原链接——那种情况下卡片上必须留着原来的
+    提取码，否则用户拿到的是一条要密码的链接，而密码已经被我们抹掉了。
+    """
+    if not platform or not registry.supported(platform):
+        return False
+    # 0 = 不限体积。不加这个判断的话，max_gb=0 会让"任何有体积的资源"都
+    # 判定成不能转，卡片就会保留上游提取码——用户拿去填我们自己的分享，必错
+    limit = int(float(settings.mirror_max_gb) * 1024 ** 3)
+    if limit and size_bytes and size_bytes > limit:
+        return False
+    try:
+        return pan.has_account(platform)
+    except Exception:  # noqa: BLE001
+        # 账号库还没初始化时按"不能转"处理：留着码最多是冗余，抹掉码是事故
+        return False
+
+
 def _public_body(body: dict) -> dict:
     """把上游真实链接换成签名跳转地址，再交给前端。
 
@@ -385,10 +406,13 @@ def _public_body(body: dict) -> dict:
     缓存里留着原始链接，_apply_hidden 才有东西可比，改密钥/关开关也能立刻生效。
 
     自有精选卡不动——那条链接本来就是我们自己的。
-    提取码一并抹掉：落地页会带我们分享的提取码，卡片上留一个上游的码
-    只会让人复制了发现不对。
 
-    `shareCode` 必须一起清：它就是网盘分享 id（实测夸克是 /s/ 后面那串），
+    提取码按平台分开处理：能转存的才抹（落地页会给我们自己那条分享的码），
+    不能转存的必须留着。原来一刀切全抹，结果是天翼、移动云盘、微云这些
+    没有 adapter 的平台，卡片上没码、回退链接又不认 URL 传码，用户手上
+    彻底没有码——2026-11 发现的一批"只有链接没有码"就是这个。
+
+    `shareCode` 一律清：它就是网盘分享 id（实测夸克是 /s/ 后面那串），
     留着等于把真实链接换个字段发出去，前面做的全都白搭。
     """
     if not MIRROR_ON:
@@ -402,8 +426,11 @@ def _public_body(body: dict) -> dict:
                 url, item.get("sharePwd") or "", item.get("platform") or "",
                 item.get("title") or "",
             )
-            item["sharePwd"] = ""
             item["shareCode"] = ""
+            if _can_mirror(
+                item.get("platform") or "", int(item.get("sizeBytes") or 0)
+            ):
+                item["sharePwd"] = ""
         items.append(item)
     out = dict(body)
     out["items"] = items
@@ -646,6 +673,13 @@ p{margin:0;color:#7b8794;font-size:13px}
 a.btn{display:inline-flex;align-items:center;height:34px;padding:0 15px;border-radius:8px;
   font-size:13px;text-decoration:none;color:#1b2430;border:1px solid #dfe3e9}
 a.btn.primary{background:#1b2430;color:#fff;border-color:#1b2430}
+/* 提取码块：只有平台上不认 URL 传码（天翼/微云/光鸭…）时才会出现 */
+.code{display:none;align-items:center;justify-content:center;gap:8px;margin:14px 0 0;
+  padding:10px 12px;border-radius:9px;background:#f2fbf9;border:1px solid #c9ece5;
+  font-size:13px;color:#0f6b60}
+.code b{font:600 15px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.16em;color:#0b5c52}
+.code button{border:1px solid #b7dfd7;background:#fff;color:#0b5c52;border-radius:6px;
+  font-size:12px;padding:4px 9px;cursor:pointer}
 </style></head>
 <body>
 <div class="box">
@@ -654,6 +688,10 @@ a.btn.primary{background:#1b2430;color:#fff;border-color:#1b2430}
   <h1 id="title">正在为你打开</h1>
   <p id="hint">正在准备这条资源，通常几秒内完成</p>
   <p class="ttl" id="ttl">链接只保留 __TTL__ 分钟，打开后请先转存到自己的网盘</p>
+  <div class="code" id="code">
+    <span>提取码</span><b id="codev"></b>
+    <button type="button" id="copycode">复制</button>
+  </div>
   <p class="err" id="err"></p>
   <div class="acts" id="acts">
     <a class="btn" href="/">返回搜索</a>
@@ -667,6 +705,35 @@ var MIN_SHOW = 1200;  // 最短停留：给"30 分钟内有效"那行留出可�
 var RING = document.getElementById('ring');
 var TITLE = document.getElementById('title');
 var HINT = document.getElementById('hint');
+var CODE = document.getElementById('code');
+var CODEV = document.getElementById('codev');
+var COPY = document.getElementById('copycode');
+
+// 有些平台不认 URL 里的提取码（天翼、微云、光鸭等），后端会把码单独送过来。
+// 只展示不写日志、不进链接，用户抄走或点复制即可。
+COPY.addEventListener('click', function () {
+  var text = CODEV.textContent || '';
+  function done() { COPY.textContent = '已复制'; }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, function () {
+      var range = document.createRange();
+      range.selectNodeContents(CODEV);
+      var sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      try { document.execCommand('copy'); } catch (e) {}
+      done();
+    });
+    return;
+  }
+  var range = document.createRange();
+  range.selectNodeContents(CODEV);
+  var sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  try { document.execCommand('copy'); } catch (e) {}
+  done();
+});
 
 // 分阶段给话。原来一句"首次打开需要转存一份"有三个毛病：暴露我们在替用户
 // 转存别人的分享、"首次"并不准（缓存命中是秒开，非首次也可能重建）、
@@ -720,7 +787,17 @@ fetch('/api/resolve', {
   clearTimeout(hardStop);
   if (j && j.url) {
     stopTimers();
-    HINT.textContent = '好了，正在跳转…';
+    if (j.pwd) {
+      CODE.style.display = 'flex';
+      CODEV.textContent = j.pwd;
+      // 要抄码，从拿到结果起再留 6 秒，不受前面转存耗时影响
+      MIN_SHOW = (Date.now() - START) + 6000;
+      TITLE.textContent = '这条资源的提取码在下面';
+      HINT.textContent = '先记下提取码，稍后会自动打开网盘';
+      document.getElementById('ttl').textContent = '打开网盘后如提示输入提取码，粘贴上面的即可';
+    } else {
+      HINT.textContent = '好了，正在跳转…';
+    }
     // 准备太快时会一闪而过，"30 分钟有效"这句等于没说，压到 1.2 秒
     var wait = Math.max(0, MIN_SHOW - (Date.now() - START));
     setTimeout(function () { location.replace(j.url) }, wait);
@@ -805,10 +882,17 @@ async def api_resolve(
     took = int((time.perf_counter() - started) * 1000)
 
     url, fallback, msg = result["url"], False, result.get("reason") or ""
+    pwd = ""
     if not result["ok"]:
         if settings.mirror_fallback:
-            # 回退要带提取码：用户拿到的是一半链接等于没给
-            url, fallback = resolver.with_pwd(info["url"], info["pwd"]), True
+            # 回退要带提取码：用户拿到的是一半链接等于没给。
+            # 拼得进 URL 的（夸克/百度/115/蓝奏…）平台会自动填；拼不进的
+            # （天翼/微云/光鸭…）把码单独交给页面展示，否则用户对着输入框
+            # 手上却没码——这是这套回退机制以前最难看的一处
+            url, applied = resolver.embed_pwd(info["url"], info["pwd"])
+            fallback = True
+            if info["pwd"] and not applied:
+                pwd = info["pwd"]
             msg = msg or "资源准备失败"
         else:
             url = ""
@@ -836,6 +920,8 @@ async def api_resolve(
             "url": url,
             "fallback": fallback,
             "cached": bool(result.get("cached")),
+            # 只在"码没拼进链接"时才有值，过渡页会显式展示给用户抄
+            "pwd": pwd,
             "msg": "" if url else (msg or "资源暂时不可用"),
         },
         headers={"Cache-Control": "no-store"},

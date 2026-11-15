@@ -64,9 +64,10 @@ def create(
         raise UnsupportedError(f"暂不支持 {platform or '该平台'} 的转存")
     client = cls(account, timeout=timeout, on_cookie=on_cookie)
     # 阈值来自配置，不该在五个 adapter 的构造函数里各抄一遍签名。
-    # max_file_bytes 只在 mirror() 里读，构造完再盖掉类默认值就够
-    if max_bytes:
-        client.max_file_bytes = int(max_bytes)
+    # max_file_bytes 只在 mirror() 里读，构造完再盖掉类默认值就够。
+    # 无条件覆盖（包括 0）：0 = 不限制，必须能把 adapter 自己写的类默认值
+    # （百度 100G）也清掉，否则"关掉上限"在百度那边是关不掉的
+    client.max_file_bytes = int(max_bytes or 0)
     return client
 
 

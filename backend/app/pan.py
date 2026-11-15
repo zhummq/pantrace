@@ -51,9 +51,10 @@ _cfg: dict = {
     # 同一个平台两次转存之间至少隔这么多秒。并发点击打到同一个网盘是最容易
     # 触发风控的行为，比单次转存失败代价大得多
     "min_interval": 3.0,
-    # 单条资源超过这个体积就不转。网盘空间是有限资源，一个 100G 的合集
-    # 能把一个账号废掉，而它带来的点击和 1G 的资源一模一样
-    "max_gb": 30.0,
+    # 单条资源超过这个体积就不转。**0 = 不限制**（2026-11 起的默认）。
+    # 曾经是 30，用来防"一个 100G 合集废掉一个账号"；取消后容量完全交给
+    # 30 分钟窗口 + 旧副本回收来控制，账号满了就只能等回收或人工清
+    "max_gb": 0.0,
 }
 
 # 换账号有意义的两类错。其余错换了也白换，直接抛
@@ -154,6 +155,42 @@ def _row_to_account(row: sqlite3.Row) -> Account:
     )
 
 
+# 启用中的平台类型集合 + 缓存时刻。搜索结果一屏 20 条，逐条查库太浪费；
+# 一次 SELECT 覆盖所有平台，20 秒的滞后换一屏只查一次。
+_types_cache: tuple[float, frozenset[str]] | None = None
+_ACCOUNT_CACHE_TTL = 20.0
+
+
+def _enabled_types() -> frozenset[str]:
+    global _types_cache
+    now = time.time()
+    if _types_cache and now - _types_cache[0] < _ACCOUNT_CACHE_TTL:
+        return _types_cache[1]
+    with _session() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT type FROM pan_accounts WHERE status=1"
+        ).fetchall()
+    value = frozenset(str(row["type"]) for row in rows)
+    _types_cache = (now, value)
+    return value
+
+
+def has_account(platform: str) -> bool:
+    """这个平台现在有没有启用中的账号。
+
+    用途只有一个：决定搜索结果卡片上的提取码要不要抹掉。有账号才可能转成
+    我们自己的链接（那时的码由落地页给），没账号点击必然回退原链接——
+    那种情况下抹码等于把用户扔在一个要密码的页面前，而他手上什么都没有。
+    """
+    return registry.resolve_type(platform) in _enabled_types()
+
+
+def _invalidate_account_cache() -> None:
+    """账号增删改之后立刻失效，别让"刚加完账号"还要等 20 秒。"""
+    global _types_cache
+    _types_cache = None
+
+
 def list_accounts(platform: str = "") -> list[Account]:
     with _session() as conn:
         if platform:
@@ -189,7 +226,9 @@ def add_account(
                 json.dumps(extra or {}, ensure_ascii=False), now, now,
             ),
         )
-        return int(cur.lastrowid or 0)
+        account_id = int(cur.lastrowid or 0)
+    _invalidate_account_cache()
+    return account_id
 
 
 def update_account(account_id: int, **fields) -> None:
@@ -209,11 +248,16 @@ def update_account(account_id: int, **fields) -> None:
             f"UPDATE pan_accounts SET {columns} WHERE id=?",
             (*sets.values(), account_id),
         )
+    # 只有启用状态会改变 has_account 的答案；fail_count 每次转存都在动，
+    # 跟着清缓存等于把缓存白做
+    if "status" in sets:
+        _invalidate_account_cache()
 
 
 def delete_account(account_id: int) -> None:
     with _session() as conn:
         conn.execute("DELETE FROM pan_accounts WHERE id=?", (account_id,))
+    _invalidate_account_cache()
 
 
 def _pick(platform: str, limit: int) -> list[Account]:
@@ -322,6 +366,11 @@ def transfer(url: str, pwd: str = "", platform: str = "", title: str = "") -> Sh
 
     _rate_gate(key)
 
+    # 0 就是把 max_file_bytes 一起清零——0 在 base.mirror 里表示不检查体积。
+    # 这里不能省成"不传"：不传的话 registry.create 不会覆盖 adapter 的类默认值，
+    # 百度那边还留着 100G 的老默认，等于换了个阈值继续限
+    max_bytes = int(float(_cfg["max_gb"]) * 1024**3) if float(_cfg["max_gb"]) > 0 else 0
+
     last: NetdiskError | None = None
     for account in candidates:
         client = registry.create(
@@ -329,7 +378,7 @@ def transfer(url: str, pwd: str = "", platform: str = "", title: str = "") -> Sh
             account,
             timeout=float(_cfg["timeout"]),
             on_cookie=_credential_hook(account),
-            max_bytes=int(float(_cfg["max_gb"]) * 1024**3),
+            max_bytes=max_bytes,
         )
         try:
             link = client.mirror(url, pwd, title)
