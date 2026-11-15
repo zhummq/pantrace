@@ -64,21 +64,58 @@ const groupCfg = ref(null)
 const groupOpen = ref(false)
 const groupMode = ref('enter')
 const pendingUrl = ref('')
+// 用户在拦截弹窗里勾了「今日点击链接不再提示」，当天剩余时间不再拦。
+// 用 ref 而不是每次读 localStorage：computed 靠它触发重算，勾上之后当前这页就立刻放行。
+const acquireMuted = ref(false)
 
 const groupIntercept = computed(() => {
   const cfg = groupCfg.value
-  return !!(cfg?.enabled && cfg?.popup?.acquire)
+  return !!(cfg?.enabled && cfg?.popup?.acquire) && !acquireMuted.value
 })
 
-// 拦截弹窗（acquire）：每次点「打开链接」都弹，不做任何"看过了就放行"的记忆。
+// 拦截弹窗（acquire）：默认每次点「打开链接」都弹，不做"看过了就放行"的自动记忆。
 // 早先这里按会话记标记，同一标签页点过一次之后连刷新都再也不弹，看起来跟坏了一样；
 // 而"本页只弹一次"又会让第二个链接被静默放行——两种都不对。宁可多点一次。
 // 想直接走的人，弹窗里一直有「不进群了，直接打开资源」的出口。
+//
+// 唯一例外是用户自己勾的「今日点击链接不再提示」（pt_group_mute_acquire_day）：
+// 那是他明确表态，按天放行，第二天零点自然恢复。
 
 // 进站弹窗的重复控制：session=每次打开页面弹（默认），day=每天只弹一次，
 // always=每次打开都弹。session 与 always 在"一个页面生命周期只挂载一次"的前提下等价，
 // 保留两个值只是为了不改动后台已存的配置。
+//
+// 另有一条用户自己的开关：弹窗里勾「今日不再弹出」（pt_group_mute_day），
+// 当天剩余时间不再自动弹。它优先于后台配置——用户明确说了不想看，就按用户来；
+// 手动点「进群交流」不读这个标记。
+// 两个标记故意分开：在进站弹窗里顺手一勾不该把点链接的拦截也一起关掉。
+function todayKey() {
+  const d = new Date()
+  return `${d.getFullYear()}-${d.getMonth() + 1}-${d.getDate()}`
+}
+
+function readMuted(key) {
+  try {
+    return localStorage.getItem(key) === todayKey()
+  } catch {
+    return false
+  }
+}
+
+function writeMuted(key) {
+  try {
+    localStorage.setItem(key, todayKey())
+  } catch {
+    /* 拿不到 storage 就只关掉这一次，下次还会弹 */
+  }
+}
+
+function enterMutedToday() {
+  return readMuted('pt_group_mute_day')
+}
+
 function enterSeenRecently() {
+  if (enterMutedToday()) return true
   const once = groupCfg.value?.popup?.once || 'session'
   if (once !== 'day') return false
   try {
@@ -108,6 +145,17 @@ function openGroup(mode, url = '') {
 
 function closeGroup() {
   groupOpen.value = false
+}
+
+// 弹窗里勾了「今日不再弹出」：按形态各记各的标记。
+// enter → 今天不再自动弹进站弹窗；acquire → 今天不再拦点击，链接直接放行。
+function muteGroupPopup(mode) {
+  if (mode === 'acquire') {
+    acquireMuted.value = true
+    writeMuted('pt_group_mute_acquire_day')
+    return
+  }
+  writeMuted('pt_group_mute_day')
 }
 
 function groupContinue() {
@@ -274,6 +322,8 @@ onMounted(async () => {
     (groupData.groups || []).some((g) => g.enabled !== false)
   ) {
     groupCfg.value = groupData
+    // 拦截开关的用户侧状态：昨天勾的不算，只认同一天
+    acquireMuted.value = readMuted('pt_group_mute_acquire_day')
     const popup = groupData.popup || {}
     // 进站弹窗：默认每次打开都弹；once=day 时才按天抑制。
     // 点链接的拦截（acquire）不在这里，它每次点击都会弹。
@@ -534,6 +584,7 @@ onBeforeUnmount(() => {
       :config="groupCfg"
       @close="closeGroup"
       @continue="groupContinue"
+      @mute="muteGroupPopup"
     />
   </div>
 </template>

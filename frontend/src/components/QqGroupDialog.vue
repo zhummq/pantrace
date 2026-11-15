@@ -3,7 +3,7 @@
 //   enter    —— 进站展示：二维码是主角
 //   acquire  —— 用户点「打开链接」时拦截：先看群，再给「继续打开」的出口
 // 群数据由后端 /api/group 下发，管理员在 /admin 看板里改，前端不写死。
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { track } from '../track.js'
 
 const props = defineProps({
@@ -12,10 +12,30 @@ const props = defineProps({
   config: { type: Object, default: null },  // /api/group 返回的 data
 })
 
-const emit = defineEmits(['close', 'continue'])
+const emit = defineEmits(['close', 'continue', 'mute'])
 
 const activeIndex = ref(0)
 const copied = ref(false)
+// 「今日不再弹出」：两种形态各自管自己那一摊，互不牵连——
+// enter 里勾上只是今天不再自动弹进站弹窗；acquire 里勾上只是今天点链接不再拦。
+// 共用一个标记会让"顺手关掉进站弹窗"的人把拦截也一起关掉，用户并没有对这个表态。
+const muteToday = ref(false)
+
+const muteLabel = computed(() =>
+  props.mode === 'acquire' ? '今日点击链接不再提示' : '今日不再弹出'
+)
+
+// 每次重新打开都复位：上次勾过没关掉、或者手动打开弹窗，都不该带着上次的勾
+watch(
+  () => props.open,
+  (v) => {
+    if (v) {
+      muteToday.value = false
+      activeIndex.value = 0
+      copied.value = false
+    }
+  }
+)
 
 const enabledGroups = computed(() => (props.config?.groups || []).filter((g) => g.enabled !== false))
 const active = computed(() => enabledGroups.value[activeIndex.value] || null)
@@ -32,10 +52,19 @@ const tipText = computed(() => {
   return props.config?.tip || '扫一扫二维码即可加入'
 })
 
+// 勾了「今日不再弹出」就把标记交出去，父组件负责落 localStorage。
+// ✕、点遮罩、「直接打开资源」三条出口都走这里——用户勾了就是勾了，不看他从哪条路关。
+function commitMute() {
+  if (!muteToday.value) return
+  track('group', { meta: { action: 'mute_today', mode: props.mode } })
+  emit('mute', props.mode)
+}
+
 function close() {
   if (props.mode === 'enter') {
     track('group', { meta: { action: 'close', mode: 'enter' } })
   }
+  commitMute()
   emit('close')
 }
 
@@ -69,6 +98,7 @@ function openJoinLink() {
 
 function continueOpen() {
   track('group', { meta: { action: 'continue', mode: 'acquire' } }, { beacon: true })
+  commitMute()
   emit('continue')
 }
 
@@ -127,6 +157,11 @@ function switchTab(i) {
         <button v-if="mode === 'acquire'" class="pt-continue" @click="continueOpen">
           不进群了，直接打开资源
         </button>
+
+        <label class="pt-mute">
+          <input v-model="muteToday" type="checkbox" />
+          <span>{{ muteLabel }}</span>
+        </label>
       </div>
     </div>
   </Teleport>
@@ -381,6 +416,30 @@ function switchTab(i) {
 .pt-continue:hover {
   border-color: var(--ink-2, #2c3644);
   color: var(--ink, #0b1017);
+}
+
+/* 今日不再弹出：放在最底下，字号压小，不抢二维码的视线 */
+.pt-mute {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+  font-size: 11.5px;
+  color: var(--faint, #96a1ad);
+  cursor: pointer;
+  user-select: none;
+}
+
+.pt-mute input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
+  accent-color: var(--accent, #00a99d);
+  cursor: pointer;
+}
+
+.pt-mute:hover {
+  color: var(--muted, #69747f);
 }
 
 @media (max-width: 560px) {
