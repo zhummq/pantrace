@@ -5,7 +5,7 @@ import StatGrid from './components/StatGrid.vue'
 import FeedbackPanel from './components/FeedbackPanel.vue'
 import AccountsPanel from './components/AccountsPanel.vue'
 import GroupPanel from './components/GroupPanel.vue'
-import InsightsPanel from './components/InsightsPanel.vue'
+import ClicksPanel from './components/ClicksPanel.vue'
 import * as api from './api'
 import { ms, pct } from './format'
 
@@ -147,7 +147,7 @@ onUnmounted(() => {
       <FeedbackPanel ref="feedbackPanel" :days="days" />
       <AccountsPanel ref="accountsPanel" />
       <GroupPanel ref="groupPanel" />
-      <InsightsPanel :data="data" />
+      <ClicksPanel :data="data" />
     </template>
   </div>
 </template>

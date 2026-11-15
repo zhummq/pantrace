@@ -146,6 +146,7 @@ export function track(kind, data = {}, opts = {}) {
       query: data.query || '',
       platform: data.platform || '',
       target: data.target || '',
+      url: data.url || '',
       source: data.source || '',
       durationMs: Number(data.durationMs) || 0,
       ok: data.ok !== false,

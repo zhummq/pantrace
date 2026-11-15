@@ -84,6 +84,8 @@ function onClick() {
     {
       target: props.item.title || '',
       platform: props.item.platform || '',
+      // shareUrl 是 /go/ 签名串，后端解 token 落库成真实网盘链接
+      url: props.item.shareUrl || '',
       query: props.keyword,
     },
     { beacon: true }

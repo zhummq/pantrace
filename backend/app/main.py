@@ -300,12 +300,29 @@ class TrackEvent(BaseModel):
     query: str = ""
     platform: str = ""
     target: str = ""
+    url: str = ""
     durationMs: int = 0
     ok: bool = True
     resultCount: int = -1
     isNew: bool = False
     source: str = ""
     meta: dict = Field(default_factory=dict)
+
+
+def _real_url_of(raw: str) -> str:
+    """/go/ 签名串解回真实网盘链接；本来就是 http(s) 的原样收下。
+
+    为什么在这里解：浏览器上从来只有 /go/ token，真实链接不外露——但管理员
+    要看"用户点开的到底是哪条网盘链接"，答案就在 token 里。验签不过的（伪造、
+    换过密钥）一律丢掉，宁缺勿错。
+    """
+    url = (raw or "").strip()
+    if not url:
+        return ""
+    if url.startswith("/go/"):
+        info = resolver.read_token(url[4:])
+        return info["url"] if info else ""
+    return url if url.startswith(("http://", "https://")) else ""
 
 
 class TrackPayload(BaseModel):
@@ -342,6 +359,7 @@ async def track(payload: TrackPayload, request: Request, background: BackgroundT
             query=event.query,
             platform=event.platform,
             target=event.target,
+            url=_real_url_of(event.url),
             ok=event.ok,
             duration_ms=event.durationMs,
             result_count=event.resultCount,

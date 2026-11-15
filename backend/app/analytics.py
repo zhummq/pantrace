@@ -105,6 +105,7 @@ def _ensure_schema() -> None:
                 query        TEXT    NOT NULL DEFAULT '',
                 platform     TEXT    NOT NULL DEFAULT '',
                 target       TEXT    NOT NULL DEFAULT '',
+                url          TEXT    NOT NULL DEFAULT '',
                 ok           INTEGER NOT NULL DEFAULT 1,
                 duration_ms  INTEGER NOT NULL DEFAULT 0,
                 result_count INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +129,9 @@ def _ensure_schema() -> None:
         # source 标记点击转存的来源（cached / fresh / fallback），老库补列
         if "source" not in cols:
             conn.execute("ALTER TABLE events ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+        # url 存点击资源的真实网盘链接（前端只有 /go/ 签名串，后端解 token 落库），老库补列
+        if "url" not in cols:
+            conn.execute("ALTER TABLE events ADD COLUMN url TEXT NOT NULL DEFAULT ''")
 
 
 def _day_of(ts: float) -> str:
@@ -162,6 +166,7 @@ def record(
     query: str = "",
     platform: str = "",
     target: str = "",
+    url: str = "",
     ok: bool = True,
     duration_ms: int = 0,
     result_count: int = -1,
@@ -189,6 +194,7 @@ def record(
         _clip(query, 100),
         _clip(platform, 100),
         _clip(target, 200),
+        _clip(url, 500),
         1 if ok else 0,
         max(0, _to_int(duration_ms)),
         _to_int(result_count, -1),
@@ -206,9 +212,9 @@ def record(
                 conn.execute(
                     """INSERT INTO events
                        (ts, day, kind, visitor, session, ip, ua, referer, path,
-                        query, platform, target, ok, duration_ms, result_count,
+                        query, platform, target, url, ok, duration_ms, result_count,
                         cached, device, is_new, bot, source, meta)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     row,
                 )
                 # 每天最多清理一次，顺手把过期数据删掉，避免库无限长大
@@ -365,12 +371,38 @@ def summary(days: int = 7) -> dict:
             (int(_tz.utcoffset(None).total_seconds()), start),
         ).fetchall()
         recent = conn.execute(
-            """SELECT ts, kind, query, platform, target, ok, device, ip
+            """SELECT ts, kind, query, platform, target, url, ok, device, ip
                FROM events
                WHERE bot=0 AND ts >= ?
                ORDER BY ts DESC LIMIT 30""",
             (start,),
         ).fetchall()
+        # 点击明细：管理员要的是"谁点开了哪条资源、属于哪个网盘、链接是什么"，
+        # 不是聚合数字。只取点击，新在前；url 是后端解 /go/ token 后的真实网盘链接，
+        # 旧版本埋点没记过这个字段，展示层做空值兜底。
+        recent_clicks = conn.execute(
+            """SELECT ts, target, platform, url, query, device, ip
+               FROM events
+               WHERE kind='click' AND bot=0 AND ts >= ?
+               ORDER BY ts DESC LIMIT 100""",
+            (start,),
+        ).fetchall()
+        # 我们自己的转存链接：mirrors 和 events 是同一个 SQLite 文件，src_url 就是
+        # token 里那条原始链接，跟 events.url 直接对得上，不用再算 src_key。
+        # mirrors 由 resolver 建表——转存关掉时这张表可能不存在，查不到就当没有。
+        mirrors_of: dict[str, dict] = {}
+        click_urls = sorted({r["url"] for r in recent_clicks if r["url"]})
+        if click_urls:
+            try:
+                marks = ",".join("?" * len(click_urls))
+                for m in conn.execute(
+                    f"SELECT src_url, our_url, status, expires_at FROM mirrors"
+                    f" WHERE src_url IN ({marks})",
+                    click_urls,
+                ):
+                    mirrors_of[m["src_url"]] = dict(m)
+            except sqlite3.Error:
+                mirrors_of = {}
 
     searches = overview["searches"] or 0
     clicks = overview["clicks"] or 0
@@ -423,5 +455,23 @@ def summary(days: int = 7) -> dict:
                 "ip": _mask_ip(r["ip"]),
             }
             for r in recent
+        ],
+        "recent_clicks": [
+            {
+                "ts": int(r["ts"]),
+                "target": r["target"],
+                "platform": r["platform"],
+                "url": r["url"],
+                # 我们转存出去的那条链接；没有就是还没转存/转存失败
+                "ourUrl": (mirrors_of.get(r["url"]) or {}).get("our_url") or "",
+                "ourStatus": (mirrors_of.get(r["url"]) or {}).get("status") or "",
+                "ourExpiresAt": int(
+                    (mirrors_of.get(r["url"]) or {}).get("expires_at") or 0
+                ),
+                "query": r["query"],
+                "device": r["device"],
+                "ip": _mask_ip(r["ip"]),
+            }
+            for r in recent_clicks
         ],
     }
