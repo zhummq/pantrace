@@ -130,6 +130,15 @@ class PanClient(ABC):
         子类应覆盖成一次轻量请求。"""
         return True
 
+    def probe_detail(self) -> dict:
+        """探测详情。后台「测试」按钮用它把失败原因说清楚。
+
+        默认只有 ok。**覆盖时不要再调 self.probe()**——两者互相调用会绕成环。
+        有多套凭据的盘（百度就是 cookie + OAuth）在这里分别报状态，
+        `ok` 只回答"能不能干主业务"，其余信息放 `detail` 里给后台看。
+        """
+        return {"ok": self.probe(), "reason": "", "detail": {}}
+
     def close(self) -> None:
         # 关的是 requests.Session。这里吞掉异常：close 常在 finally 里被调，
         # 它自己抛出来会把真正的失败原因盖掉，排查时只剩一句 AttributeError

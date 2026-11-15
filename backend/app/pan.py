@@ -314,11 +314,13 @@ def _credential_hook(account: Account):
                 pairs = dict(
                     part.split("=", 1) for part in payload.split(";") if "=" in part
                 )
+                # 百度会带 __expires__（真实到期时间）；其它盘不给，就退回旧默认值
+                expires_at = int(pairs.get("__expires__") or 0) or int(time.time()) + 3600 * 12
                 update_account(
                     account.id,
                     access_token=pairs.get("__token__", account.access_token),
                     refresh_token=pairs.get("__refresh__", account.refresh_token),
-                    expires_at=int(time.time()) + 3600 * 12,
+                    expires_at=expires_at,
                 )
                 account.access_token = pairs.get("__token__", account.access_token)
                 account.refresh_token = pairs.get("__refresh__", account.refresh_token)
@@ -453,15 +455,20 @@ def probe(account_id: int) -> dict:
     except NetdiskError as exc:
         return {"ok": False, "reason": str(exc)}
     try:
-        alive = client.probe()
-        if alive:
+        detail = client.probe_detail()
+        if detail.get("ok"):
             _reset_fail(account)
-            return {"ok": True, "reason": ""}
-        _bump_fail(account, AuthError("账号探测失败"))
-        return {"ok": False, "reason": "账号登录态不可用"}
+            return {
+                "ok": True,
+                "reason": detail.get("reason", ""),
+                "detail": detail.get("detail") or {},
+            }
+        reason = detail.get("reason") or "账号登录态不可用"
+        _bump_fail(account, AuthError(reason))
+        return {"ok": False, "reason": reason, "detail": detail.get("detail") or {}}
     except NetdiskError as exc:
         _bump_fail(account, exc)
-        return {"ok": False, "reason": str(exc)}
+        return {"ok": False, "reason": str(exc), "detail": {}}
     finally:
         client.close()
 
@@ -821,6 +828,9 @@ def summary() -> dict:
                 "tempDir": a.temp_dir,
                 "hasCookie": bool(a.cookie),
                 "hasToken": bool(a.access_token or a.refresh_token),
+                # 能不能自动续期。false 就是"token 用满 30 天就没了"，
+                # 后台要能一眼看出来，别等它悄悄死掉
+                "hasOAuth": bool(a.extra.get("client_id") and a.extra.get("client_secret")),
                 "failCount": a.fail_count,
                 "lastError": a.last_error,
                 "expiresAt": a.expires_at,

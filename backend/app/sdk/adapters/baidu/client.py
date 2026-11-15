@@ -1,12 +1,16 @@
 """百度网盘客户端。
 
-和其它盘最大的不同：**两套认证**。
-- cookie 模式（BDUSS）：绝大多数接口都能用，最省事；
-- OAuth 模式：access_token 两小时过期，必须用 refresh_token 续，且每次续
-  都会换发新的 refresh_token —— 不落库就只续得了一次。
+它和别的盘最大的不同：**两套凭据，各管一段，谁也不能替谁**。
 
-百度还要求很多接口带 `bdstoken`，它跟着 cookie 走，所以要单独取一次并缓存。
-form-urlencoded 而不是 JSON，这点也别改：百度那套老接口对 JSON body
+- Cookie（BDUSS）：读分享、转存、建分享。网页端接口只认它。
+- OAuth（access_token）：自己盘里的文件管理——容量、列目录、批量元信息、
+  删除。官方 OpenAPI 只认它，实现见 `openapi.py`。
+
+**没有"二选一"这回事**：只填 token 转不了存，只填 cookie 用不了官方接口。
+项目要的是转存，所以 cookie 是必填项，OAuth 是加分项（巡检和清理更稳）。
+
+百度还要求很多网页接口带 `bdstoken`，它跟着 cookie 走，所以要单独取一次并
+缓存。form-urlencoded 而不是 JSON，这点也别改：百度那套老接口对 JSON body
 会返回 errno=2 参数错误，看起来像字段填错了。
 """
 
@@ -30,15 +34,17 @@ from ...errors import (
     UpstreamError,
     ViolationError,
     map_error,
+    message_of,
 )
 from ...http import Requester
 from ...registry import register
 from ...types import Account, File, ShareInfo, ShareLink, TaskResult
+from .openapi import BaiduOpenApi
 
 log = logging.getLogger("pantrace.sdk.baidu")
 
 API = "https://pan.baidu.com"
-OAUTH_TOKEN = "https://openapi.baidu.com/oauth/2.0/token"
+#: OAuth 的 token 端点随 OpenAPI 一起挪到了 openapi.py，这里别再加回来
 SHARE_HOST = "https://pan.baidu.com/s/"
 # 我们建分享时统一用这个码。百度要求 schannel=4 时 pwd 必填，且必须是 4 位
 DEFAULT_PWD = "6666"
@@ -77,6 +83,14 @@ class BaiduClient(PanClient):
         self._bdstoken_at = 0.0
         self._uk = ""
         super().__init__(account, timeout=timeout, on_cookie=on_cookie)
+        # OAuth 那条线：只管盘内文件管理（列目录/元信息/删除/容量）。
+        # 它和转存用的 cookie 是两套凭据，别指望 token 能转存——百度网页端
+        # 接口只认 BDUSS，这一点竞品自己也是这么分的（fs_openapi vs fs_share_api）。
+        self.openapi = BaiduOpenApi(
+            account,
+            timeout=timeout,
+            on_token=self._on_token if on_cookie is not None else None,
+        )
 
     # ---- 请求层 ----
 
@@ -115,39 +129,32 @@ class BaiduClient(PanClient):
                 raise exc(message or "分享不可访问", code=errno, raw=payload)
         raise map_error(ERRNO_MAP, errno, message or f"{action}失败", raw=payload)
 
+    def _on_token(self, info: dict) -> None:
+        """把续期结果交给业务层落库。
+
+        复用 on_cookie 的 `__token__` 约定，业务层不用认识第二种回调形态。
+        百度的 refresh_token 是**轮换式**的：旧的用完即废，不落库下次刷新
+        直接 invalid_grant，账号就废了——所以这个回调不是可选的装饰。
+        """
+        if self.on_cookie is None:
+            return
+        self.on_cookie(
+            f"__token__={info.get('access_token', '')};"
+            f"__refresh__={info.get('refresh_token', '')};"
+            f"__expires__={int(info.get('expires_at') or 0)}"
+        )
+
     def _ensure_oauth(self) -> None:
         """access_token 快过期就用 refresh_token 换一张新的。
 
-        百度的刷新是**轮换式**：旧 refresh_token 用完即废。回调必须落库，
-        否则下次刷新直接报 invalid_grant，账号就废了。
+        实现挪到了 `openapi.ensure_token()`：那边才知道 client_id/secret
+        缺没缺。这里只做"cookie 模式不碰 OAuth"的分流。
         """
         if self.account.cookie:
             return  # cookie 模式不碰 OAuth
-        if not self.account.refresh_token:
-            raise ConfigError("百度账号缺少 refresh_token")
-        now = int(time.time())
-        if self.account.access_token and self.account.expires_at - now > 300:
-            return
-        resp = self.http.get(
-            OAUTH_TOKEN,
-            params={
-                "grant_type": "refresh_token",
-                "refresh_token": self.account.refresh_token,
-                "client_id": self.account.extra.get("client_id", ""),
-                "client_secret": self.account.extra.get("client_secret", ""),
-            },
-            action="刷新百度 token",
-            retries=1,
-        )
-        token = str(resp.get("access_token") or "")
-        if not token:
-            raise AuthError("百度 token 刷新失败，需要重新授权")
-        self.account.access_token = token
-        self.account.refresh_token = str(resp.get("refresh_token") or self.account.refresh_token)
-        self.account.expires_at = now + int(resp.get("expires_in") or 2592000)
-        if self.on_cookie is not None:
-            # 这里复用 on_cookie 回调存 token，业务层按 type 判断怎么落库
-            self.on_cookie(f"__token__={token};__refresh__={self.account.refresh_token}")
+        if not (self.account.access_token or self.account.refresh_token):
+            raise ConfigError("百度账号缺少 access_token / refresh_token")
+        self.openapi.ensure_token()
 
     def _query_auth(self) -> dict:
         """cookie 模式补 access_token；OAuth 模式补 access_token。"""
@@ -167,7 +174,24 @@ class BaiduClient(PanClient):
         if token:
             self._bdstoken = token
             self._bdstoken_at = time.time()
-        return token
+            return token
+        # 以前这里静默返回空串，probe 只能回一句"登录态不可用"——排查时分不清
+        # 是 cookie 掉了、还是接口改了。OAuth 模式下这个接口确实回空（它跟着
+        # cookie 走），所以要把话说清楚。
+        errno = resp.get("errno")
+        if str(errno) in ("0", "None"):
+            raise AuthError(
+                "取 bdstoken 失败：返回空值。这个值跟着 Cookie 走，"
+                "OAuth token 拿不到——网页端转存必须填 BDUSS",
+                raw=resp,
+            )
+        if str(errno) == "-6":
+            raise AuthError(
+                "百度 Cookie 已失效（errno -6）：BDUSS 多半被踢了，重新登录 pan.baidu.com 复制一条",
+                code=errno,
+                raw=resp,
+            )
+        raise map_error(ERRNO_MAP, errno, message_of(resp) or "取 bdstoken 失败", raw=resp)
 
     # ---- 分享侧 ----
 
@@ -385,11 +409,56 @@ class BaiduClient(PanClient):
         except NetdiskError as exc:
             log.info("百度保活失败：%s", exc)
 
-    def probe(self) -> bool:
+    def close(self) -> None:
+        """两个 Requester（网页端 / 官方 OpenAPI）都要关。"""
+        super().close()
         try:
-            return bool(self.bdstoken())
-        except NetdiskError:
-            return False
+            self.openapi.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def probe(self) -> bool:
+        return bool(self.probe_detail().get("ok"))
+
+    def probe_detail(self) -> dict:
+        """两套凭据分开测，各自报结果——竞品的 check-account 也是这么干的。
+
+        `ok` 只看 cookie。这个项目要的是**转存**，而百度网页端接口只认 BDUSS；
+        OAuth 通了只说明"盘内文件管理可用"，说明不了能转存，所以它在 detail
+        里单列、不参与判定。
+
+        反过来，只有 OAuth 没有 cookie 时必须判死：否则账号会被排进轮换，
+        每次点击都失败一次，还把 fail_count 加满——那比不配账号更坑。
+        """
+        detail: dict[str, str] = {"cookie": "未配置", "oauth": "未配置"}
+        notes: list[str] = []
+        cookie_ok = False
+
+        if self.account.cookie:
+            try:
+                if self.bdstoken():
+                    detail["cookie"] = "ok"
+                    cookie_ok = True
+                else:
+                    detail["cookie"] = "fail: bdstoken 为空"
+            except NetdiskError as exc:
+                detail["cookie"] = f"fail: {exc}"
+
+        if self.openapi.configured:
+            try:
+                info = self.openapi.uinfo()
+                who = str(info.get("netdisk_name") or info.get("baidu_name") or "")
+                detail["oauth"] = f"ok（{who}）" if who else "ok"
+            except NetdiskError as exc:
+                detail["oauth"] = f"fail: {exc}"
+                notes.append(f"OAuth 不可用：{exc}")
+
+        if not self.account.cookie:
+            notes.insert(0, "缺少 Cookie：百度转存走网页端接口，只认 BDUSS，OAuth token 转不了存")
+        elif not cookie_ok:
+            notes.insert(0, f"Cookie 不可用：{detail['cookie'].removeprefix('fail: ')}")
+
+        return {"ok": cookie_ok, "reason": "；".join(notes), "detail": detail}
 
 
 def _query_auth_safe(client: BaiduClient) -> dict:

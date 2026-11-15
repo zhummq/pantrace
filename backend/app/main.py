@@ -1129,6 +1129,18 @@ class AccountIn(BaseModel):
     temp_dir: str = ""
     expires_at: int = 0
     status: int = 1
+    #: 网盘特有的附加凭据。目前只有百度用：client_id / client_secret。
+    #: 单开一个字段而不是拆成两个列，是因为以后别的盘也大概率有这种"应用级"配置。
+    extra: dict = Field(default_factory=dict)
+
+
+def _clean_extra(extra: dict | None) -> dict[str, str]:
+    """附加凭据去掉空值。别把空串存进库——读的时候分不清"没配"和"配了个空"。"""
+    return {
+        str(key): str(value).strip()
+        for key, value in (extra or {}).items()
+        if str(value).strip()
+    }
 
 
 @app.get("/api/admin/accounts", include_in_schema=False)
@@ -1168,6 +1180,7 @@ async def admin_account_add(payload: AccountIn, request: Request):
         refresh_token=payload.refresh_token.strip(),
         expires_at=payload.expires_at,
         temp_dir=payload.temp_dir.strip(),
+        extra=_clean_extra(payload.extra),
     )
     return {"code": 0, "id": aid, "msg": "已添加"}
 
@@ -1189,6 +1202,14 @@ async def admin_account_update(aid: int, payload: AccountIn, request: Request):
         }.items()
         if value not in ("", 0) or key in ("status",)
     }
+    # 附加凭据单独处理：空对象不能当"清空"用，否则前端编辑时没填
+    # client_secret 就会把已经存着的 client_id 一起抹掉。这里做合并。
+    fresh_extra = _clean_extra(payload.extra)
+    if fresh_extra:
+        current = next((a for a in pan.list_accounts() if a.id == aid), None)
+        merged = dict(current.extra) if current else {}
+        merged.update(fresh_extra)
+        fields["extra"] = merged
     if not fields:
         return JSONResponse(status_code=400, content={"code": 400, "msg": "没有要改的字段"})
     pan.update_account(aid, **fields)

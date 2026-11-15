@@ -7,7 +7,8 @@ import { platformName } from '../format'
 
 /**
  * 每个网盘要什么凭据，前端先说清楚，别让人填一半被后端打回。
- * cookie: required / either / none   token: required / either / none
+ * cookie: required / either / none   token: required / optional / either / none
+ * oauth:  true 时额外显示 client_id / client_secret（目前只有百度）
  * temp:   required / optional
  */
 const PLATFORMS = [
@@ -30,10 +31,11 @@ const PLATFORMS = [
   {
     key: 'baidu',
     name: '百度网盘',
-    cookie: 'either',
-    token: 'either',
+    cookie: 'required',
+    token: 'optional',
+    oauth: true,
     temp: 'optional',
-    tip: '两条路选一条：① Cookie 里带 BDUSS + STOKEN（网页登录后复制）；② 填 refresh_token（开放平台授权拿到的）。有 refresh_token 时 access_token 会自动换，过期也能自愈。',
+    tip: 'Cookie 必填（要有 BDUSS + STOKEN）：百度转存走网页端接口，只认它，OAuth token 转不了存。OAuth 是可选加分项——填 refresh_token 并在下面补 client_id/secret，能自动续期，还能用官方接口做盘内巡检和临时文件清理。OAuth 要用开放平台里已开通文件权限的应用，否则会报 20020（路径不在允许访问范围内）。',
   },
   {
     key: 'xunlei',
@@ -84,6 +86,9 @@ const emptyForm = () => ({
   cookie: '',
   access_token: '',
   refresh_token: '',
+  // 百度的应用级凭据，只有 pf.oauth 时才显示
+  client_id: '',
+  client_secret: '',
   temp_dir: '',
   expires_at: 0,
   status: 1,
@@ -176,6 +181,9 @@ function edit(item) {
     cookie: '',
     access_token: '',
     refresh_token: '',
+    // 凭据一律留空：留空 = 不改。后端 update 会把 extra 合并而不是覆盖
+    client_id: '',
+    client_secret: '',
     temp_dir: item.tempDir || '',
     expires_at: item.expiresAt || 0,
     status: item.status,
@@ -189,6 +197,8 @@ function onTypeChange() {
   form.cookie = ''
   form.access_token = ''
   form.refresh_token = ''
+  form.client_id = ''
+  form.client_secret = ''
 }
 
 /** 提交前的拦截。比后端报错更早一步，也说得更具体。 */
@@ -204,7 +214,14 @@ function validate() {
   if (p.token === 'required' && !tokenFilled) {
     return p.key === 'xunlei' ? '迅雷必须填 refresh_token（只填 access_token 活不过一小时）' : `${p.name}必须填 refresh_token 或 access_token`
   }
-  if (p.key === 'baidu' && !cookieFilled && !tokenFilled) return '百度网盘 Cookie 和 refresh_token 至少填一个'
+  // 百度 OAuth 的应用凭据必须成对出现；两个都留空 = 不配 / 不改
+  if (p.oauth) {
+    const hasId = form.client_id.trim() !== ''
+    const hasSecret = form.client_secret.trim() !== ''
+    if (hasId !== hasSecret) {
+      return '百度 OAuth 的 client_id 和 client_secret 要一起填；不想改就两个都留空'
+    }
+  }
   if (p.temp === 'required' && !form.temp_dir.trim()) return `${p.name}必须填临时目录，而且要在盘里先建好`
   return ''
 }
@@ -226,6 +243,11 @@ async function save() {
       expires_at: Number(form.expires_at) || 0,
       status: Number(form.status) || 0,
     }
+    // 附加凭据只传填了的：后端按"合并"处理，不会把已存的抹掉
+    const extra = {}
+    if (form.client_id.trim()) extra.client_id = form.client_id.trim()
+    if (form.client_secret.trim()) extra.client_secret = form.client_secret.trim()
+    if (Object.keys(extra).length) payload.extra = extra
     if (editing.value) {
       await api.updateAccount(editingId.value, payload)
       flash('已保存')
@@ -250,8 +272,14 @@ async function test(item) {
   try {
     const d = await api.testAccount(item.id)
     await reload()
-    if (d.ok) flash(`${label(item)} 连接正常`)
-    else flash(`${label(item)} 不可用：${d.reason || '未知原因'}`, true)
+    // 两套凭据分开报：百度常见的是"Cookie 好、OAuth 没权限"，
+    // 只给一句"不可用"会让人把两条线一起怀疑
+    const ext =
+      d.detail && Object.keys(d.detail).length
+        ? '（' + Object.entries(d.detail).map(([k, v]) => `${k}: ${v}`).join(' / ') + '）'
+        : ''
+    if (d.ok) flash(`${label(item)} 连接正常${ext}`)
+    else flash(`${label(item)} 不可用：${d.reason || '未知原因'}${ext}`, true)
   } catch (e) {
     flash(e.message, true)
   } finally {
@@ -294,8 +322,15 @@ function label(item) {
 function credText(item) {
   const parts = []
   if (item.hasCookie) parts.push('Cookie')
-  if (item.hasToken) parts.push('Token')
+  if (item.hasToken) parts.push(item.hasOAuth ? 'OAuth（可续期）' : 'Token（不会续期）')
   return parts.length ? parts.join(' + ') : '无凭据'
+}
+
+/** 凭据字段右侧的标签：必填 / 可选 / 二选一 */
+function reqLabel(mode) {
+  if (mode === 'required') return '必填'
+  if (mode === 'optional') return '可选'
+  return '二选一'
 }
 
 // ---- 手工验链 ----
@@ -412,7 +447,7 @@ defineExpose({ reload, openAdd })
         <div v-if="showCookie" class="acct-field">
           <label>
             Cookie
-            <span class="acct-req" :class="{ must: pf.cookie === 'required' }">{{ pf.cookie === 'required' ? '必填' : '二选一' }}</span>
+            <span class="acct-req" :class="{ must: pf.cookie === 'required' }">{{ reqLabel(pf.cookie) }}</span>
             <span v-if="editing && editingItem && editingItem.hasCookie" class="acct-keep">已存着，留空表示不改</span>
           </label>
           <textarea
@@ -427,7 +462,7 @@ defineExpose({ reload, openAdd })
         <div v-if="showToken" class="grp-grid">
           <label>refresh_token
             <span class="acct-req" :class="{ must: pf.token === 'required' }">
-              {{ pf.token === 'required' ? '必填' : '二选一' }}
+              {{ reqLabel(pf.token) }}
             </span>
             <input
               v-model="form.refresh_token"
@@ -440,6 +475,27 @@ defineExpose({ reload, openAdd })
               v-model="form.access_token"
               maxlength="2000"
               :placeholder="editing ? '留空 = 不改' : '短期凭据'"
+            />
+          </label>
+        </div>
+
+        <!-- 百度专用：OAuth 应用凭据。没有它，refresh_token 用满 30 天就续不上了 -->
+        <div v-if="pf.oauth" class="grp-grid">
+          <label>OAuth client_id
+            <span class="acct-req">可选</span>
+            <span v-if="editing && editingItem && editingItem.hasOAuth" class="acct-keep">已存着，留空表示不改</span>
+            <input
+              v-model="form.client_id"
+              maxlength="200"
+              :placeholder="editing ? '留空 = 不改' : '开放平台应用的 API Key'"
+            />
+          </label>
+          <label>OAuth client_secret
+            <input
+              v-model="form.client_secret"
+              type="password"
+              maxlength="200"
+              :placeholder="editing ? '留空 = 不改' : '开放平台应用的 Secret Key'"
             />
           </label>
         </div>
