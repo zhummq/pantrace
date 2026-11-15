@@ -1272,6 +1272,34 @@ async def admin_account_test(aid: int, request: Request):
     return {"code": 0, "data": result}
 
 
+@app.post("/api/admin/maintain/recycle", include_in_schema=False)
+async def admin_recycle(request: Request, force: bool = True):
+    """立刻跑一轮到期回收，不用等后台线程那 5 分钟。
+
+    `force=true` 会先把 retry_after 清零——排查时最常做的动作就是"我改完
+    配置了，马上试一次"，否则失败的记录还压着一小时退避，看起来像没生效。
+    返回体里带每条的失败原因，和日志里的 `src_key 前缀: 错误` 对得上。
+    """
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+
+    def _run() -> dict:
+        if force:
+            with resolver.session() as conn:
+                conn.execute(
+                    "UPDATE mirrors SET retry_after=0, last_error='' "
+                    "WHERE status='ok' AND retry_after > 0"
+                )
+        return pan.recycle_expired(resolver.session)
+
+    try:
+        result = await asyncio.to_thread(_run)
+        return {"code": 0, "data": result}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("手动回收失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"回收失败：{exc}"})
+
+
 @app.post("/api/admin/maintain/cleanup", include_in_schema=False)
 async def admin_cleanup(request: Request, cold_days: int = 0):
     """回收冷映射占用的空间。
