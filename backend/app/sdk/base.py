@@ -13,19 +13,31 @@ createTransferTask），上层被迫写五个 strategy 分支，每个分支还�
         def list_files(...) -> list[File]
         def delete(...) -> None
         # create_share / wait_task / keepalive 有默认实现，不支持就别覆盖
+        # 想参与违规巡检再加 list_shares / revoke_shares（不实现就自动跳过）
 
 然后 `registry.register(XXXClient)`。
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable
 
-from .errors import NetdiskError, TaskTimeoutError, TooLargeError, UnsupportedError
+from .errors import (
+    NetdiskError,
+    TaskTimeoutError,
+    TooLargeError,
+    UnsupportedError,
+    ViolationError,
+)
 from .http import Requester
-from .types import Account, File, ShareInfo, ShareLink, TaskResult
+from .types import Account, File, ShareBrief, ShareInfo, ShareLink, TaskResult
+
+# 收尾动作（删违规副本、清广告）都发生在适配器的公共流程里，日志统一挂这个
+# 名字，不要各 adapter 自己起的 logger——排查时要一次 grep 到全部网盘
+log = logging.getLogger("pantrace.sdk")
 
 
 class PanClient(ABC):
@@ -74,6 +86,22 @@ class PanClient(ABC):
     def create_share(self, fids: list[str], title: str, expire_hours: int = 0) -> ShareLink:
         """建分享。不支持建分享的盘（如迅雷）由上层直接用原链接兜底。"""
         raise UnsupportedError(f"{self.display or self.type} 不支持创建分享")
+
+    def list_shares(self, *, only_violated: bool = False, page: int = 1, size: int = 200) -> list[ShareBrief]:
+        """列我们账号下的分享。
+
+        **只为撤销服务**，不做的盘不要假装能列。业务层拿到 UnsupportedError
+        就当"这个盘不用巡检"跳过，不影响其他账号——所以默认实现直接抛。
+        """
+        raise UnsupportedError(f"{self.display or self.type} 不支持列出分享")
+
+    def revoke_shares(self, share_ids: list[str], *, batch: int = 50) -> dict:
+        """撤销分享（**不是**删文件）。返回 `{"ok": n, "fail": n}`。
+
+        为什么需要它：删文件只能让链接变死链，分享条目还挂在账号上；违规
+        分享挂着的代价是被限流/封号，必须从"我的分享"里撤掉。
+        """
+        raise UnsupportedError(f"{self.display or self.type} 不支持取消分享")
 
     def wait_task(self, task_id: str, timeout: float = 30.0) -> TaskResult:
         """轮询异步任务。默认实现按 0.5s 起步、1s 退避。
@@ -129,11 +157,93 @@ class PanClient(ABC):
         fids = self.transfer(info, self.account.temp_dir)
         if not fids:
             raise NetdiskError("转存没有返回文件 id")
-        link = self.create_share(fids, info.title or title or "资源分享", expire_hours)
+        try:
+            link = self.create_share(fids, info.title or title or "资源分享", expire_hours)
+        except ViolationError:
+            # 违规文件已经转存下来了，只是建不了分享。不删就是孤儿：mirrors
+            # 里没有它的行，回收任务永远扫不到，账号上白白挂着违规内容。
+            # 这条约定原本只写在 errors.py 的表里，这里把它兑现。
+            try:
+                self.delete(fids)
+                log.warning("%s 建分享被拒（违规），已删除转存副本 %s 个", self.display, len(fids))
+            except NetdiskError as exc:
+                log.error("%s 违规副本删除失败（%s 个）：%s", self.display, len(fids), exc)
+            raise
         # 把 fids 带回上层：清理任务要知道删哪些文件，重新列目录去猜代价太大
         link.fids = list(fids)
         link.size = info.total_size
         return link
+
+    # ---- 转存后收尾 ----
+
+    #: 广告扫描的请求预算。这些请求都在用户点击的链路上——为了几个广告文件
+    #: 把跳转拖到十几秒是不划算的，宁可漏删。
+    AD_SCAN_REQUESTS = 24
+    AD_SCAN_SECONDS = 8.0
+
+    def scrub_ads(
+        self,
+        fids: list[str],
+        keywords: list[str],
+        *,
+        max_depth: int = 2,
+        max_requests: int | None = None,
+        seconds: float | None = None,
+    ) -> list[str]:
+        """删掉转存内容里夹带的广告文件，返回被删的 fid。
+
+        规则和竞品一致：递归下探 `max_depth` 层，文件名命中关键词就删；目录
+        本身命中就连目录一起删，否则只删里面命中的文件。
+
+        两个刻意的限制：
+          - **只看文件名，不看路径**：路径里带上层目录名，"资源/微信"这种
+            会被误杀。
+          - **顶层文件删不到**：转存接口只回 fid 不回文件名，判断不了它是
+            不是广告。要补只能多打一次 info 接口，不值。
+        """
+        pats = [k.strip().lower() for k in (keywords or []) if k and k.strip()]
+        if not pats or not fids:
+            return []
+
+        def matched(name: str) -> bool:
+            low = (name or "").lower()
+            return any(p in low for p in pats)
+
+        budget = self.AD_SCAN_REQUESTS if max_requests is None else max(0, int(max_requests))
+        deadline = time.monotonic() + (self.AD_SCAN_SECONDS if seconds is None else float(seconds))
+        removed: list[str] = []
+
+        def walk(parent_id: str, depth: int) -> None:
+            nonlocal budget
+            if depth > max_depth or budget <= 0 or time.monotonic() > deadline:
+                return
+            budget -= 1
+            try:
+                children = self.list_files(parent_id, 1, 100)
+            except NetdiskError as exc:
+                # 列不出来通常是"这是个文件，不是目录"，属正常情况，不打日志
+                log.debug("%s 广告扫描跳过 %s：%s", self.display, parent_id, exc)
+                return
+
+            hits = [c for c in children if matched(c.name)]
+            if hits:
+                try:
+                    self.delete([c.fid for c in hits])
+                    removed.extend(c.fid for c in hits)
+                    log.info(
+                        "%s 转存内容里删掉 %s 个广告文件：%s",
+                        self.display, len(hits),
+                        "、".join(h.name[:24] for h in hits[:3]),
+                    )
+                except NetdiskError as exc:
+                    log.warning("%s 广告文件删除失败：%s", self.display, exc)
+            for child in children:
+                if child.is_dir and not matched(child.name):
+                    walk(child.fid, depth + 1)
+
+        for fid in fids:
+            walk(fid, 1)
+        return removed
 
     # ---- 小工具 ----
 

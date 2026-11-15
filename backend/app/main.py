@@ -105,8 +105,19 @@ def _start_maintenance() -> None:
 
     不用 APScheduler：一个守护线程就够。多进程部署时每个进程都会跑一遍，
     但回收是幂等的（删文件 + 改状态，重复执行只是空转），可以接受。
+
+    违规巡检也挂在这条线程上：它比回收更重（每个账号一次列表请求），
+    不值得为它单开线程，更不能塞进点击链路。
     """
+    violated_on = bool(settings.mirror_violated_auto)
+    violated_every = max(300, int(settings.mirror_violated_minutes) * 60)
+    # 启动后先等 90 秒：刚起来那会儿并发最多，别一上来就去刷网盘接口
+    next_violated = time.time() + 90
+
     def _loop() -> None:
+        # 下面要改写入睡时刻，不声明 nonlocal 会变成 _loop 的局部变量，
+        # 第一次读就 UnboundLocalError（已踩过）
+        nonlocal next_violated
         cold_tick = 0
         last_err = ""
         while True:
@@ -129,6 +140,20 @@ def _start_maintenance() -> None:
                     log.info("旧副本清理：%s 批 / %s 个文件", trash["rows"], trash["files"])
                 if trash["errors"]:
                     log.warning("旧副本清理有 %s 条失败：%s", len(trash["errors"]), trash["errors"][:3])
+
+                # 违规分享巡检：只撤"分享条目"，不碰文件（文件归上面两条管）
+                if violated_on and time.time() >= next_violated:
+                    next_violated = time.time() + violated_every
+                    v = pan.check_violated(mirrors_session=resolver.session)
+                    if v["scanned"] or v["errors"]:
+                        log.info(
+                            "违规分享巡检：%s 个账号 / 扫 %s 条 / 撤 %s 条 / 失败 %s 条 / "
+                            "窗口内跳过 %s 条 / 跳过 %s 个平台",
+                            v["accounts"], v["scanned"], v["revoked"], v["failed"],
+                            v["protected"], v["skipped"],
+                        )
+                    for item in v["errors"][:3]:
+                        log.warning("违规分享巡检失败：%s", item)
             except Exception:  # noqa: BLE001
                 log.exception("到期回收失败，5 分钟后再试")
 
@@ -164,6 +189,9 @@ if MIRROR_ON:
             cold_days=settings.mirror_cold_days,
             max_gb=settings.mirror_max_gb,
             min_interval=settings.mirror_min_interval,
+            ad_filter=settings.mirror_ad_filter,
+            ad_keywords=settings.mirror_ad_keywords,
+            ad_depth=settings.mirror_ad_depth,
         )
         # 老部署靠 MIRROR_QUARK_COOKIE 一个变量活着。表里没有夸克账号时
         # 把它导进去，避免升级后"转存突然全挂"——这是唯一的兼容路径，别删
@@ -1199,6 +1227,28 @@ async def admin_cleanup(request: Request, cold_days: int = 0):
     except Exception as exc:  # noqa: BLE001
         log.exception("空间回收失败")
         return JSONResponse(status_code=500, content={"code": 500, "msg": f"回收失败：{exc}"})
+
+
+@app.post("/api/admin/maintain/violated", include_in_schema=False)
+async def admin_violated(request: Request, dry_run: bool = False):
+    """跑一轮违规分享巡检（每账号列分享 → 批量撤销）。
+
+    `dry_run=true` 只列不撤，返回前 5 条样本。上线前先用它看一眼要撤的是
+    什么，别一上来就整批撤销——这些账号上可能还有你手工建的分享。
+    只有实现了撤销接口的网盘会参与（目前是夸克/UC），其余的算「跳过」。
+    """
+    if not MIRROR_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "点击转存已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        result = await asyncio.to_thread(
+            pan.check_violated, dry_run=dry_run, mirrors_session=resolver.session
+        )
+        return {"code": 0, "data": result}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("违规分享巡检失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"巡检失败：{exc}"})
 
 
 @app.post("/api/admin/mirror/test", include_in_schema=False)

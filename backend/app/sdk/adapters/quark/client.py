@@ -39,7 +39,7 @@ from ...errors import (
 )
 from ...http import Requester
 from ...registry import register
-from ...types import Account, File, ShareInfo, ShareLink, TaskResult
+from ...types import Account, File, ShareBrief, ShareInfo, ShareLink, TaskResult
 from .const import EXPIRE_CANDIDATES, PROFILES
 
 log = logging.getLogger("pantrace.sdk.quark")
@@ -334,6 +334,80 @@ class QuarkClient(PanClient):
             expired_at=expired_at,
             note=note,
         )
+
+    # ---- 分享管理（撤销违规分享用）----
+
+    def list_shares(
+        self, *, only_violated: bool = False, page: int = 1, size: int = 200
+    ) -> list[ShareBrief]:
+        """列账号下的分享，等价网页版「我的分享」。
+
+        参数全是网页端抓的，没有文档：
+          - `_share_type="0,1"` = 文件分享 + 文件夹分享，少了会漏
+          - `_filter="violated"` = 只回被平台判定违规的那些，别的取值别乱传，
+            传错等于不筛（会返回全部），所以这里只在 True 时**追加**它
+        单页上限实测 500，超过会被截断成默认值，所以自己封顶。
+        """
+        page_size = max(1, min(int(size), 500))
+        params: dict[str, object] = {
+            "_page": max(1, int(page)),
+            "_size": page_size,
+            "_order_field": "created_at",
+            "_order_type": "desc",
+            "_fetch_total": 1,
+            "_fetch_notify_follow": 1,
+            "_share_type": "0,1",
+        }
+        if only_violated:
+            params["_filter"] = "violated"
+        resp = self.http.get("/share/mypage/detail", params=params, action="列出分享")
+        data = self._ok(resp, "列出分享")
+
+        out: list[ShareBrief] = []
+        for entry in data.get("list") or []:
+            share_id = str(entry.get("share_id") or "")
+            if not share_id:
+                # 没有 share_id 就没法撤，混进来只会在后面白跑一次请求
+                continue
+            out.append(
+                ShareBrief(
+                    share_id=share_id,
+                    title=str(entry.get("title") or entry.get("file_name") or "")[:120],
+                    created_at=int(entry.get("created_at") or 0),
+                    # 上游对违规的标记字段名不稳定，这里只做"有就是有"的保守判断；
+                    # 真正的依据是 list_shares 被调时传了 _filter=violated
+                    violated=bool(only_violated or entry.get("violated") or entry.get("status")),
+                )
+            )
+        return out
+
+    def revoke_shares(self, share_ids: list[str], *, batch: int = 50) -> dict:
+        """取消分享。分批打，单批失败不影响后面的批。
+
+        和 `delete()` 的区别要记住：这个撤的是**分享条目**，文件还在网盘里。
+        撤销后旧链接立刻 404，但空间要另外删文件才回来。
+        """
+        ids = [str(s) for s in (share_ids or []) if s]
+        if not ids:
+            return {"ok": 0, "fail": 0}
+        step = max(1, min(int(batch), 100))
+        ok = fail = 0
+        for start in range(0, len(ids), step):
+            chunk = ids[start:start + step]
+            try:
+                resp = self.http.post(
+                    "/share/delete",
+                    json_body={"share_ids": chunk},
+                    action="取消分享",
+                )
+                self._ok(resp, "取消分享")
+                ok += len(chunk)
+            except NetdiskError as exc:
+                # 已经失效/已被别人撤掉的分享也会报错，一律算失败但要能看见原因，
+                # 否则"每轮都撤不掉那几条"会变成永远查不出来的噪音
+                fail += len(chunk)
+                log.warning("%s 取消分享失败（%s 条）：%s", self.display, len(chunk), exc)
+        return {"ok": ok, "fail": fail}
 
     # ---- 任务 ----
 

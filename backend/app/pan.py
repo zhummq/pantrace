@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -55,6 +56,12 @@ _cfg: dict = {
     # 曾经是 30，用来防"一个 100G 合集废掉一个账号"；取消后容量完全交给
     # 30 分钟窗口 + 旧副本回收来控制，账号满了就只能等回收或人工清
     "max_gb": 0.0,
+    # 转存后清掉源分享里夹带的广告文件（"加群领福利"那一类）。默认关：
+    # 关键词配错会删掉正片，先手工验一条再开
+    "ad_filter": False,
+    "ad_keywords": "",
+    # 往下探几层。1 = 只看转存内容的直接子项，2 = 再进一层
+    "ad_depth": 2,
 }
 
 # 换账号有意义的两类错。其余错换了也白换，直接抛
@@ -383,6 +390,7 @@ def transfer(url: str, pwd: str = "", platform: str = "", title: str = "") -> Sh
         try:
             link = client.mirror(url, pwd, title)
             _reset_fail(account)
+            _scrub_ads(client, link)
             link.note = (link.note + f"|account={account.id}").strip("|")
             return link
         except _SWITCHABLE as exc:
@@ -403,6 +411,35 @@ def transfer(url: str, pwd: str = "", platform: str = "", title: str = "") -> Sh
             client.close()
 
     raise last or UpstreamError("所有账号都失败了")
+
+
+def _scrub_ads(client, link) -> None:
+    """转存完顺手把源分享夹带的广告文件删掉（"加群领福利"那一类）。
+
+    失败一律吞掉：广告没清干净只是脏，转存失败是故障，两件事不能混。
+    删掉的文件必须从 `link.fids` 里摘掉——那串会进 mirrors，回收任务照着它
+    删，留着已经删过的 fid 只会让下一轮 delete 报错、连累同批正常文件。
+    """
+    if not _cfg.get("ad_filter") or not link.fids:
+        return
+    keywords = [
+        k.strip() for k in str(_cfg.get("ad_keywords") or "").split(",") if k.strip()
+    ]
+    if not keywords:
+        log.warning("广告清理已开启但关键词为空（MIRROR_AD_KEYWORDS），本次跳过")
+        return
+    try:
+        removed = client.scrub_ads(
+            link.fids, keywords, max_depth=int(_cfg.get("ad_depth") or 2)
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("广告文件清理失败（不影响转存）：%s", exc)
+        return
+    if not removed:
+        return
+    gone = set(removed)
+    link.fids = [f for f in link.fids if f not in gone]
+    log.info("广告文件已清 %s 个，分享里只剩正片", len(removed))
 
 
 def probe(account_id: int) -> dict:
@@ -604,6 +641,154 @@ def cleanup(mirrors_session, *, cold_days: int = 0) -> dict:
         "errors": errors,
         "coldDays": days,
     }
+
+
+# ---- 违规分享巡检 ----
+
+#: 每个账号最多翻几页（200/页）。4 页 = 800 条，再多说明该人工进去看了
+_VIOLATED_MAX_PAGES = 4
+#: 列表接口单页条数，跟 _collect_violated 里的"翻完了没"判断绑在一起
+_VIOLATED_PAGE_SIZE = 200
+
+
+#: 从我们自己的分享链接里反解 share_id。夸克/UC 都是 `/s/<id>`，
+#: 提取码在 query 里，不影响。百度的短链也是这个形状，够通用。
+_SHARE_ID_RE = re.compile(r"/s/([0-9A-Za-z_-]{4,})")
+
+
+def _protected_share_ids(mirrors_session) -> set[str]:
+    """当前还有映射指着、且窗口没过的分享 id —— 撤销时必须绕开。
+
+    这是这个任务唯一的硬保护。上游的 `_filter=violated` 没有文档，万一哪次
+    改版把它当成未知参数忽略掉，返回的就是账号下的**全部**分享；照着撤
+    等于把用户手上的链接当场打死。有了这张排除表，即使筛选失效，最多也只
+    撤掉那些已经没人指的（本来就是死链，撤了正好）。
+    """
+    if mirrors_session is None:
+        return set()
+    now = time.time()
+    try:
+        with mirrors_session() as conn:
+            rows = conn.execute(
+                "SELECT our_url FROM mirrors WHERE status='ok' AND expires_at > ?",
+                (now,),
+            ).fetchall()
+    except sqlite3.Error:
+        return set()
+    out: set[str] = set()
+    for row in rows:
+        match = _SHARE_ID_RE.search(str(row["our_url"] or ""))
+        if match:
+            out.add(match.group(1))
+    return out
+
+
+def _collect_violated(client, max_pages: int = _VIOLATED_MAX_PAGES) -> list[str]:
+    """把一个账号的违规分享 id 全捞出来。"""
+    ids: list[str] = []
+    for page in range(1, max(1, int(max_pages)) + 1):
+        batch = client.list_shares(
+            only_violated=True, page=page, size=_VIOLATED_PAGE_SIZE
+        )
+        ids.extend(s.share_id for s in batch if s.share_id)
+        if len(batch) < _VIOLATED_PAGE_SIZE:
+            break
+    return ids
+
+
+def check_violated(
+    *, dry_run: bool = False, max_pages: int = _VIOLATED_MAX_PAGES,
+    mirrors_session=None,
+) -> dict:
+    """扫每个账号下被平台判违规的分享，批量撤销。
+
+    为什么单独做这件事：我们转存的是别人的东西，被判违规的分享挂在账号上，
+    代价是限流甚至封号。**删文件撤不掉它**——分享条目还在，这是"回收"和
+    "撤销"的根本区别。竞品也单独跑这个任务（每 5 分钟，且只做夸克）。
+
+    不需要 mirrors 里有 share_id：扫的是**账号**不是映射，历史数据不用补。
+    但 mirrors 要用来做排除表（`mirrors_session` 传 resolver.session）：
+    窗口内还在用的分享绝不撤，详见 _protected_share_ids。
+
+    没实现撤销接口的网盘（百度/迅雷/光鸭/139）抛 UnsupportedError，静默跳过，
+    不拖累其他账号。dry_run=True 只列不撤，上线前用它确认"要撤的是哪些"。
+    """
+    if not _inited:
+        return {
+            "accounts": 0, "skipped": 0, "scanned": 0, "revoked": 0,
+            "failed": 0, "protected": 0, "errors": ["pan 未初始化"], "samples": [],
+        }
+
+    stats: dict = {
+        "accounts": 0, "skipped": 0, "scanned": 0, "revoked": 0,
+        "failed": 0, "protected": 0, "errors": [], "samples": [],
+    }
+    protected = _protected_share_ids(mirrors_session)
+
+    for account in [a for a in list_accounts() if a.enabled]:
+        if not (account.cookie or account.access_token or account.refresh_token):
+            # 半配的账号（后台建了但没填凭据）每轮都建客户端只会刷一堆
+            # ConfigError，巡检本身对它也没意义
+            stats["skipped"] += 1
+            continue
+        try:
+            client = registry.create(
+                account.type,
+                account,
+                timeout=float(_cfg["timeout"]),
+                on_cookie=_credential_hook(account),
+            )
+        except UnsupportedError:
+            stats["skipped"] += 1
+            continue
+        except NetdiskError as exc:
+            stats["errors"].append(f"{account.type}#{account.id} 建客户端失败：{exc}")
+            continue
+
+        try:
+            try:
+                ids = _collect_violated(client, max_pages)
+            except UnsupportedError:
+                # 这个盘没有"列分享"接口，不是错误，是没做
+                stats["skipped"] += 1
+                continue
+
+            if not ids:
+                continue
+
+            stats["accounts"] += 1
+            stats["scanned"] += len(ids)
+
+            # 先摘掉还在用的：这一步不让任何配置背锅
+            keep = [sid for sid in ids if sid in protected]
+            ids = [sid for sid in ids if sid not in protected]
+            if keep:
+                stats["protected"] += len(keep)
+                log.info(
+                    "%s#%s 有 %s 条分享仍在 30 分钟窗口内，跳过不撤",
+                    account.type, account.id, len(keep),
+                )
+            if not ids:
+                continue
+
+            if dry_run:
+                stats["samples"].extend(
+                    f"{account.type}#{account.id}:{sid}" for sid in ids[:5]
+                )
+                continue
+
+            result = client.revoke_shares(ids)
+            stats["revoked"] += int(result.get("ok") or 0)
+            stats["failed"] += int(result.get("fail") or 0)
+        except NetdiskError as exc:
+            stats["errors"].append(f"{account.type}#{account.id}：{exc}")
+        except Exception as exc:  # noqa: BLE001
+            # 一个账号的意外不该让整轮巡检停在半路
+            stats["errors"].append(f"{account.type}#{account.id}：{exc.__class__.__name__}")
+        finally:
+            client.close()
+
+    return stats
 
 
 def _parse_fids(raw: object) -> list[str]:

@@ -78,6 +78,20 @@ class ShareLink:
 
 
 @dataclass(slots=True)
+class ShareBrief:
+    """我们账号下的一条分享（列"我的分享"用）。
+
+    只为批量撤销服务：`share_id` 是撤销时要传的键，其余字段都是给日志和
+    后台看的，别指望它们齐全——各网盘返回的字段名和有无都不一样。
+    """
+
+    share_id: str
+    title: str = ""
+    created_at: int = 0
+    violated: bool = False
+
+
+@dataclass(slots=True)
 class Account:
     """一个网盘账号。cookie 与 token 字段按网盘类型取用。
 
