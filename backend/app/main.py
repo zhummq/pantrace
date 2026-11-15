@@ -214,7 +214,6 @@ if MIRROR_ON:
                 "点击转存已启用，但没有任何网盘账号——所有点击会回退到上游原始链接。"
                 "在 /admin 的「网盘账号」里加一个才会真正生效。"
             )
-        _start_maintenance()
     except Exception as exc:  # noqa: BLE001
         MIRROR_ON = False
         log.error("点击转存初始化失败，已关闭：%s", exc)
@@ -238,6 +237,12 @@ if GROUP_ON:
         log.error("群入口初始化失败，已关闭：%s", exc)
 else:
     log.info("群入口已关闭（GROUP_ENABLED=false）")
+
+# 维护线程必须最后起。它一启动就去开连接做回收，和 group.init 抢同一个
+# SQLite：WAL 初始化撞上并发写，会偶发 "attempt to write a readonly database"，
+# 结果是群入口被静默关掉（实测两次启动命中一次）。所有建表/连接都做完再放它出来。
+if MIRROR_ON:
+    _start_maintenance()
 
 
 def client_ip(request: Request) -> str:
@@ -506,6 +511,21 @@ async def platforms():
     return {"code": 0, "platforms": PLATFORMS}
 
 
+def _has_mirror_account() -> bool:
+    """有没有启用中的转存账号。
+
+    别改回 `bool(settings.mirror_quark_cookie)`：账号已经搬进 pan_accounts，
+    只有第一次启动会从旧变量迁移一次。留着那个判断，后台明明加了百度账号，
+    health 还是报 false——排查时会被这条假信息带去翻 .env，白花半小时。
+    """
+    if not MIRROR_ON or not pan.is_ready():
+        return False
+    try:
+        return int(pan.summary().get("enabled") or 0) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @app.get("/api/health")
 async def health():
     return {
@@ -520,7 +540,7 @@ async def health():
         "analytics": ANALYTICS_ON,
         "feedback": FEEDBACK_ON,
         "mirror": MIRROR_ON,
-        "mirrorAccount": bool(settings.mirror_quark_cookie),
+        "mirrorAccount": _has_mirror_account(),
     }
 
 
