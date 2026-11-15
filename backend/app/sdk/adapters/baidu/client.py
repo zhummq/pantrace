@@ -543,6 +543,17 @@ class BaiduClient(PanClient):
                 # token 过期/权限没开/接口抖动，退回 cookie 那条主链路，
                 # 不能因为"官方通道暂时不通"就整条回收停摆
                 log.info("OAuth 通道删除失败（%s），退回网页端", exc)
+        else:
+            # 没走 OAuth 的原因必须打出来。之前只看到 132，分不清是"token 没
+            # 写进库"还是"应用没权限"，只能隔着日志猜——这一步不该靠猜。
+            log.warning(
+                "账号 %s 未启用 OAuth 通道（token=%s refresh=%s client_id=%s），"
+                "本次走网页端删除",
+                self.account.id,
+                bool(self.account.access_token),
+                bool(self.account.refresh_token),
+                bool(str(self.account.extra.get("client_id") or "").strip()),
+            )
         try:
             resp = self.http.post(
                 "/api/filemanager",
