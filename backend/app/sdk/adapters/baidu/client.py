@@ -97,6 +97,8 @@ class BaiduClient(PanClient):
         self._bdstoken = ""
         self._bdstoken_at = 0.0
         self._uk = ""
+        #: 已经确认存在的目录，一次会话里只查一遍
+        self._ensured_dirs: set[str] = set()
         super().__init__(account, timeout=timeout, on_cookie=on_cookie)
         # OAuth 那条线：只管盘内文件管理（列目录/元信息/删除/容量）。
         # 它和转存用的 cookie 是两套凭据，别指望 token 能转存——百度网页端
@@ -303,10 +305,64 @@ class BaiduClient(PanClient):
             },
         )
 
+    def _dir_exists(self, path: str) -> bool:
+        """目录在不在。filemetas 对不存在的路径回 errno=12，那不是异常，是答案。"""
+        resp = self.http.get(
+            "/api/filemetas",
+            params={
+                "target": json.dumps([path], ensure_ascii=False, separators=(",", ":")),
+                "dlink": 0,
+                "web": 1,
+                "bdstoken": self.bdstoken(),
+            },
+            action="查目录",
+        )
+        if int(resp.get("errno") or 0) != 0:
+            return False
+        info = resp.get("info") or []
+        return bool(info) and int(info[0].get("isdir") or 0) == 1
+
+    def _ensure_dir(self, path: str) -> None:
+        """转存目标目录不存在就建出来，逐级建。
+
+        百度 /api/create **不是幂等的**：路径已存在时再建一次，它会给你一个
+        "pantrace_20261115_180205" 这样的新目录（实测）。所以每级都必须先查
+        再建，绝不能图省事直接 create。
+
+        原先这里什么都不做，全靠用户自己去网页端把临时目录建好；没建就直接
+        转存，百度回一句「转存路径不存在（code=2）」，用户看着像配置错了。
+        目录该由我们负责。
+        """
+        path = "/" + path.strip("/")
+        if path == "/" or path in self._ensured_dirs:
+            return
+        segments = [s for s in path.split("/") if s]
+        for depth in range(1, len(segments) + 1):
+            sub = "/" + "/".join(segments[:depth])
+            if self._dir_exists(sub):
+                continue
+            resp = self.http.post(
+                "/api/create",
+                params={"bdstoken": self.bdstoken(), "clienttype": 0, "web": 1},
+                data={"path": sub, "isdir": 1, "block_list": "[]"},
+                action="建转存目录",
+            )
+            self._ok(resp, "建转存目录")
+            created = str(resp.get("path") or resp.get("name") or "")
+            if created and created != sub:
+                # create 撞名会改名，说明有人抢在前面建了同名目录，或者我们的
+                # 存在性判断过期了。不纠正的话文件会落进意料之外的目录。
+                raise UpstreamError(
+                    f"建目录时被改名（{sub} → {created}），转存已中止", raw=resp
+                )
+        self._ensured_dirs.add(path)
+
     def transfer(self, info: ShareInfo, to_dir: str = "") -> list[str]:
         path = (to_dir or "/").rstrip("/") or "/"
         if not path.startswith("/"):
             path = "/" + path
+        # 目标目录由后台「临时目录」配置来，写 pantrace 就该有 /pantrace
+        self._ensure_dir(path)
         fsids = [int(f.fid) for f in info.files if str(f.fid).isdigit()]
         if not fsids:
             raise ShareInvalidError("分享里没有可转存的文件")
