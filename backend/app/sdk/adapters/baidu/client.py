@@ -26,6 +26,8 @@ from ...errors import (
     ConfigError,
     NetdiskError,
     NotFoundError,
+    PasscodeRequiredError,
+    PasscodeWrongError,
     QuotaExceededError,
     ShareExpiredError,
     ShareInvalidError,
@@ -59,6 +61,9 @@ ERRNO_MAP: dict[object, type[NetdiskError]] = {
     113: ShareInvalidError,
     115: ShareInvalidError,
     130: NotFoundError,
+    # 分享不存在/已被删除。必须是负数：百度对分享侧用 -130，正数 130 是"文件不存在"，
+    # 两者混在一起时，一条死链会被当成我们账号的文件问题，排查方向整个跑偏
+    -130: ShareInvalidError,
     132: QuotaExceededError,
     31066: QuotaExceededError,
     9007: ViolationError,
@@ -70,6 +75,16 @@ ERRTYPE_MAP: dict[object, type[NetdiskError]] = {
     1: ShareExpiredError,   # 分享已被取消
     3: ViolationError,      # 侵权/色情/反动，无法访问
 }
+
+#: 新版分享接口（wxlist）用字符串 errtype，"mis_105" = 分享已删除/被取消。
+#: 实测死链返回 `{errno:-130, errtype:"mis_105"}`；老代码只认整数 key，
+#: 于是这类响应掉进 "上游失败（code=-130）"，看不出是链接废了
+_ERRTYPE_PREFIX = "mis_"
+
+#: "mispwd-9" = 提取码缺失**或**错误。百度对这两种情况的返回一模一样：
+#: 空码和错码都是 `{errno:-130, errtype:"mispwd-9", data:{list:[]}}`
+#: （实测，别指望从响应里分辨），只能由调用方按"有没有传码"来定。
+_ERRTYPE_MISPWD = "mispwd"
 
 
 @register
@@ -123,10 +138,22 @@ class BaiduClient(PanClient):
         message = str(payload.get("show_msg") or payload.get("errmsg") or "").strip()
         # errtype 优先：分享失效的三种原因只有它说得清
         errtype = payload.get("errtype")
+        if isinstance(errtype, str) and errtype.startswith(_ERRTYPE_MISPWD):
+            # 缺码还是错码，这一层判不了（百度两种回得一模一样），先按"缺码"抛，
+            # share_info 知道调用方有没有传码，再改判成"码不对"。
+            raise PasscodeRequiredError(
+                "这条分享需要提取码", code=errno, raw=payload
+            )
         if errtype is not None:
             exc = ERRTYPE_MAP.get(errtype)
             if exc is not None:
                 raise exc(message or "分享不可访问", code=errno, raw=payload)
+            if isinstance(errtype, str) and errtype.startswith(_ERRTYPE_PREFIX):
+                raise ShareInvalidError(
+                    f"分享已失效（{errtype}）：可能被删除、取消或链接本身不对",
+                    code=errno,
+                    raw=payload,
+                )
         raise map_error(ERRNO_MAP, errno, message or f"{action}失败", raw=payload)
 
     def _on_token(self, info: dict) -> None:
@@ -227,10 +254,26 @@ class BaiduClient(PanClient):
             },
             action="读取百度分享",
         )
-        body = self._ok(resp, "读取百度分享")
+        try:
+            body = self._ok(resp, "读取百度分享")
+        except PasscodeRequiredError as exc:
+            # 传了码还退回来，那就是码不对。这条分享本身是活的——别让上层
+            # 把它当死链下架，也别把账算到账号头上。
+            if passcode:
+                raise PasscodeWrongError(
+                    f"提取码 {passcode} 不对，分享本身还在", code=exc.code, raw=exc.raw
+                ) from exc
+            raise
+        # wxlist 的成功响应把业务字段包在 data 里：
+        #   {"errno":0, "data":{"list":[...], "title":..., "uk":..., "shareid":..., "seckey":...}}
+        # 老代码直接在顶层取 list，拿到的是 None——于是**每一条正常的分享**都被判成
+        # "分享里没有文件"，后台手工验链全是红的。这里是实测踩出来的，别再改回顶层。
+        if isinstance(body.get("data"), dict):
+            body = body["data"]
         entries = body.get("list") or []
         if not entries:
-            raise ShareInvalidError("分享里没有文件")
+            # errno=0 但没文件：提取码不对时百度也这么回（不是每个接口都肯给错误码）
+            raise ShareInvalidError("分享里没有文件（提取码可能不对，或分享已被清空）")
 
         files: list[File] = []
         total = 0
@@ -282,6 +325,11 @@ class BaiduClient(PanClient):
             action="转存",
         )
         body = self._ok(resp, "转存")
+        # 百度分享侧（channel=weixin）习惯把业务字段包一层 data。顶层找不到
+        # extra/task_id 就往 data 里再找一次——否则会误报"转存没有返回任务号"，
+        # 而接口其实成功、文件也已经进盘了，只是我们没看见
+        if not body.get("extra") and not body.get("task_id") and isinstance(body.get("data"), dict):
+            body = body["data"]
 
         # 异步转存：有 extra.list 说明已经完成，否则要等 taskquery
         extra = body.get("extra") or {}
@@ -291,12 +339,40 @@ class BaiduClient(PanClient):
             if not task_id:
                 raise UpstreamError("转存没有返回任务号", raw=body)
             pairs = self.wait_task(task_id, timeout=max(30.0, self.timeout * 2)).fids
-            return [str(p) for p in pairs]
+            return [_target_path(p) for p in pairs]
 
-        return [str(item.get("to") or "") for item in pairs if item.get("to")]
+        return [_target_path(item.get("to")) for item in pairs if item.get("to")]
 
     def create_share(self, fids: list[str], title: str, expire_hours: int = 0) -> ShareLink:
         period = 0 if not expire_hours else (1 if expire_hours <= 24 else 7)
+        # 这里收的可能是 fs_id，也可能是 transfer 返回的**路径**。
+        # /share/set 两个字段都认：fid_list 收数字 id，path_list 收绝对路径，
+        # 但绝不能不分类就往 fid_list 里塞——isdigit() 一过滤就成了空数组，
+        # 百度只会回一句 "path_list or fid_list param need"，看不出真正原因。
+        fid_ids: list[int] = []
+        paths: list[str] = []
+        for item in fids:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if text.isdigit():
+                fid_ids.append(int(text))
+            else:
+                paths.append(text if text.startswith("/") else "/" + text)
+        form: dict[str, object] = {
+            "period": period,
+            "pwd": DEFAULT_PWD,
+            "eflag_disable": "true",
+            "channel_list": "[]",
+            "schannel": 4,
+        }
+        if fid_ids:
+            form["fid_list"] = json.dumps(fid_ids)
+        if paths:
+            form["path_list"] = json.dumps(paths)
+        if not fid_ids and not paths:
+            raise UpstreamError("没有可分享的文件（转存没有返回目标路径）")
+
         resp = self.http.post(
             "/share/set",
             params={
@@ -306,23 +382,26 @@ class BaiduClient(PanClient):
                 "web": 1,
                 **_query_auth_safe(self),
             },
-            data={
-                "period": period,
-                "pwd": DEFAULT_PWD,
-                "eflag_disable": "true",
-                "channel_list": "[]",
-                "schannel": 4,
-                "fid_list": json.dumps([int(f) for f in fids if str(f).isdigit()]),
-            },
+            data=form,
             action="创建分享",
         )
         body = self._ok(resp, "创建分享")
-        shorturl = str(body.get("shorturl") or "")
+        if not body.get("shorturl") and isinstance(body.get("data"), dict):
+            body = body["data"]
+        shorturl = str(body.get("shorturl") or body.get("link") or "").strip()
         if not shorturl:
             raise UpstreamError("创建分享没有返回 shorturl", raw=body)
+        # 现在的 /share/set 的 shorturl 回的是**完整 URL**
+        # （"https://pan.baidu.com/s/1F9Uxu_..."），老版本只回尾段。
+        # 一律拼域名就会得到 "https://pan.baidu.com/s/https://..."，
+        # 这个链接自己都打不开，回读还会报 code=2。
+        base = shorturl if shorturl.startswith("http") else f"{SHARE_HOST}{shorturl}"
+        sep = "&" if "?" in base else "?"
+        url = base if "pwd=" in base else f"{base}{sep}pwd={DEFAULT_PWD}"
+        share_id = base.split("?")[0].rstrip("/").rsplit("/", 1)[-1]
         return ShareLink(
-            url=f"{SHARE_HOST}{shorturl}?pwd={DEFAULT_PWD}",
-            share_id=shorturl,
+            url=url,
+            share_id=share_id,
             passcode=DEFAULT_PWD,
             expired_at=int(body.get("expiretime") or 0) * 1000,
         )
@@ -336,6 +415,8 @@ class BaiduClient(PanClient):
             action="查询转存任务",
         )
         body = self._ok(resp, "查询转存任务")
+        if not body.get("status") and isinstance(body.get("data"), dict):
+            body = body["data"]
         status = str(body.get("status") or "")
         done = status == "success"
         failed = status in ("failed", "canceled")
@@ -467,3 +548,21 @@ def _query_auth_safe(client: BaiduClient) -> dict:
         return client._query_auth()
     except NetdiskError:
         return {}
+
+
+def _target_path(value: object) -> str:
+    """转存结果里的 `to` 是**目标路径**，不是 fs_id。
+
+    实测：转存目录分享后 `extra.list[].to == "/复仇者联盟4：终局之战 (2019)(1)"`。
+    老代码把它当 fs_id 往下传，`create_share` 里 `isdigit()` 一过滤就空了，
+    百度回 "path_list or fid_list param need"——错在转存之后，看着却像参数没拼对。
+
+    统一成"相对根目录、不带前导斜杠"：`delete()` 那边是 `f"/{f}"`，
+    mirrors 里存的也是这一形态。万一是数字（fs_id），原样留着给 fid_list 用。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return text
+    return text.lstrip("/") or "/"

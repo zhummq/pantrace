@@ -32,6 +32,8 @@ from .sdk.errors import (
     AuthError,
     ConfigError,
     NetdiskError,
+    PasscodeRequiredError,
+    PasscodeWrongError,
     QuotaExceededError,
     TooLargeError,
     UnsupportedError,
@@ -401,6 +403,10 @@ def transfer(url: str, pwd: str = "", platform: str = "", title: str = "") -> Sh
             continue
         except (ViolationError, UnsupportedError, TooLargeError):
             # 这三类换账号也没用：资源本身的问题，不是账号的问题
+            raise
+        except (PasscodeRequiredError, PasscodeWrongError):
+            # 缺码/错码也不是账号的问题：换账号重试只会把每个账号的 fail_count
+            # 都刷一遍，最后仍然失败，还把好账号标记成"有问题"
             raise
         except NetdiskError as exc:
             # 分享本身的错换账号也没用，但先记一笔，方便看是哪个账号在出问题

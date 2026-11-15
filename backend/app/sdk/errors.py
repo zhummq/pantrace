@@ -76,10 +76,14 @@ class PasscodeRequiredError(ShareInvalidError):
     """需要提取码但上游没给。用户的问题，不是资源的问题。"""
 
     kind = "passcode_required"
+    # 继承 ShareInvalidError 会把 share_bad 一起继承过来，那就等于"该下架"——
+    # 缺个码就把资源判死，是最贵的一种误判。
+    share_bad = False
 
 
 class PasscodeWrongError(ShareInvalidError):
     kind = "passcode_wrong"
+    share_bad = False
 
 
 class ViolationError(ShareInvalidError):
