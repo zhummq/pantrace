@@ -62,6 +62,7 @@ class XunleiClient(PanClient):
         self._expires_at = account.expires_at or 0
         self._captchas: dict[str, tuple[str, float]] = {}
         self._temp_dir_id = ""
+        self._user_id = ""
         super().__init__(account, timeout=timeout, on_cookie=on_cookie)
 
     def _build_requester(self) -> Requester:
@@ -104,6 +105,9 @@ class XunleiClient(PanClient):
             raise AuthError("迅雷 token 刷新失败，需要重新授权")
         self._access_token = token
         self._expires_at = now + int(resp.get("expires_in") or 3600) - 60
+        # 写操作（如建目录）的 captcha 会校验 meta.user_id，传 "0" 会被
+        # captcha_invalid 拒掉（实测）；读操作不挑。刷新响应里有真实 user_id
+        self._user_id = str(resp.get("user_id") or resp.get("sub") or "")
         self.account.access_token = token
         if refresh:
             self.account.refresh_token = refresh
@@ -130,7 +134,7 @@ class XunleiClient(PanClient):
                     "client_version": "1.45.0",
                     "captcha_sign": "1.fe2108ad808a74c9ac0243309242726c",
                     "timestamp": "1645241033384",
-                    "user_id": "0",
+                    "user_id": self._user_id or "0",
                 },
             },
             action="取验证令牌",
@@ -386,7 +390,14 @@ class XunleiClient(PanClient):
     def delete(self, fids: list[str]) -> None:
         if not fids:
             return
-        self._call("DELETE", "/drive/v1/files", query={"file_ids": ",".join(fids)}, action="删除文件")
+        # DELETE /drive/v1/files 实测 501 unimplemented（迅雷根本没实现这个方法）。
+        # 网页端和竞品都走 POST /drive/v1/files:batchDelete，换过来回收任务才能删掉文件
+        self._call(
+            "POST",
+            "/drive/v1/files:batchDelete",
+            body={"ids": fids, "space": ""},
+            action="删除文件",
+        )
 
     def probe(self) -> bool:
         try:
