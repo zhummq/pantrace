@@ -61,6 +61,7 @@ class XunleiClient(PanClient):
         self._access_token = account.access_token or ""
         self._expires_at = account.expires_at or 0
         self._captchas: dict[str, tuple[str, float]] = {}
+        self._temp_dir_id = ""
         super().__init__(account, timeout=timeout, on_cookie=on_cookie)
 
     def _build_requester(self) -> Requester:
@@ -143,8 +144,21 @@ class XunleiClient(PanClient):
         self._captchas[action] = (token, time.time() + int(resp.get("expires_in") or 300) - 10)
         return token
 
-    def _call(self, method: str, path: str, *, query: dict | None = None, body: dict | None = None, action: str = "") -> dict:
-        """带 Authorization + x-captcha-token 的业务请求。"""
+    def _call(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict | None = None,
+        body: dict | None = None,
+        action: str = "",
+        gone_error: type[NetdiskError] | None = None,
+    ) -> dict:
+        """带 Authorization + x-captcha-token 的业务请求。
+
+        gone_error：分享侧 404/410 该抛什么。不传的话 http 层只能报裸
+        "HTTP 404"，后台验链看不出是源链接死了还是账号挂了。
+        """
         action_key = f"{method.upper()}:{path}"
         headers = {
             "Authorization": f"Bearer {self._token()}",
@@ -157,7 +171,64 @@ class XunleiClient(PanClient):
             json_body=body,
             headers=headers,
             action=action or path,
+            gone_error=gone_error,
         )
+
+    # ---- 转存目标目录 ----
+
+    def _ensure_transfer_dir(self) -> str:
+        """解析转存目标目录的 parent_id。
+
+        迅雷 restore 的 parent_id **不能传空串**：网页客户端和竞品实际都传
+        真实目录 ID（竞品的 tempDir 由管理员手填），空串会被接口 404 拒掉，
+        表现成一句看不出原因的"转存失败：HTTP 404"。
+
+        账号没配 temp_dir 时，找根目录下的 pantrace 目录（与百度盘同名约定），
+        没有就建一个。目录该由我们负责，不能指望用户去网页端手工建。
+        """
+        if self.account.temp_dir:
+            return self.account.temp_dir
+        if self._temp_dir_id:
+            return self._temp_dir_id
+        resp = self._call(
+            "GET",
+            "/drive/v1/files",
+            query={
+                "parent_id": "",
+                "page_token": "",
+                "limit": 200,
+                "thumbnail_size": "SIZE_SMALL",
+                "filters": json.dumps(
+                    {"phase": {"eq": "PHASE_TYPE_COMPLETE"}, "trashed": {"eq": False}}
+                ),
+            },
+            action="找转存目录",
+        )
+        for item in resp.get("files") or []:
+            fid = str(item.get("id") or "")
+            if (
+                fid
+                and (item.get("kind") == "drive#folder" or item.get("is_dir"))
+                and str(item.get("name") or "") == "pantrace"
+            ):
+                self._temp_dir_id = fid
+                return fid
+        resp = self._call(
+            "POST",
+            "/drive/v1/files",
+            body={
+                "kind": "drive#folder",
+                "name": "pantrace",
+                "parent_id": "",
+                "space": "",
+            },
+            action="建转存目录",
+        )
+        fid = str((resp.get("file") or {}).get("id") or "")
+        if not fid:
+            raise UpstreamError("迅雷建转存目录没返回目录 id", raw=resp)
+        self._temp_dir_id = fid
+        return fid
 
     # ---- 分享侧 ----
 
@@ -182,6 +253,7 @@ class XunleiClient(PanClient):
                 "thumbnail_size": "SIZE_SMALL",
             },
             action="读取迅雷分享",
+            gone_error=ShareInvalidError,
         )
         status = str(resp.get("share_status") or "OK")
         if status != "OK":
@@ -221,7 +293,8 @@ class XunleiClient(PanClient):
         )
 
     def transfer(self, info: ShareInfo, to_dir: str = "") -> list[str]:
-        parent = to_dir or ""
+        # parent_id 空串会被 restore 404 拒掉，必须解析成真实目录 ID
+        parent = to_dir or self._ensure_transfer_dir()
         resp = self._call(
             "POST",
             "/drive/v1/share/restore",
@@ -234,6 +307,9 @@ class XunleiClient(PanClient):
                 "file_ids": [f.fid for f in info.files],
             },
             action="转存",
+            # 404 多数是"分享还挂着、文件已被删/违规屏蔽"，映射成源链接失效，
+            # 别让后台验链报一句裸 HTTP 404 看不出该修哪头
+            gone_error=ShareInvalidError,
         )
         task_id = str(resp.get("restore_task_id") or "")
         if not task_id:
