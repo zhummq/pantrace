@@ -333,14 +333,38 @@ def summary(days: int = 7) -> dict:
             (start,),
         ).fetchall()
         # 搜不到的词：成功返回但 0 条。这是词库运营最有用的一个数。
-        zero_keywords = conn.execute(
-            """SELECT query AS q, COUNT(*) AS n
-               FROM events
-               WHERE kind='search' AND ts >= ? AND query<>''
-                     AND ok=1 AND result_count=0 AND bot=0
-               GROUP BY query ORDER BY n DESC, MAX(ts) DESC LIMIT 20""",
-            (start,),
-        ).fetchall()
+        #
+        # 两个口径细节：
+        # - 只算首屏（meta.page=1）。翻到越界页码也返回空 items，那是分页边界不是
+        #   缺资源，混进词表会把真需求冲淡。老数据 meta 为空，按首屏算，宁可多记。
+        # - 同时给 total（这个词被搜的总次数）。只有 n 看不出"偶尔搜不到"和
+        #   "从来搜不到"的区别，补资源的优先级完全不一样。
+        _zero_sql = """
+            SELECT query AS q,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN ok=1 AND result_count=0 THEN 1 ELSE 0 END) AS n,
+                   MAX(CASE WHEN ok=1 AND result_count=0 THEN ts END) AS last_ts,
+                   GROUP_CONCAT(DISTINCT CASE WHEN ok=1 AND result_count=0
+                                              THEN NULLIF(platform, '') END) AS platforms
+              FROM events
+             WHERE kind='search' AND ts >= ? AND query<>'' AND bot=0
+                   {page_filter}
+             GROUP BY query
+            HAVING n > 0
+             ORDER BY n DESC, last_ts DESC LIMIT 50
+        """
+        try:
+            zero_keywords = conn.execute(
+                _zero_sql.format(
+                    page_filter="AND (json_extract(meta,'$.page')=1 OR meta='')"
+                ),
+                (start,),
+            ).fetchall()
+        except sqlite3.Error:
+            # SQLite 没编进 JSON1 时（少见）退回不带分页过滤的口径，别让面板整块挂掉
+            zero_keywords = conn.execute(
+                _zero_sql.format(page_filter=""), (start,)
+            ).fetchall()
         platforms = conn.execute(
             """SELECT platform AS key, COUNT(*) AS n
                FROM events
@@ -438,7 +462,16 @@ def summary(days: int = 7) -> dict:
             ),
         },
         "keywords": [{"q": r["q"], "n": r["n"]} for r in keywords],
-        "zero_keywords": [{"q": r["q"], "n": r["n"]} for r in zero_keywords],
+        "zero_keywords": [
+            {
+                "q": r["q"],
+                "n": r["n"],
+                "total": r["total"],
+                "last_ts": int(r["last_ts"] or 0),
+                "platforms": r["platforms"] or "",
+            }
+            for r in zero_keywords
+        ],
         "platforms": [{"key": r["key"], "n": r["n"]} for r in platforms],
         "targets": [{"t": r["t"], "n": r["n"]} for r in targets],
         "referers": [{"r": r["r"], "n": r["n"]} for r in referers],

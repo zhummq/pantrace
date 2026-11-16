@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import Gate from './components/Gate.vue'
 import StatGrid from './components/StatGrid.vue'
 import FeedbackPanel from './components/FeedbackPanel.vue'
+import ZeroPanel from './components/ZeroPanel.vue'
 import AccountsPanel from './components/AccountsPanel.vue'
 import GroupPanel from './components/GroupPanel.vue'
 import ClicksPanel from './components/ClicksPanel.vue'
@@ -144,6 +145,7 @@ onUnmounted(() => {
       <StatGrid :items="overviewStats" size="big" />
       <StatGrid :items="subStats" />
 
+      <ZeroPanel :data="data" />
       <FeedbackPanel ref="feedbackPanel" :days="days" />
       <AccountsPanel ref="accountsPanel" />
       <GroupPanel ref="groupPanel" />

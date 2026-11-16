@@ -24,7 +24,7 @@ frontend/
   src/admin/          看板（Vue 应用，独立入口）
     App.vue           壳：口令门、区间切换、60s 自动刷新
     api.js            统一请求层（口令、401、错误处理）
-    components/       Panel/StatGrid/BarList/Pager + 六个业务面板（含「网盘账号」）
+    components/       Panel/StatGrid/BarList/Pager + 业务面板（搜不到的词、反馈、网盘账号、群入口、点击记录）
   admin.html          看板的 Vite 入口（与 index.html 一起构建）
   src/api.js          接口封装
   vite.config.js      dev 时 /api、/uploads 代理到 8000；build 双入口
