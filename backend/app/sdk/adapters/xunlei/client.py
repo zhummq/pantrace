@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 
 from ...base import PanClient
@@ -51,6 +52,9 @@ SHARE_STATUS_MAP: dict[str, type[NetdiskError]] = {
     "PROHIBITED": ViolationError,
 }
 
+# 迅雷的资源 ID 长这样：VP6UOc2WqXgWNUa17d0f_bI8A1（V 开头 20-30 位）
+_DIR_ID_RE = re.compile(r"V[A-Za-z0-9_-]{20,30}")
+
 
 @register
 class XunleiClient(PanClient):
@@ -62,6 +66,7 @@ class XunleiClient(PanClient):
         self._expires_at = account.expires_at or 0
         self._captchas: dict[str, tuple[str, float]] = {}
         self._temp_dir_id = ""
+        self._temp_dir_name = ""
         self._user_id = ""
         super().__init__(account, timeout=timeout, on_cookie=on_cookie)
 
@@ -180,19 +185,22 @@ class XunleiClient(PanClient):
 
     # ---- 转存目标目录 ----
 
-    def _ensure_transfer_dir(self) -> str:
-        """解析转存目标目录的 parent_id。
+    def _resolve_transfer_parent(self, to_dir: str = "") -> str:
+        """解析 restore 的 parent_id，必须落到真实目录 ID 上。
 
-        迅雷 restore 的 parent_id **不能传空串**：网页客户端和竞品实际都传
-        真实目录 ID（竞品的 tempDir 由管理员手填），空串会被接口 404 拒掉，
-        表现成一句看不出原因的"转存失败：HTTP 404"。
+        后台「临时目录」填名字（如 pantrace）是最自然的写法——百度那边填的
+        就是路径。但迅雷的 restore 把 parent_id 当目录 ID 用，名字不是 ID，
+        接口直接 404，报错文案还长得和"源链接失效"一模一样，排查会完全走偏
+        （实测踩过：本地复现 parent_id='pantrace' → 404，换成真实 ID → 200）。
 
-        账号没配 temp_dir 时，找根目录下的 pantrace 目录（与百度盘同名约定），
-        没有就建一个。目录该由我们负责，不能指望用户去网页端手工建。
+        统一收口：配置长得像 ID 就直接用；否则当目录名，找根目录下同名目录，
+        没有就建；都空则用默认名 pantrace。
         """
-        if self.account.temp_dir:
-            return self.account.temp_dir
-        if self._temp_dir_id:
+        conf = (to_dir or self.account.temp_dir or "").strip().strip("/")
+        if conf and _DIR_ID_RE.fullmatch(conf):
+            return conf
+        name = conf or "pantrace"
+        if self._temp_dir_id and self._temp_dir_name == name:
             return self._temp_dir_id
         resp = self._call(
             "GET",
@@ -213,25 +221,20 @@ class XunleiClient(PanClient):
             if (
                 fid
                 and (item.get("kind") == "drive#folder" or item.get("is_dir"))
-                and str(item.get("name") or "") == "pantrace"
+                and str(item.get("name") or "") == name
             ):
-                self._temp_dir_id = fid
+                self._temp_dir_id, self._temp_dir_name = fid, name
                 return fid
         resp = self._call(
             "POST",
             "/drive/v1/files",
-            body={
-                "kind": "drive#folder",
-                "name": "pantrace",
-                "parent_id": "",
-                "space": "",
-            },
+            body={"kind": "drive#folder", "name": name, "parent_id": "", "space": ""},
             action="建转存目录",
         )
         fid = str((resp.get("file") or {}).get("id") or "")
         if not fid:
-            raise UpstreamError("迅雷建转存目录没返回目录 id", raw=resp)
-        self._temp_dir_id = fid
+            raise UpstreamError(f"迅雷建转存目录 {name} 没返回目录 id", raw=resp)
+        self._temp_dir_id, self._temp_dir_name = fid, name
         return fid
 
     # ---- 分享侧 ----
@@ -297,8 +300,8 @@ class XunleiClient(PanClient):
         )
 
     def transfer(self, info: ShareInfo, to_dir: str = "") -> list[str]:
-        # parent_id 空串会被 restore 404 拒掉，必须解析成真实目录 ID
-        parent = to_dir or self._ensure_transfer_dir()
+        # parent_id 必须是真实目录 ID：名字/空串都先解析（见 _resolve_transfer_parent）
+        parent = self._resolve_transfer_parent(to_dir)
         resp = self._call(
             "POST",
             "/drive/v1/share/restore",
