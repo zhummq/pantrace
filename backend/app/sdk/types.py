@@ -40,6 +40,8 @@ class ShareInfo:
     title: str = ""
     stoken: str = ""
     passcode: str = ""
+    #: 上游那条**源分享**的到期时刻，Unix 秒；0 = 读不到。和 ShareLink 同一个
+    #: 约定，别一处给秒一处给毫秒——2026-11 百度就踩过 `* 1000` 的坑
     expired_at: int = 0
     files: list[File] = field(default_factory=list)
     total_size: int = 0
@@ -64,6 +66,9 @@ class ShareLink:
     url: str
     share_id: str = ""
     passcode: str = ""
+    #: 分享在上游的到期时刻，**Unix 秒**（各适配器必须归一化成秒再填）。
+    #: 0 = 上游没给/读不到，**不是**"永久"——不要拿它和 time.time() 相减去猜
+    #: 还剩多久，除非先确认这个字段确实有值
     expired_at: int = 0
     note: str = ""
     #: 这次转存占了哪些 fid。清理任务靠它把文件删掉，不保存就只能靠目录 diff 猜
@@ -72,8 +77,13 @@ class ShareLink:
     size: int = 0
 
     @property
-    def permanent(self) -> bool:
-        """expired_at 为 0 表示读不到，不能当成"永久"下结论。"""
+    def expiry_unknown(self) -> bool:
+        """上游没返回到期时间（`expired_at=0`）。
+
+        原来叫 `permanent`，名字是错的：0 的含义是"读不到"，不是"永久"。
+        真按"永久"去理解，就会把一条读不到有效期的分享当成永远可用。
+        目前没有调用方，留着是为了给上层一个统一的判断口子。
+        """
         return self.expired_at == 0
 
 

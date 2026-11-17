@@ -468,7 +468,10 @@ class BaiduClient(PanClient):
             url=url,
             share_id=share_id,
             passcode=DEFAULT_PWD,
-            expired_at=int(body.get("expiretime") or 0) * 1000,
+            # expiretime 上游给的就是**秒**。这里曾经 `* 1000` 转成毫秒，和夸克
+            # （统一归一到秒）不一致：`ShareLink.expired_at` 的约定是秒，谁拿它跟
+            # time.time() 比都不会差三个数量级
+            expired_at=int(body.get("expiretime") or 0),
         )
 
     # ---- 任务 ----

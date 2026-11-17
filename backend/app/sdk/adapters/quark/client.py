@@ -361,8 +361,31 @@ class QuarkClient(PanClient):
         if not share_id:
             raise UpstreamError("分享任务完成但没有 share_id", raw=task.extra)
 
-        pwd_resp = self.http.post("/share/password", json_body={"share_id": share_id}, action="读取分享信息")
-        pwd_data = self._ok(pwd_resp, "读取分享信息")
+        # 到这里分享**已经在账号里建成了**（share_id 在手），只剩读一次提取码。
+        # 这一步再失败绝不能抛出去：`create_share` 的 except NetdiskError 会把它
+        # 当成"这一档失败"，换 7 天档再建一条——账号里多一条纯属白建的分享，
+        # 和 2026-11 那个"一次点击两条"是同一个坑，只是入口窄。
+        # http 层只重试 429/5xx/网络错，业务码异常它管不到，所以在这里补一次。
+        pwd_data: dict = {}
+        for attempt in (1, 2):
+            try:
+                pwd_resp = self.http.post(
+                    "/share/password",
+                    json_body={"share_id": share_id},
+                    action="读取分享信息",
+                )
+                pwd_data = self._ok(pwd_resp, "读取分享信息")
+                break
+            except (AuthError, QuotaExceededError):
+                # 登录态失效、容量满：换档重建也救不了，原样抛给上层去换账号
+                raise
+            except NetdiskError as exc:
+                if attempt == 2:
+                    raise
+                log.warning(
+                    "%s 建好分享后读取信息失败（%s），就着同一个 share_id 重试一次",
+                    self.display, exc,
+                )
         url = str(pwd_data.get("share_url") or f"{self.profile['share_host']}{share_id}")
         passcode = str(pwd_data.get("passcode") or "")
         if passcode and "pwd=" not in url:

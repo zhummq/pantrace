@@ -442,14 +442,16 @@ def _needs_refresh(row: dict) -> bool:
     """这条映射要不要重新转存。
 
     链接只活 `link_ttl`（默认 30 分钟），到期必须重转——竞品的逻辑是
-    "文件到点就删"，旧链接留着也是死链，不能用。"老数据"（expires_at=-1，
-    没记过窗口）一律翻新一次，把之前依赖分享有效期的那批换掉。
+    "文件到点就删"，旧链接留着也是死链，不能用。
+
+    **没有可用窗口的一律重转**：`-1` 是从没记过窗口的老数据，`0` 是窗口记录
+    丢了（库迁移、清理任务写坏、上游读不到）。这两种都判不了"还能不能打开"，
+    而复用一条可能已经死掉的链接，用户点开只会看到"文件不存在"。重转的成本
+    是一次转存，比发死链便宜。
     """
     expires = int(row.get("expires_at", -1))
-    if expires < 0:
+    if expires <= 0:
         return True
-    if expires == 0:
-        return False   # 0 = 没有窗口（旧数据 / 已回收），不当成可复用
     return expires <= time.time() + _REFRESH_AHEAD
 
 
@@ -554,12 +556,19 @@ def mirror(url: str, pwd: str = "", platform: str = "", title: str = "", force: 
 
 
 def _still_alive(row: dict | None) -> bool:
-    """旧映射还能不能用（只在重建失败时用它决定要不要兜底）。"""
+    """旧映射还能不能用（只在重建失败时用它决定要不要兜底）。
+
+    注意这里和 `_needs_refresh` 的方向是**故意相反**的，别急着"统一"：
+    - `-1`（老数据，从没记过窗口）→ 判死，让上层回退到上游原链接。那种链接
+      多半就是为了翻新才要重建的，拿它当兜底等于发一条大概率打不开的链接。
+    - `0`（ok 行上的窗口记录丢了）→ 判活。这种情况几乎不可达，真出现时手上
+      没有更好的选择，与其让用户什么也拿不到，不如先给这条。
+    """
     if not row:
         return False
     expires = int(row.get("expires_at", -1))
     if expires == 0:
-        return True    # 没有窗口（永久/读不到），没法判断，按还活着处理
+        return True
     return expires > time.time()
 
 
