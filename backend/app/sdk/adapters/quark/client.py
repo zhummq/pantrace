@@ -74,17 +74,25 @@ def _candidates(expire_hours: int) -> tuple[tuple[int, int], ...]:
 
 
 def _expiry_ok(seconds: int, expect_hours: int) -> bool:
-    """回读的有效期是不是我们要的那一档（按 0.5～1.5 倍容差）。
+    """回读的有效期是不是**够长**（只卡下限，不卡上限）。
 
-    给带宽而不是卡死，是因为上游算的是"分享时刻 + N 天"，偶尔有几秒到几分钟
-    的偏差。读不到（0）时按"没法校验"放过——接口偶尔不返回这个字段，
+    只卡下限，是因为"比要的长"对我们永远无害：链接真正活多久由回收任务决定
+    （30 分钟删源文件），分享到期时间只是兜底，6 小时还是 7 天都一样。
+    卡上限反而在制造故障——2026-11 实测夸克 `expired_type=2` 把到期时间
+    **对齐到北京时间次日 24:00**，上午建分享就会返回约 37 小时；旧代码按
+    `24 × 1.5 = 36` 判超限，于是每天上午的点击必然判"这档不对"→ 换 7 天档
+    重建，一次点击两条分享，用户拿到的还是 7 天那条。
+
+    下限保留 0.5 倍：万一上游把档位理解成更短的（要 1 天给了 1 小时），
+    那条分享在我们删文件之前就自己到期了，必须重建。
+    读不到（0）时按"没法校验"放过——接口偶尔不返回这个字段，
     为它重建一次只会白留一份分享。
     """
     if not seconds:
         return True
     expect = _norm_hours(expect_hours) * 3600
     left = int(seconds) - time.time()
-    return expect * 0.5 <= left <= expect * 1.5
+    return left >= expect * 0.5
 
 # 上游错误码 → 语义异常。这张表是整套 SDK 的价值所在：
 # 上层只需要问"该换账号还是该下架资源"，不需要认识 41012 是什么
@@ -311,7 +319,7 @@ class QuarkClient(PanClient):
 
             last = link
             log.error(
-                "%s 分享有效期不是约 %s 小时（expired_type=%s，%s），换下一个候选值重建",
+                "%s 分享有效期短于 %s 小时（expired_type=%s，%s），换下一个候选值重建",
                 self.display, tier_hours, expire_type,
                 link.note or f"expired_at={link.expired_at}",
             )
@@ -365,15 +373,25 @@ class QuarkClient(PanClient):
         expired_at = raw_expired // 1000 if raw_expired > 10_000_000_000 else raw_expired
 
         # 到期时间符合预期就不写 note（note 会进 mirrors.reason，后台里一条条
-        # "分享 1 天后到期"纯属噪音）；只有对不上才留字，给排障用。
+        # "分享 1 天后到期"纯属噪音）；偏短才留字并重建，偏长只记一行 info：
+        # 夸克会把到期时间对齐到日界，上午建分享固定多出十几个小时，这是常态，
+        # 不是异常，写进 note 只会让后台全是"有效期异常"。
         note = ""
-        if expired_at and not _expiry_ok(expired_at, expect_hours):
+        if expired_at:
             hours = max(0, int((expired_at - time.time()) / 3600))
-            note = f"分享有效期异常：约 {hours} 小时后到期"
-            log.error(
-                "%s 分享有效期不是约 %s 小时（expired_type=%s，实际约 %s 小时）：%s",
-                self.display, expect_hours, expire_type, hours, url,
-            )
+            if not _expiry_ok(expired_at, expect_hours):
+                note = f"分享有效期异常：约 {hours} 小时后到期"
+                log.error(
+                    "%s 分享有效期只有约 %s 小时，短于要求的 %s 小时"
+                    "（expired_type=%s）：%s",
+                    self.display, hours, expect_hours, expire_type, url,
+                )
+            elif hours > expect_hours * 1.5:
+                log.info(
+                    "%s 分享有效期约 %s 小时，长于请求的 %s 小时"
+                    "（expired_type=%s，上游按日界对齐，接受不重建）",
+                    self.display, hours, expect_hours, expire_type,
+                )
 
         return ShareLink(
             url=url,
