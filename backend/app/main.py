@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, feedback, group, pan, providers, resolver
+from . import analytics, feedback, group, guard, pan, providers, resolver
 from .sdk import registry
 from .config import get_settings
 from .providers import UpstreamError
@@ -31,6 +31,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("pantrace")
 
 settings = get_settings()
+
+# 防刷：IP 滑动窗口 + 匿名票据。放在所有接口前面，后面 /api/ticket 和
+# /api/search 都用它。密钥留空时跟转存签名一样从 apikey|签名派生。
+guard.init(
+    secret=settings.ticket_secret or f"{settings.api_key}|{settings.idr_sign}",
+    ttl=settings.ticket_ttl,
+    rate_limit=settings.rate_limit_per_minute,
+)
+log.info("防刷已启用：单 IP %s 次/分钟，票据 %s 秒", settings.rate_limit_per_minute, settings.ticket_ttl)
 
 # 启动即自检：配置不对时提前吼一声，别等用户搜一次才发现
 _KEY_PROBLEM = settings.api_key_problem
@@ -563,6 +572,23 @@ async def health():
     }
 
 
+@app.get("/api/ticket")
+async def get_ticket(request: Request):
+    """领一张匿名票据。前端进站时静默调一次，缓存复用，过期前再续。
+
+    票据不携带任何身份信息，只是按来源 IP 签发的短期凭证。领票接口本身
+    也计入 IP 限流——不然脚本可以无限领票绕过配额。票据校验在 /api/search。
+    """
+    ip = client_ip(request)
+    allowed, wait = guard.allow(ip)
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={"code": 429, "msg": f"操作太频繁了，{wait} 秒后再试"},
+        )
+    return JSONResponse(content={"code": 0, **guard.issue(ip)})
+
+
 @app.get("/api/search")
 async def search(
     request: Request,
@@ -574,6 +600,25 @@ async def search(
     search_in: str = Query("title", description="title 或 all"),
 ):
     global _last_call_at, _last_error
+
+    # ---- 防刷：先限流，再验票 ----
+    # 两道闸门共用一个 IP 计数池（领票接口也计数），无票探测也会消耗配额。
+    # 顺序不能反：先验票的话，脚本可以无限发无票请求而不占配额。
+    ip = client_ip(request)
+    allowed, wait = guard.allow(ip)
+    if not allowed:
+        return JSONResponse(
+            status_code=429,
+            content={"code": 429, "msg": f"操作太频繁了，{wait} 秒后再试"},
+        )
+    ticket = request.headers.get("x-ticket", "")
+    if not guard.verify(ticket, ip):
+        # 403 = 票据无效/缺失。前端收到后会自动重领一次再重试，
+        # 所以正常用户几乎感知不到；挡掉的是不带票直接打接口的脚本。
+        return JSONResponse(
+            status_code=403,
+            content={"code": 403, "msg": "票据无效，请重试"},
+        )
 
     query = q.strip()
     requested = [p.strip() for p in platforms.split(",") if p.strip()]
@@ -595,7 +640,7 @@ async def search(
         "page": page,
         "visitor": visitor,
         "session": session,
-        "ip": client_ip(request),
+        "ip": ip,
         "ua": request.headers.get("user-agent", ""),
         "referer": request.headers.get("referer", ""),
         "is_new": is_new,

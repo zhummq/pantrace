@@ -4,6 +4,7 @@ import ResultCard from './components/ResultCard.vue'
 import FeedbackDialog from './components/FeedbackDialog.vue'
 import QqGroupDialog from './components/QqGroupDialog.vue'
 import { fetchPlatforms, fetchGroup, searchResources } from './api.js'
+import { ensureTicket } from './ticket.js'
 import { initTracking, track } from './track.js'
 
 const PAGE_SIZE = 20
@@ -306,6 +307,10 @@ function resetHome() {
 onMounted(async () => {
   // 埋点先于一切初始化：页面打开就算一次访问，后面接口失败也不影响计数
   initTracking()
+
+  // 匿名票据预热：进站就静默领票，首次搜索不必等一次领票往返。
+  // 领票失败不阻塞（ensureTicket 内部吞异常），交底下的搜索接口自行处理。
+  ensureTicket()
 
   // 平台列表与群配置并行拉：原先串行（先等平台列表返回才发群配置请求），
   // 进站弹窗要白白多等一个 RTT，800ms 延迟叠上去就明显觉得"卡了一下"。

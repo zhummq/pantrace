@@ -45,8 +45,14 @@ class Settings(BaseSettings):
     # ---- 本地保护策略 ----
     cache_ttl: int = 300          # 搜索结果缓存秒数，同 query 不重复请求上游
     cache_max_entries: int = 512
-    rate_limit_per_minute: int = 30   # 单 IP 每分钟搜索次数（预留，未实现）
+    rate_limit_per_minute: int = 30   # 单 IP 每分钟搜索次数（滑动窗口，含票据接口）
     max_page_size: int = 50
+
+    # ---- 防刷：匿名票据 ----
+    # 不收个人信息，票据只按来源 IP 签发，绑定 IP + 短 TTL。
+    # 密钥留空则从 API_KEY|IDR_SIGN 派生（重启不变）；换掉它 = 所有在途票据失效。
+    ticket_secret: str = ""
+    ticket_ttl: int = 300             # 票据有效期秒数，前端会提前自动续
 
     # ---- 埋点 ----
     # 只存本地 SQLite，不外发。data 目录跟着 backend/ 走，备份时一起打包即可。
