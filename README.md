@@ -254,7 +254,7 @@ sqlite3 backend/data/analytics.db \
 | UC | 同构，`pc-api.uc.cn/1/clouddrive`，`pr=UCBrowser` | 与夸克共用一张码表 |
 | 阿里 | `api.alipan.com/.../get_share_by_anonymous` | 最省事，一次请求拿到元信息 |
 | 123 | `www.123865.com/api/share/info` | `123pan.com` 已改版成 HTML，只有 123865 还回 JSON |
-| 百度 | `share/verify` + `share/list` | 匿名 list 统一回 9019「need verify」，**必须带提取码**才判得了；没码直接落 unsupported |
+| 百度 | 有码走 `share/verify` + `share/list`；无码走 `share/init` 页 | `share/list` 匿名一律回 9019「need verify」，所以**没有提取码时改看 init 页**：200 且正文含「请输入提取码」= 存在但要码，404 = 不存在或已失效，3xx 跳转 = 公开分享可访问 |
 
 其余平台（天翼/迅雷/115/光雅/移动等）没有可用的匿名接口，落 `unsupported`，前端不显示任何东西——宁可不说，也不能瞎说。
 
@@ -531,7 +531,7 @@ sdk/
 - **只有一条通道，没有降级**。签名过期时搜索直接失败并提示重新抓取。这是刻意的：以前挂过降级链，签名失效的请求会被悄悄转到慢通道，日志里只剩“慢”，看不出真因。
 - **删文件 ≠ 释放空间**。夸克 `delete()` 走的是 `action_type: 2`，文件进回收站；目前没有任何地方清回收站，配额要等平台自己清才回来。竞品也只对光鸭调了 `clearRecycleBin()`，夸克同样没清（`quarkUC-sdk/src/fs_api.ts:538` 有现成接口 `/file/recycle/remove`，我们没接）。所以"账号被塞爆"会比按副本体积估的更早到——这是下一步，不是已经解决的。
 - **链接检测依赖各家的匿名接口，随时可能失效**。这是刻意的取舍：判不了就落 `uncertain`，页面照常显示，不会误杀。接口改版时的症状是后台 `uncertain` 占比突然升高——看到就先跑一次后台「检测」，别再往下查缓存或前端。
-- **百度匿名检测受限**：`share/list` 现在统一回 9019「need verify」，只有带提取码的链接能验；没带码的一律 `unsupported`。这不是漏做，是匿名链路本身的能力边界。
+- **百度没有提取码也能验**：`share/list` 匿名一律回 9019「need verify」，但 `share/init` 页不查 cookie——存在且要码回 200 并带「请输入提取码」，不存在回 404。实测 7 条样本两轮全稳。代价是 404 这条路只能给「不存在或已失效」，分不出是取消还是删除；真要细分得带码走 verify + list。若哪天百度开始对 init 页上风控，症状会是一批 `uncertain` 突然出现（200 但不是提取码页），不会误判成失效。
 
 ## 上线前要做的
 

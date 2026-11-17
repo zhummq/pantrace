@@ -488,6 +488,24 @@ def _throttle(host: str) -> None:
         _last_hit[host] = time.monotonic()
 
 
+def _request_page(url: str, **kwargs) -> tuple[int, str, str]:
+    """取 HTML 页面：返回 (状态码, 正文前 4KB, Location 头)。
+
+    `_request` 只解析 JSON，百度这类只回 HTML 的判定点用它。默认不跟随跳转，
+    跳转本身就是结论。**必须关压缩**：百度部分响应声明的 gzip 实际解不开，
+    requests 会抛 ContentDecodingError，禁掉才能拿到正文。
+    """
+    host = url.split("/")[2] if "://" in url else url
+    _throttle(host)
+    kwargs.setdefault("timeout", (4.0, _timeout))
+    kwargs.setdefault("allow_redirects", False)
+    headers = dict(kwargs.pop("headers", {}) or {})
+    headers.setdefault("accept-encoding", "identity")
+    resp = _get_session().request("GET", url, headers=headers, **kwargs)
+    body = resp.text if resp.status_code == 200 else ""
+    return resp.status_code, body[:4000], resp.headers.get("location", "")
+
+
 def _request(method: str, url: str, **kwargs) -> tuple[int, Any]:
     """发请求，返回 (状态码, 解析后的 JSON 或 None)。不抛异常。"""
     host = url.split("/")[2] if "://" in url else url
@@ -681,16 +699,19 @@ def _check_123(share_key: str, passcode: str) -> tuple[str, str]:
 
 
 def _check_baidu(share_id: str, passcode: str) -> tuple[str, str]:
-    """百度网盘：匿名 list 现在统一回 9019「need verify」。
+    """百度网盘：匿名 list 对任何链接都回 9019「need verify」，所以分两条路。
 
-    带提取码时可以先 verify 拿 BDCLND，再 list；不带码的一律判不了，
-    直接落 unsupported（不去发那个必然 9019 的请求，省一次上游调用）。
+    带提取码：verify 换 BDCLND → list，能给出 ok / bad / locked，结论最硬。
+    不带码：改打 `share/init` 页，这个页面不查 cookie——
+      · 分享存在且要码 → 200，正文含「请输入提取码」
+      · 分享不存在或已失效 → 404（通用「页面不存在」页）
+    实测 7 条样本两轮全稳（3 条活的 200、4 条死的 404）。
     """
     if not share_id:
         return STATE_UNSUPPORTED, "无法解析分享地址"
-    if not passcode:
-        return STATE_UNSUPPORTED, "百度链接需带提取码才能匿名检测"
     short = share_id[1:] if share_id.startswith("1") and len(share_id) > 1 else share_id
+    if not passcode:
+        return _check_baidu_init(short)
     headers = {"referer": "https://pan.baidu.com/"}
     status, payload = _request(
         "POST",
@@ -728,6 +749,33 @@ def _check_baidu(share_id: str, passcode: str) -> tuple[str, str]:
     if errno in (-7, 105, 115, 117, 145):
         return STATE_BAD, "链接失效"
     return STATE_UNCERTAIN, str(payload.get("errmsg") or f"未知 errno={errno}")
+
+
+def _check_baidu_init(short: str) -> tuple[str, str]:
+    """百度无提取码时的判定：只看 share/init 页的状态码。
+
+    这是目前唯一不需要 cookie 的百度判定点。宁可 uncertain 也不猜：
+    只有 200 带提取码提示、404 两个明确信号才下结论。
+    """
+    status, text, location = _request_page(
+        "https://pan.baidu.com/share/init",
+        params={"surl": short},
+        headers={
+            "referer": "https://pan.baidu.com/",
+            "accept": "text/html,application/xhtml+xml",
+        },
+    )
+    if status == 404:
+        return STATE_BAD, "链接不存在或已失效"
+    if status in (301, 302, 303, 307, 308):
+        # 不需要提取码的公开分享会直接跳到 /s/1xxx，能跳说明分享还在
+        return (STATE_OK, "可访问") if location else (STATE_UNCERTAIN, "分享页无跳转地址")
+    if status == 200:
+        if "请输入提取码" in text or "提取码" in text:
+            return STATE_LOCKED, "需要提取码"
+        # 200 但不是提取码页：多半是中转页或被安全验证拦住，不下结论
+        return STATE_UNCERTAIN, "分享页无法识别（可能需要安全验证）"
+    return STATE_UNCERTAIN, f"分享页返回 HTTP {status}"
 
 
 def _as_int(value: Any, default: int = 0) -> int:

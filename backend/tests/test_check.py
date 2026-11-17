@@ -21,9 +21,12 @@ from app import check
 
 
 class FakeResponse:
-    def __init__(self, payload, status: int = 200):
+    def __init__(self, payload, status: int = 200, text: str = "", location: str = ""):
         self._payload = payload
         self.status_code = status
+        # 走 HTML 判定的分支（百度 share/init）要用到正文和 Location
+        self.text = text
+        self.headers = {"location": location} if location else {}
 
     def json(self):
         if self._payload is None:
@@ -164,12 +167,44 @@ class TestAliyunAnd123(BaseCase):
         self.assertEqual(state, check.STATE_OK)
 
 
-class TestScope(BaseCase):
-    def test_baidu_without_pwd_is_unsupported(self):
-        state, summary = check.check_one("baidu", "https://pan.baidu.com/s/1abcDEF")
-        self.assertEqual(state, check.STATE_UNSUPPORTED)
-        self.assertIn("提取码", summary)
+class TestBaidu(BaseCase):
+    """百度不带提取码时走 share/init 页：200 要码、404 失效、3xx 公开分享。"""
 
+    def setUp(self):
+        super().setUp()
+        self._orig = check._request_page
+
+    def patch(self, status: int, text: str = "", location: str = ""):
+        check._request_page = lambda url, **kw: (status, text, location)
+
+    def tearDown(self):
+        check._request_page = self._orig
+        super().tearDown()
+
+    def test_init_200_with_pwd_hint_is_locked(self):
+        self.patch(200, text="<html>请输入提取码</html>")
+        state, _ = check.check_one("baidu", "https://pan.baidu.com/s/1abcDEF")
+        self.assertEqual(state, check.STATE_LOCKED)
+
+    def test_init_404_is_bad(self):
+        self.patch(404)
+        state, summary = check.check_one("baidu", "https://pan.baidu.com/s/1abcDEF")
+        self.assertEqual(state, check.STATE_BAD)
+        self.assertIn("失效", summary)
+
+    def test_init_redirect_is_ok(self):
+        self.patch(302, location="https://pan.baidu.com/s/1abcDEF")
+        state, _ = check.check_one("baidu", "https://pan.baidu.com/s/1abcDEF")
+        self.assertEqual(state, check.STATE_OK)
+
+    def test_init_unknown_page_is_uncertain_not_bad(self):
+        # 200 但不是提取码页：可能是中转页/安全验证，绝不能判失效
+        self.patch(200, text="<html>请稍候</html>")
+        state, _ = check.check_one("baidu", "https://pan.baidu.com/s/1abcDEF")
+        self.assertEqual(state, check.STATE_UNCERTAIN)
+
+
+class TestScope(BaseCase):
     def test_unimplemented_platform_is_unsupported(self):
         state, _ = check.check_one("xunlei", "https://pan.xunlei.com/s/abc")
         self.assertEqual(state, check.STATE_UNSUPPORTED)
