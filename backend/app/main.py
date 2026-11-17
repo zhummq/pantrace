@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, feedback, group, guard, pan, providers, resolver
+from . import analytics, check, feedback, group, guard, pan, providers, resolver
 from .sdk import registry
 from .config import get_settings
 from .providers import UpstreamError
@@ -229,6 +229,33 @@ if MIRROR_ON:
         log.error("点击转存初始化失败，已关闭：%s", exc)
 else:
     log.info("点击转存已关闭（MIRROR_ENABLED=false），搜索结果直接给上游链接")
+
+# ---- 链接存活检测 ----
+# 搜索返回后异步探活（BackgroundTasks → 线程池），结果落 link_check 表，
+# 下次渲染时读表。**不能挡在搜索链路上**：搜索本身已经要等上游 2~60 秒，
+# 再加 20 条外部请求会把它变成不可用。打的是各网盘的匿名接口，不占转存账号。
+CHECK_ON = settings.link_check_enabled
+if CHECK_ON:
+    try:
+        check.init(
+            settings.analytics_path,
+            enabled=True,
+            hide_bad=settings.link_check_hide_bad,
+            workers=settings.link_check_workers,
+            timeout=settings.link_check_timeout,
+            per_page=settings.link_check_per_page,
+        )
+        log.info(
+            "链接检测已启用：每页 ≤%s 条，%s 线程，失效%s隐藏",
+            settings.link_check_per_page,
+            settings.link_check_workers,
+            "" if settings.link_check_hide_bad else "不",
+        )
+    except Exception as exc:  # noqa: BLE001
+        CHECK_ON = False
+        log.error("链接检测初始化失败，已关闭：%s", exc)
+else:
+    log.info("链接检测已关闭（LINK_CHECK_ENABLED=false）")
 
 # ---- 群入口（二维码弹窗）----
 # 图片落 backend/data/uploads/，前端通过 /uploads/<文件名> 访问。
@@ -497,6 +524,34 @@ def _public_body(body: dict) -> dict:
     out["items"] = items
     return out
 
+
+def _export_search(body: dict, background: BackgroundTasks, *, page: int) -> dict:
+    """搜索响应的唯一出口：举报隐藏 → 失效过滤/标状态 → 换签名链接。
+
+    顺序不能调换：
+    - 隐藏和检测都按 `shareUrl` 比对，必须发生在 `_public_body` 把链接换成
+      `/go/<token>` 之前；
+    - 检测标注会**复制**条目再写 `checkState`，缓存里那份保持干净（同 `_apply_hidden`）。
+    - 探活只在第一页做。深处页面几乎没人翻，检了纯浪费上游请求。
+    """
+    body = _apply_hidden(body)
+    if not CHECK_ON:
+        return _public_body(body)
+
+    items = body.get("items") or []
+    kept, dropped = check.annotate(items)
+    if dropped or kept is not items:
+        body = {**body, "items": kept}
+    if dropped:
+        # 和 feedback 的 `hidden` 分开计数：一个是"多人举报"，一个是"实测失效"，
+        # 排查误判时要能看出是哪一个在摘结果
+        body["checkedBad"] = dropped
+    if page == 1 and kept:
+        # BackgroundTasks 在响应发出后才执行；schedule 内部只做一次 SQLite 读
+        # 然后丢给线程池，不会拖住这次响应
+        background.add_task(check.schedule, kept)
+    return _public_body(body)
+
 # 界面用的平台列表。只放上游实测确认过的 key：
 # 传一个上游不认识的 key 会让整次搜索报 1001，所以宁缺勿滥。
 PLATFORMS = [
@@ -569,6 +624,7 @@ async def health():
         "feedback": FEEDBACK_ON,
         "mirror": MIRROR_ON,
         "mirrorAccount": _has_mirror_account(),
+        "linkCheck": check.summary() if CHECK_ON else {"enabled": False},
     }
 
 
@@ -659,7 +715,7 @@ async def search(
                 result_count=len(body.get("items") or []),
                 cached=True,
             )
-        return _public_body(_apply_hidden(body))
+        return _export_search(body, background, page=page)
 
     failed = _fail_cache.get(cache_key)
     if failed and now - failed[0] < FAIL_TTL:
@@ -745,7 +801,7 @@ async def search(
         "search q=%s page=%s items=%s %sms",
         query, page, len(body["items"]), upstream_ms,
     )
-    return _public_body(_apply_hidden(dict(body)))
+    return _export_search(dict(body), background, page=page)
 
 
 # ---- 点击跳转：/go/<token> ----
@@ -1395,6 +1451,50 @@ async def admin_mirror_test(payload: MirrorTestIn, request: Request):
     if not url.startswith("http"):
         return JSONResponse(status_code=400, content={"code": 400, "msg": "给一条完整分享链接"})
     result = await asyncio.to_thread(resolver.mirror, url, payload.pwd or "", "", "", True)
+    return {"code": 0, "data": result}
+
+
+@app.get("/api/admin/link-check", include_in_schema=False)
+async def admin_link_check(request: Request, state: str = "", limit: int = 30):
+    """检测概况 + 最近记录。
+
+    上线后第一天看两件事：`uncertain` 占比高说明接口被限流/改版（检测在空转），
+    `bad` 占比高得不正常说明判定映射错了（会误杀结果）。都在这一个接口里。
+    """
+    if not CHECK_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "链接检测已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    return {
+        "code": 0,
+        "data": {"summary": check.summary(), "recent": check.recent(state, limit)},
+    }
+
+
+class LinkCheckIn(BaseModel):
+    url: str
+    pwd: str = ""
+
+
+@app.post("/api/admin/link-check/test", include_in_schema=False)
+async def admin_link_check_test(payload: LinkCheckIn, request: Request):
+    """手工检一条链接。上线前用它确认"匿名接口还认我们"，别等用户来反馈。
+
+    走和批量检测完全相同的 checker，结果会覆盖旧结论——这也是误判的复位手段：
+    某条好资源被标成失效，跑一次这里就恢复。
+    """
+    if not CHECK_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "链接检测已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    url = (payload.url or "").strip()[:500]
+    if not url.startswith("http"):
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "给一条完整分享链接"})
+    try:
+        result = await asyncio.to_thread(check.probe, url, payload.pwd or "")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("手工检测失败")
+        return JSONResponse(status_code=500, content={"code": 500, "msg": f"检测失败：{exc}"})
     return {"code": 0, "data": result}
 
 

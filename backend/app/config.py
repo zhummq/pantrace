@@ -68,6 +68,21 @@ class Settings(BaseSettings):
     feedback_enabled: bool = True
     feedback_rate_per_10min: int = 5   # 单 IP 十分钟提交上限
 
+    # ---- 链接存活检测 ----
+    # 搜索返回后异步探活（夸克/UC/阿里/123，百度需带提取码），结果落
+    # link_check 表，下次渲染时给卡片标"已失效/需提取码"。不用转存账号，
+    # 打的是各网盘的匿名接口。关掉不影响搜索，只是卡片不再有核验标记。
+    link_check_enabled: bool = True
+    # 并发探活线程数。别调大：匿名接口没有配额说明，打急了会被当爬虫。
+    link_check_workers: int = 3
+    # 单条检测的超时秒数（连接超时固定 4 秒）
+    link_check_timeout: float = 8.0
+    # 每次搜索最多检多少条。只有第一页会检，20 条覆盖绝大多数点击
+    link_check_per_page: int = 20
+    # 确认失效的链接是否从结果里摘掉。关掉只在卡片上标"已失效"，
+    # 排查误判时先关这个开关，别直接关掉整个检测。
+    link_check_hide_bad: bool = True
+
     # ---- 群入口（进站 / 获取链接时弹二维码）----
     # 配置存在同一个 SQLite 里，/admin 看板可改，这个开关是总闸。
     group_enabled: bool = True
