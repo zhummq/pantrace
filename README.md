@@ -12,6 +12,7 @@ backend/
   app/feedback.py     反馈/求资源：工单表、限流、去重、聚合
   app/group.py        群入口配置：二维码/群号/弹窗策略（app_config 表）
   app/resolver.py     点击时转存：链接映射、单飞、签名跳转（不认识具体网盘）
+  app/check.py        链接存活检测：匿名接口探活、五态 + TTL、异步落表
   app/pan.py          网盘账号表 + 多账号轮换 + 失败转移 + 空间回收
   app/sdk/            网盘操作 SDK：夸克/UC/百度/迅雷/光鸭/移动139（见「网盘 SDK」）
   .env                apikey 等敏感配置，已被 gitignore
@@ -87,6 +88,8 @@ npm run dev
 | GET | `/api/admin/stats?days=7` | 看板数据，需 `X-Admin-Token` |
 | GET | `/api/admin/mirror` | 转存映射：成功/失败/命中数/占用体积 + 最近 30 条，需 `X-Admin-Token` |
 | POST | `/api/admin/mirror/test` | 手工验一条链接的转存结果（验 cookie 用），需 `X-Admin-Token` |
+| GET | `/api/admin/link-check?state=&limit=30` | 检测概况 + 最近记录，需 `X-Admin-Token` |
+| POST | `/api/admin/link-check/test` | 手工检一条链接（验匿名接口是否可用、误判复位），需 `X-Admin-Token` |
 | GET | `/admin` | 用户行为看板（Vue 构建产物，`no-store` 不缓存） |
 | GET | `/docs` | FastAPI 自带接口文档 |
 
@@ -236,6 +239,67 @@ sqlite3 backend/data/analytics.db \
 ```
 
 `FEEDBACK_ENABLED=false` 可以单独关掉反馈，不影响埋点——统计和工单是两件事，不该互相绑死。
+
+## 链接存活检测
+
+搜索结果里混着大量已删/已取消的分享。原来的兜底只有一条：**2 个不同访客报失效才隐藏**（事后）。检测把判断提前到用户点开之前，同时把 `dead_link` 这一类工单自动闭环。
+
+### 怎么判
+
+只打各网盘的**公开接口**，不碰转存账号——账号是稀缺资源，拿去探活等于烧配额，还会把风控引到账号上。
+
+| 平台 | 接口 | 说明 |
+|---|---|---|
+| 夸克 | `drive-h.quark.cn/.../sharepage/token` → `drive-pc.quark.cn/.../sharepage/detail` | `code 0` + 详情有 list 才算有效 |
+| UC | 同构，`pc-api.uc.cn/1/clouddrive`，`pr=UCBrowser` | 与夸克共用一张码表 |
+| 阿里 | `api.alipan.com/.../get_share_by_anonymous` | 最省事，一次请求拿到元信息 |
+| 123 | `www.123865.com/api/share/info` | `123pan.com` 已改版成 HTML，只有 123865 还回 JSON |
+| 百度 | `share/verify` + `share/list` | 匿名 list 统一回 9019「need verify」，**必须带提取码**才判得了；没码直接落 unsupported |
+
+其余平台（天翼/迅雷/115/光雅/移动等）没有可用的匿名接口，落 `unsupported`，前端不显示任何东西——宁可不说，也不能瞎说。
+
+### 五态与 TTL
+
+| 状态 | 含义 | TTL | 出口动作 |
+|---|---|---|---|
+| `ok` | 可访问 | 6h | 不标记（每条都写"已核验"等于噪声） |
+| `bad` | 失效/取消/违规/空分享 | **6h** | 从结果里摘掉，`checkedBad` 计数 |
+| `locked` | 需要提取码，结果里没带 | 24h | 只标「需提取码」，不隐藏 |
+| `uncertain` | 超时/限流/接口异常/判不了 | 30min | 什么都不做 |
+| `unsupported` | 平台没接口 / 链接解析不出 id | 7d | 什么都不做 |
+
+`bad` 的 TTL 特意和 `ok` 一样短：**任何一次误判都会让一条好资源消失，6 小时必须给它自愈的机会**。误判当场要复位就走后台「链接存活检测 → 检测」跑一次，会覆盖旧结论。
+
+### 链路
+
+```
+/api/search 返回（缓存或新结果）
+   └─ BackgroundTasks → check.schedule(items)   # 只检第一页、最多 20 条
+        ├─ 先批量读表，6 小时内检过的直接跳过
+        ├─ 单飞：同一 key 已在检就不再提交
+        └─ 3 个线程（同域请求间隔 0.25s）→ check_one → 写 link_check 表
+下次渲染同一个页面
+   └─ check.annotate(items) 读表 → 复制条目写 checkState / 摘掉 bad
+```
+
+三条不能改的约束：
+
+1. **绝不在搜索链路里同步检**。搜索本身要等上游 2~60 秒，再加 20 条外部请求会把可用性打穿。检测晚 5 秒生效没人感知，用户刷新一下就有了。
+2. **判不准必须是 `uncertain`**。没见过的错误码、非 JSON、网络异常，一律不许落 `bad`——`bad` 会让结果消失，漏放的代价远小于误杀。
+3. **标注只复制不改原对象**。`items` 是 `_cache` 里那份的引用，就地写 `checkState` 会把结论固化进缓存，改开关/回滚都无效。
+
+### 配置与排障
+
+`LINK_CHECK_ENABLED`（总闸）/ `WORKERS` / `TIMEOUT` / `PER_PAGE` / `HIDE_BAD`。排查误判先关 `LINK_CHECK_HIDE_BAD`（只标记不摘），别直接关掉整个检测。
+
+数据在 `backend/data/analytics.db` 的 `link_check` 表，键是 `盘类型:分享id`（同一分享的 `/s/xxx`、`?pwd=`、`share/init?surl=` 三种写法算同一条）：
+
+```bash
+sqlite3 backend/data/analytics.db \
+  "select state, count(*) from link_check group by state;"
+```
+
+后台「链接存活检测」面板看两件事：`uncertain` 占比高 = 接口被限流或改版（在空转）；`bad` 突然变多 = 码表映射错了（在误杀）。
 
 ## 点击时转存（链接不外露）
 
@@ -466,6 +530,8 @@ sdk/
 - `credits` 字段实测多次为 0，计费逻辑以上游账单为准，不要用这个字段估算成本。
 - **只有一条通道，没有降级**。签名过期时搜索直接失败并提示重新抓取。这是刻意的：以前挂过降级链，签名失效的请求会被悄悄转到慢通道，日志里只剩“慢”，看不出真因。
 - **删文件 ≠ 释放空间**。夸克 `delete()` 走的是 `action_type: 2`，文件进回收站；目前没有任何地方清回收站，配额要等平台自己清才回来。竞品也只对光鸭调了 `clearRecycleBin()`，夸克同样没清（`quarkUC-sdk/src/fs_api.ts:538` 有现成接口 `/file/recycle/remove`，我们没接）。所以"账号被塞爆"会比按副本体积估的更早到——这是下一步，不是已经解决的。
+- **链接检测依赖各家的匿名接口，随时可能失效**。这是刻意的取舍：判不了就落 `uncertain`，页面照常显示，不会误杀。接口改版时的症状是后台 `uncertain` 占比突然升高——看到就先跑一次后台「检测」，别再往下查缓存或前端。
+- **百度匿名检测受限**：`share/list` 现在统一回 9019「need verify」，只有带提取码的链接能验；没带码的一律 `unsupported`。这不是漏做，是匿名链路本身的能力边界。
 
 ## 上线前要做的
 
