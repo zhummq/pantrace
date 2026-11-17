@@ -108,6 +108,14 @@ ERROR_MAP: dict[object, type[NetdiskError]] = {
 # 目录 fid 是 32 位十六进制。纯数字那种是测试环境的假 id，不要当 fid 用
 _FID_RE = re.compile(r"^[0-9a-fA-F]{16,40}$")
 
+# 建分享任务的等待时限（秒）。原来只等 20 秒，账号下分享一多就经常不够：
+# 一超时，create_share 就当成"这一档失败"去换 7 天档重建，用户最后拿到的是
+# 7 天那条。先等 45 秒；还超时就着**同一个 task_id** 再等 30 秒——任务在
+# 服务端通常已经跑完，续等拿到的 share_id 仍是这一档，不必换档重建。
+# 两轮都超时才交给上层按候选链降级。分享本身 1 天后自然过期，不做清理。
+_SHARE_TASK_TIMEOUT = 45.0
+_SHARE_TASK_RETRY_TIMEOUT = 30.0
+
 
 @register
 class QuarkClient(PanClient):
@@ -330,7 +338,17 @@ class QuarkClient(PanClient):
         if not task_id:
             raise UpstreamError("创建分享没有返回任务号", raw=resp)
 
-        task = self.wait_task(task_id, timeout=max(20.0, self.timeout))
+        # 超时 ≠ 没建成。这个 task 在服务端照常在跑，只是我们没等到结果；
+        # 而 share_id 就在结果里，超时时还没拿到。先就着同一个 task 再等一轮，
+        # 拿到就还是这一档，不会因为一次慢响应就降级成 7 天。
+        try:
+            task = self.wait_task(task_id, timeout=max(_SHARE_TASK_TIMEOUT, self.timeout))
+        except TaskTimeoutError:
+            log.warning(
+                "%s 建分享任务 %ss 未完成，同一个 task 再等 %ss",
+                self.display, int(_SHARE_TASK_TIMEOUT), int(_SHARE_TASK_RETRY_TIMEOUT),
+            )
+            task = self.wait_task(task_id, timeout=_SHARE_TASK_RETRY_TIMEOUT)
         share_id = str(task.extra.get("share_id") or "")
         if not share_id:
             raise UpstreamError("分享任务完成但没有 share_id", raw=task.extra)
