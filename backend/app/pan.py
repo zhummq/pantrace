@@ -27,7 +27,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .sdk import registry, urls
+from .sdk import refresh, registry, urls
 from .sdk.errors import (
     AuthError,
     ConfigError,
@@ -253,6 +253,12 @@ def update_account(account_id: int, **fields) -> None:
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
         return
+    # 凭据变了就先清刷新缓存：不清的话，后台刚换上的 refresh_token 会被
+    # sdk.refresh 里那条旧 access_token 顶掉（它默认能活一小时）。
+    # 适配器刷完 token 回写时会走这里，所以它们是在 remember() 之前调的，
+    # 不会把刚存进去的结果清掉。
+    if sets.keys() & {"access_token", "refresh_token", "expires_at"}:
+        refresh.forget(int(account_id or 0))
     if "extra" in sets and not isinstance(sets["extra"], str):
         sets["extra"] = json.dumps(sets["extra"], ensure_ascii=False)
     sets["updated_ts"] = time.time()

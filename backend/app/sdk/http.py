@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -158,14 +159,18 @@ class Requester:
 
             cost = int((time.monotonic() - started) * 1000)
             if response.status_code >= 400:
+                # 把上游错误体里那句话带上。只报 "HTTP 400" 的代价是线上排查
+                # 全靠猜——2026-11 迅雷 token 刷新失败，日志里就只有一个 400，
+                # 分不清是 invalid_grant、参数错还是被风控
+                why = _why(response.text)
                 if response.status_code in (404, 410) and gone_error is not None:
                     raise gone_error(
-                        f"{action}失败：资源不存在或已失效",
+                        f"{action}失败：资源不存在或已失效" + (f"，{why}" if why else ""),
                         code=response.status_code,
                         raw=response.text[:300],
                     )
                 raise UpstreamError(
-                    f"{action}失败：HTTP {response.status_code}",
+                    f"{action}失败：HTTP {response.status_code}" + (f"，{why}" if why else ""),
                     code=response.status_code,
                     raw=response.text[:300],
                 )
@@ -211,6 +216,24 @@ def _short(url: str) -> str:
     """日志里只留路径，去掉 query。query 里经常带 stoken / sign。"""
     base, _, _ = url.partition("?")
     return base[-80:]
+
+
+def _why(text: str) -> str:
+    """从 4xx/5xx 响应体里抠一句能给人看的话。
+
+    抠不出来就返回空串，宁可什么都没有，也不要把整页 nginx HTML 塞进日志。
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        # 非 JSON：太长的多半是 HTML 错误页，短的就当纯文本错误原因
+        return "" if ("<" in text or len(text) > 200) else text
+    if isinstance(payload, dict):
+        return message_of(payload)[:160]
+    return ""
 
 
 def check_code(

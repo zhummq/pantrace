@@ -21,6 +21,7 @@ import os
 import time
 from urllib.parse import urlparse
 
+from ... import refresh
 from ...base import PanClient
 from ...errors import (
     AuthError,
@@ -105,34 +106,44 @@ class GuangyaClient(PanClient):
             if self._access:
                 return self._access
             raise AuthError("光鸭没有可用的 token")
-        resp = self.http.post(
-            f"{API_ACCOUNT}/auth/token",
-            json_body={
-                "client_id": CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": self.account.refresh_token,
-            },
-            headers=self._headers(),
-            action="刷新光鸭 token",
-            retries=1,
-        )
-        token = str(resp.get("access_token") or "")
-        if not token:
-            raise AuthError("光鸭 token 刷新失败，需要重新授权")
-        self._access = token
-        self._expires = time.time() + int(resp.get("expires_in") or 3600) - 60
-        self.account.access_token = token
-        if resp.get("refresh_token"):
-            self.account.refresh_token = str(resp["refresh_token"])
-        if self.on_cookie is not None:
-            # 同迅雷：不带 __expires__ 就会被回写层按 12 小时兜底，而真实寿命只有
-            # expires_in。库里期限比真实期限长，`_token()` 就会一直复用死 token，
-            # 请求全 401 且不刷新
-            self.on_cookie(
-                f"__token__={token};__refresh__={self.account.refresh_token}"
-                f";__expires__={int(self._expires)}"
+        # 和迅雷同源：refresh_token 轮换，两个线程各拿一份旧的去换，
+        # 后到的那个会被判无效，严重时整条 token family 被吊销
+        key = int(self.account.id or 0)
+        with refresh.lock_for(key):
+            hit = refresh.reuse(key)
+            if hit is not None:
+                self._access, self._expires = hit[0], float(hit[1])
+                return self._access
+
+            resp = self.http.post(
+                f"{API_ACCOUNT}/auth/token",
+                json_body={
+                    "client_id": CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "refresh_token": self.account.refresh_token,
+                },
+                headers=self._headers(),
+                action="刷新光鸭 token",
+                retries=1,
             )
-        return token
+            token = str(resp.get("access_token") or "")
+            if not token:
+                raise AuthError("光鸭 token 刷新失败，需要重新授权")
+            self._access = token
+            self._expires = time.time() + int(resp.get("expires_in") or 3600) - 60
+            self.account.access_token = token
+            if resp.get("refresh_token"):
+                self.account.refresh_token = str(resp["refresh_token"])
+            if self.on_cookie is not None:
+                # 同迅雷：不带 __expires__ 就会被回写层按 12 小时兜底，而真实寿命只有
+                # expires_in。库里期限比真实期限长，`_token()` 就会一直复用死 token，
+                # 请求全 401 且不刷新
+                self.on_cookie(
+                    f"__token__={token};__refresh__={self.account.refresh_token}"
+                    f";__expires__={int(self._expires)}"
+                )
+            refresh.remember(key, token, self._expires)
+        return self._access
 
     def _post(self, url: str, payload: dict, *, anonymous: bool = False, action: str = "") -> dict:
         self._throttle()

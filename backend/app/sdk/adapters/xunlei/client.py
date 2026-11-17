@@ -18,6 +18,7 @@ import logging
 import re
 import time
 
+from ... import refresh
 from ...base import PanClient
 from ...errors import (
     AuthError,
@@ -94,37 +95,51 @@ class XunleiClient(PanClient):
         now = int(time.time())
         if self._access_token and self._expires_at - now > 60:
             return self._access_token
-        resp = self.http.post(
-            f"{USER_BASE}/v1/auth/token",
-            json_body={
-                "client_id": CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": self.account.refresh_token,
-            },
-            action="刷新迅雷 token",
-            retries=1,
-        )
-        token = str(resp.get("access_token") or "")
-        refresh = str(resp.get("refresh_token") or "")
-        if not token:
-            raise AuthError("迅雷 token 刷新失败，需要重新授权")
-        self._access_token = token
-        self._expires_at = now + int(resp.get("expires_in") or 3600) - 60
-        # 写操作（如建目录）的 captcha 会校验 meta.user_id，传 "0" 会被
-        # captcha_invalid 拒掉（实测）；读操作不挑。刷新响应里有真实 user_id
-        self._user_id = str(resp.get("user_id") or resp.get("sub") or "")
-        self.account.access_token = token
-        if refresh:
-            self.account.refresh_token = refresh
-        if self.on_cookie is not None:
-            # __expires__ 必须带上：不带的话 pan._credential_hook 只能按 12 小时
-            # 兜底写库，而迅雷 access_token 实际只有 expires_in（一般 1 小时）。
-            # 结果是库里记着"还有 11 小时才过期"，`_token()` 于是一直拿死 token
-            # 去请求，全量 401，且永远不会触发刷新——账号表现成"配好第二天就用不了"。
-            self.on_cookie(
-                f"__token__={token};__refresh__={refresh};__expires__={self._expires_at}"
+        # 刷新按账号串行：refresh_token 轮换，两个线程各拿一份旧的去换，
+        # 后到的那个会被判 invalid_grant，严重时整条 token family 被吊销。
+        # 见 sdk/refresh.py 的说明
+        key = int(self.account.id or 0)
+        with refresh.lock_for(key):
+            hit = refresh.reuse(key, now)
+            if hit is not None:
+                # 等锁期间别人刚刷好了，直接用，别再换一次
+                self._access_token, self._expires_at = hit[0], int(hit[1])
+                return self._access_token
+
+            resp = self.http.post(
+                f"{USER_BASE}/v1/auth/token",
+                json_body={
+                    "client_id": CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "refresh_token": self.account.refresh_token,
+                },
+                action="刷新迅雷 token",
+                retries=1,
             )
-        return token
+            token = str(resp.get("access_token") or "")
+            refresh_token = str(resp.get("refresh_token") or "")
+            if not token:
+                raise AuthError("迅雷 token 刷新失败，需要重新授权")
+            self._access_token = token
+            self._expires_at = now + int(resp.get("expires_in") or 3600) - 60
+            # 写操作（如建目录）的 captcha 会校验 meta.user_id，传 "0" 会被
+            # captcha_invalid 拒掉（实测）；读操作不挑。刷新响应里有真实 user_id
+            self._user_id = str(resp.get("user_id") or resp.get("sub") or "")
+            self.account.access_token = token
+            if refresh_token:
+                self.account.refresh_token = refresh_token
+            if self.on_cookie is not None:
+                # __expires__ 必须带上：不带的话 pan._credential_hook 只能按 12 小时
+                # 兜底写库，而迅雷 access_token 实际只有 expires_in（一般 1 小时）。
+                # 结果是库里记着"还有 11 小时才过期"，`_token()` 于是一直拿死 token
+                # 去请求，全量 401，且永远不会触发刷新——账号表现成"配好第二天就用不了"。
+                self.on_cookie(
+                    f"__token__={token};__refresh__={refresh_token}"
+                    f";__expires__={self._expires_at}"
+                )
+            # 放在 on_cookie 之后：回写走 update_account，它会 forget 掉缓存
+            refresh.remember(key, token, self._expires_at)
+        return self._access_token
 
     def _captcha(self, action: str, renew: bool = False) -> str:
         cached = self._captchas.get(action)
@@ -173,7 +188,37 @@ class XunleiClient(PanClient):
 
         gone_error：分享侧 404/410 该抛什么。不传的话 http 层只能报裸
         "HTTP 404"，后台验链看不出是源链接死了还是账号挂了。
+
+        401 会自动重试一次：token 被上游吊销、或在别处被轮换掉，库里却还写着
+        没过期——不丢缓存重刷的话，这一小时内每次请求都拿同一个死 token 撞墙。
         """
+        try:
+            return self._request_once(
+                method, path, query=query, body=body,
+                action=action, gone_error=gone_error,
+            )
+        except (AuthError, UpstreamError) as exc:
+            if getattr(exc, "code", None) != 401:
+                raise
+            log.warning("%s 请求被判未授权（401），丢掉缓存 token 重刷一次", self.display)
+            self._access_token = ""
+            self._expires_at = 0
+            refresh.forget(int(self.account.id or 0))
+            return self._request_once(
+                method, path, query=query, body=body,
+                action=action, gone_error=gone_error,
+            )
+
+    def _request_once(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict | None = None,
+        body: dict | None = None,
+        action: str = "",
+        gone_error: type[NetdiskError] | None = None,
+    ) -> dict:
         action_key = f"{method.upper()}:{path}"
         headers = {
             "Authorization": f"Bearer {self._token()}",
