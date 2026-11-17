@@ -321,8 +321,12 @@ def _credential_hook(account: Account):
                 pairs = dict(
                     part.split("=", 1) for part in payload.split(";") if "=" in part
                 )
-                # 百度会带 __expires__（真实到期时间）；其它盘不给，就退回旧默认值
-                expires_at = int(pairs.get("__expires__") or 0) or int(time.time()) + 3600 * 12
+                # 优先用适配器报的真实到期时间（百度/迅雷/光鸭都会带 __expires__）。
+                # 兜底从 12 小时改成 1 小时：兜底值**宁可短**。记长了不会让 token
+                # 活得更久，只会让 `_token()` 一直信任一个已经死掉的 token——2026-11
+                # 迅雷就是这样"配好第二天全量 401"，因为库里写着还剩 11 小时。
+                # 记短了的代价只是多刷一次 token，那个接口是幂等的（刷新本身不算贵）。
+                expires_at = int(pairs.get("__expires__") or 0) or int(time.time()) + 3600
                 update_account(
                     account.id,
                     access_token=pairs.get("__token__", account.access_token),

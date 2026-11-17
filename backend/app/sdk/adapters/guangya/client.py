@@ -125,7 +125,13 @@ class GuangyaClient(PanClient):
         if resp.get("refresh_token"):
             self.account.refresh_token = str(resp["refresh_token"])
         if self.on_cookie is not None:
-            self.on_cookie(f"__token__={token};__refresh__={self.account.refresh_token}")
+            # 同迅雷：不带 __expires__ 就会被回写层按 12 小时兜底，而真实寿命只有
+            # expires_in。库里期限比真实期限长，`_token()` 就会一直复用死 token，
+            # 请求全 401 且不刷新
+            self.on_cookie(
+                f"__token__={token};__refresh__={self.account.refresh_token}"
+                f";__expires__={int(self._expires)}"
+            )
         return token
 
     def _post(self, url: str, payload: dict, *, anonymous: bool = False, action: str = "") -> dict:

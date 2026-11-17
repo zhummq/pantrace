@@ -117,7 +117,13 @@ class XunleiClient(PanClient):
         if refresh:
             self.account.refresh_token = refresh
         if self.on_cookie is not None:
-            self.on_cookie(f"__token__={token};__refresh__={refresh}")
+            # __expires__ 必须带上：不带的话 pan._credential_hook 只能按 12 小时
+            # 兜底写库，而迅雷 access_token 实际只有 expires_in（一般 1 小时）。
+            # 结果是库里记着"还有 11 小时才过期"，`_token()` 于是一直拿死 token
+            # 去请求，全量 401，且永远不会触发刷新——账号表现成"配好第二天就用不了"。
+            self.on_cookie(
+                f"__token__={token};__refresh__={refresh};__expires__={self._expires_at}"
+            )
         return token
 
     def _captcha(self, action: str, renew: bool = False) -> str:
