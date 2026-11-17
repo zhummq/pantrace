@@ -77,9 +77,18 @@ const fileCountText = computed(() => {
 const copied = ref('')
 
 // 后端异步探活的结果，只透传结论，不下发上游原始文案。
-// ok 不显示任何东西——每条都挂个"已核验"等于噪声，用户只需要知道哪条有问题。
+//
+// ok 必须显示。早先的判断是"每条都挂已核验等于噪声"，实际跑出来是反的：
+// 全静默时用户分不清"验过且正常"和"压根没验"，整页看着像功能没生效。
+// 现在改成 ok 给一个绿色的「可访问」——文案避开"有效"，因为右边的橙色徽标
+// 说的是转存链接 30 分钟有效期，两件事挤一个词会互相稀释。
+//
+// uncertain / unsupported 一律不显示：没有结论就别下结论，也别假装验过。
 const checkChip = computed(() => {
   const state = props.item.checkState
+  if (state === 'ok') {
+    return { tone: 'ok', text: '可访问', tip: '已实测：该分享当前可以正常打开。' }
+  }
   if (state === 'bad') {
     return { tone: 'bad', text: '已失效', tip: '实测该分享已无法访问，可能已被删除或取消。' }
   }
@@ -175,14 +184,28 @@ async function onCopyPwd() {
           <span v-if="fileCountText">{{ fileCountText }}</span>
           <i v-if="fileCountText" class="dot"></i>
           <span>{{ sizeText }}</span>
-          <!-- 存活检测结论：只在有问题时出现（失效/需提取码），
-               有效不标——每条都挂"已核验"等于噪声 -->
+          <!-- 存活检测结论：ok 给绿色对勾，失效/需提取码给红/橙，
+               没有任何结论（未检、unsupported）就不出现 -->
           <span
             v-if="checkChip"
             class="state-chip"
             :class="checkChip.tone"
             :title="checkChip.tip"
-          >{{ checkChip.text }}</span>
+          >
+            <svg
+              v-if="checkChip.tone === 'ok'"
+              width="10"
+              height="10"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="3"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M4 12.5l5 5L20 6.5" />
+            </svg>{{ checkChip.text }}</span>
           <!-- 时效提示收敛成一个小徽标：完整说明整页只出现一次（列表顶部），
                悬停可看全文；一页十条整句提示等于免责声明刷屏 -->
           <span
@@ -260,6 +283,7 @@ async function onCopyPwd() {
 .state-chip {
   display: inline-flex;
   align-items: center;
+  gap: 3px;
   padding: 1px 7px;
   border-radius: 999px;
   font-size: 11px;
@@ -267,6 +291,17 @@ async function onCopyPwd() {
   font-weight: 600;
   cursor: help;
   user-select: none;
+}
+
+.state-chip svg {
+  flex-shrink: 0;
+  opacity: 0.9;
+}
+
+/* 绿比红要淡：失效得跳出来，正常只是"验过"，不该抢视觉焦点 */
+.state-chip.ok {
+  color: #12805a;
+  background: rgba(18, 128, 90, 0.08);
 }
 
 .state-chip.bad {

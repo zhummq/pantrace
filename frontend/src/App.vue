@@ -29,6 +29,10 @@ const loading = ref(false)
 const elapsed = ref(0)
 let elapsedTimer = null
 
+// 序号用于丢弃过期请求：用户连搜两次时，先发那次的后台补拉不能覆盖新结果
+let searchSeq = 0
+let checkTimers = []
+
 const error = ref('')
 const searched = ref(false)
 
@@ -206,11 +210,48 @@ function syncUrl() {
   history.replaceState(null, '', qs ? `?${qs}` : location.pathname)
 }
 
+// ---- 检测结论补拉 ----
+// 两轮足够：3 线程 + 同域 0.25s 间隔，一页 20 条同平台约 5~8 秒出全。
+// 补拉命中后端搜索缓存（5 分钟内），不碰上游，成本接近零；失败静默。
+const CHECK_REFRESH_DELAYS = [6000, 16000]
+
+function clearCheckRefresh() {
+  for (const t of checkTimers) clearTimeout(t)
+  checkTimers = []
+}
+
+function scheduleCheckRefresh(seq, args) {
+  clearCheckRefresh()
+  for (const delay of CHECK_REFRESH_DELAYS) {
+    const timer = setTimeout(() => refreshCheckStates(seq, args), delay)
+    checkTimers.push(timer)
+  }
+}
+
+async function refreshCheckStates(seq, args) {
+  // 用户已经翻了页或换了词：这次补拉的结果已经不属于当前视图
+  if (seq !== searchSeq) return
+  try {
+    const data = await searchResources(args)
+    if (seq !== searchSeq) return
+    const next = data.items || []
+    // 结果为空多半是撞上了上游抖动，别把眼前这页清掉
+    if (!next.length) return
+    // 整页替换而不是逐条合并：/go/ 签名里带时间戳，两次请求的链接串不同，
+    // 按链接匹配根本对不上；同一次查询的排序是稳定的，替换不会打乱顺序。
+    items.value = next
+  } catch {
+    /* 补拉失败不影响主流程，用户手动刷新同样能拿到结论 */
+  }
+}
+
 async function doSearch(targetPage = 1) {
   const q = keyword.value.trim()
   if (!q) return
   if (loading.value) return
 
+  const seq = ++searchSeq
+  clearCheckRefresh()
   loading.value = true
   error.value = ''
   searched.value = true
@@ -236,6 +277,16 @@ async function doSearch(targetPage = 1) {
     tookMs.value = data.tookMs || 0
     syncUrl()
     if (targetPage > 1) window.scrollTo({ top: 0, behavior: 'smooth' })
+    // 探活跑在响应之后（后端 BackgroundTasks），这一屏注定还没有角标。
+    // 不补拉一次，用户只能靠手动刷新才看得到"可访问 / 已失效"，而多数人不会刷。
+    if (targetPage === 1) {
+      scheduleCheckRefresh(seq, {
+        q,
+        platforms: activePlatform.value,
+        page: targetPage,
+        pageSize: PAGE_SIZE,
+      })
+    }
   } catch (e) {
     items.value = []
     total.value = 0
@@ -354,6 +405,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (elapsedTimer) clearInterval(elapsedTimer)
+  clearCheckRefresh()
 })
 </script>
 
