@@ -894,9 +894,12 @@ def summary() -> dict:
                 "tempDir": a.temp_dir,
                 "hasCookie": bool(a.cookie),
                 "hasToken": bool(a.access_token or a.refresh_token),
-                # 能不能自动续期。false 就是"token 用满 30 天就没了"，
-                # 后台要能一眼看出来，别等它悄悄死掉
-                "hasOAuth": bool(a.extra.get("client_id") and a.extra.get("client_secret")),
+                # 能不能自动续期，看的就是有没有 refresh_token。
+                # 原来判的是 extra 里有没有 client_id/client_secret，那只对百度成立
+                # （它是 OAuth 应用）；迅雷、光鸭的 client_id 写死在适配器里，账号
+                # 表里根本没有这一项，于是配了 refresh_token 也被标成"不会续期"，
+                # 后台显示和实际能力是反的。
+                "hasOAuth": bool(a.refresh_token),
                 "failCount": a.fail_count,
                 "lastError": a.last_error,
                 "expiresAt": a.expires_at,

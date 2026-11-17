@@ -317,11 +317,27 @@ class GuangyaClient(PanClient):
         self._ok(resp, "删除文件")
 
     def probe(self) -> bool:
+        return bool(self.probe_detail().get("ok"))
+
+    def probe_detail(self) -> dict:
+        """和迅雷同源的问题：只调 `_token()` 会不发网络、还吞掉原因。
+
+        库里期限未到时 `_token()` 直接返回缓存 token 就判通过，账号实际已经
+        401 全挂；失败原因也被压成 False，后台只剩一句"账号登录态不可用"。
+        改成 token + 列根目录两步分开报。
+        """
+        detail: dict[str, object] = {}
         try:
             self._token()
-            return True
-        except NetdiskError:
-            return False
+        except NetdiskError as exc:
+            return {"ok": False, "reason": str(exc), "detail": {**detail, "stage": "token"}}
+        detail["tokenLeft"] = max(0, int(self._expires - time.time()))
+        try:
+            files = self.list_files("", 1, 1)
+        except NetdiskError as exc:
+            return {"ok": False, "reason": str(exc), "detail": {**detail, "stage": "list"}}
+        detail["rootFiles"] = len(files)
+        return {"ok": True, "reason": "", "detail": detail}
 
 
 def _device_id() -> str:

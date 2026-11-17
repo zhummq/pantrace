@@ -322,7 +322,7 @@ function label(item) {
 function credText(item) {
   const parts = []
   if (item.hasCookie) parts.push('Cookie')
-  if (item.hasToken) parts.push(item.hasOAuth ? 'OAuth（可续期）' : 'Token（不会续期）')
+  if (item.hasToken) parts.push(item.hasOAuth ? 'Token（可自动续期）' : 'Token（不会续期）')
   return parts.length ? parts.join(' + ') : '无凭据'
 }
 

@@ -409,11 +409,33 @@ class XunleiClient(PanClient):
         )
 
     def probe(self) -> bool:
+        return bool(self.probe_detail().get("ok"))
+
+    def probe_detail(self) -> dict:
+        """真发一次请求，并把失败原因原样带出去。
+
+        以前这里只调 `_token()`，有两个毛病，2026-11 迅雷账号"后台显示正常、
+        实际全 401"就是它们叠出来的：
+
+        1. **不发网络**。库里 `expires_at` 还没到时 `_token()` 直接返回缓存
+           token，一次请求都不打，于是账号早废了也判 True。
+        2. **吞掉原因**。异常被压成 False，上层只能回一句"账号登录态不可用"，
+           分不清是 refresh_token 被吊销、目录没权限还是网络不通。
+
+        现在 token 和列根目录两步分开报，`detail` 里带 token 剩余秒数。
+        """
+        detail: dict[str, object] = {}
         try:
             self._token()
-            return True
-        except NetdiskError:
-            return False
+        except NetdiskError as exc:
+            return {"ok": False, "reason": str(exc), "detail": {**detail, "stage": "token"}}
+        detail["tokenLeft"] = max(0, int(self._expires_at - time.time()))
+        try:
+            files = self.list_files("", 1, 1)
+        except NetdiskError as exc:
+            return {"ok": False, "reason": str(exc), "detail": {**detail, "stage": "list"}}
+        detail["rootFiles"] = len(files)
+        return {"ok": True, "reason": "", "detail": detail}
 
 
 def _trace_ids(raw: object) -> list[str]:

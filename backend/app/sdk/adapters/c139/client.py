@@ -348,11 +348,15 @@ class C139Client(PanClient):
         self._cloud_post(BATCH_TRASH_URL, {"fileIds": fids}, "删除文件")
 
     def probe(self) -> bool:
+        return bool(self.probe_detail().get("ok"))
+
+    def probe_detail(self) -> dict:
+        """把失败原因带出去，别让后台只剩"账号登录态不可用"一句话。"""
         try:
-            self.list_files("", 1, 1)
-            return True
-        except NetdiskError:
-            return False
+            files = self.list_files("", 1, 1)
+        except NetdiskError as exc:
+            return {"ok": False, "reason": f"列目录失败：{exc}", "detail": {}}
+        return {"ok": True, "reason": "", "detail": {"rootFiles": len(files)}}
 
 
 def _account_of(authorization: str) -> str:

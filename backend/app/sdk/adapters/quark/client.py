@@ -596,11 +596,19 @@ class QuarkClient(PanClient):
             log.info("%s 保活失败：%s", self.display, exc)
 
     def probe(self) -> bool:
+        return bool(self.probe_detail().get("ok"))
+
+    def probe_detail(self) -> dict:
+        """把失败原因带出去。
+
+        以前只返回 True/False，`pan.probe` 拿不到原因，只能回一句"账号登录态
+        不可用"——cookie 过期、被风控、网络不通三种情况在后台长得一模一样。
+        """
         try:
             self.http.get("/auth/pc/flush", action="探测账号")
-            return True
-        except NetdiskError:
-            return False
+        except NetdiskError as exc:
+            return {"ok": False, "reason": f"保活接口不通：{exc}", "detail": {}}
+        return {"ok": True, "reason": "", "detail": {}}
 
     # ---- 目录 ----
 
