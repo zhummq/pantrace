@@ -2,6 +2,7 @@ export const PLATFORM_NAMES = {
   quark: '夸克网盘',
   baidu: '百度网盘',
   ali: '阿里云盘',
+  aliyun: '阿里云盘',   // 链接检测模块用的是网盘自己的叫法
   uc: 'UC网盘',
   xunlei: '迅雷网盘',
   115: '115网盘',

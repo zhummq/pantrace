@@ -7,6 +7,7 @@ import ZeroPanel from './components/ZeroPanel.vue'
 import AccountsPanel from './components/AccountsPanel.vue'
 import GroupPanel from './components/GroupPanel.vue'
 import ClicksPanel from './components/ClicksPanel.vue'
+import LinkCheckPanel from './components/LinkCheckPanel.vue'
 import * as api from './api'
 import { ms, pct } from './format'
 
@@ -27,6 +28,7 @@ const lastLoaded = ref('')
 const feedbackPanel = ref(null)
 const accountsPanel = ref(null)
 const groupPanel = ref(null)
+const linkCheckPanel = ref(null)
 
 const o = computed(() => data.value.overview || {})
 const rangeText = computed(() => (days.value === 1 ? '今天' : `近 ${days.value} 天`))
@@ -69,7 +71,7 @@ async function loadStats(silent = false) {
 
 function loadAll() {
   loadStats()
-  for (const p of [feedbackPanel, accountsPanel]) {
+  for (const p of [feedbackPanel, accountsPanel, linkCheckPanel]) {
     if (p.value) p.value.reload()
   }
 }
@@ -148,6 +150,7 @@ onUnmounted(() => {
       <ZeroPanel :data="data" />
       <FeedbackPanel ref="feedbackPanel" :days="days" />
       <AccountsPanel ref="accountsPanel" />
+      <LinkCheckPanel ref="linkCheckPanel" />
       <GroupPanel ref="groupPanel" />
       <ClicksPanel :data="data" />
     </template>

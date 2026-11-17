@@ -87,3 +87,9 @@ export const cleanupMirrors = (coldDays) =>
   api(`/api/admin/maintain/cleanup?cold_days=${coldDays || 0}`, { method: 'POST' })
 export const mirrorTest = (url, pwd) =>
   api('/api/admin/mirror/test', { method: 'POST', body: { url, pwd: pwd || '' } })
+
+// 链接存活检测：列表 + 手工验一条（验接口是否还活着，也是误判复位入口）
+export const linkCheck = (state = '', limit = 30) =>
+  api(`/api/admin/link-check?state=${encodeURIComponent(state)}&limit=${limit}`)
+export const linkCheckTest = (url, pwd) =>
+  api('/api/admin/link-check/test', { method: 'POST', body: { url, pwd: pwd || '' } })

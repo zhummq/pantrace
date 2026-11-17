@@ -76,6 +76,19 @@ const fileCountText = computed(() => {
 
 const copied = ref('')
 
+// 后端异步探活的结果，只透传结论，不下发上游原始文案。
+// ok 不显示任何东西——每条都挂个"已核验"等于噪声，用户只需要知道哪条有问题。
+const checkChip = computed(() => {
+  const state = props.item.checkState
+  if (state === 'bad') {
+    return { tone: 'bad', text: '已失效', tip: '实测该分享已无法访问，可能已被删除或取消。' }
+  }
+  if (state === 'locked') {
+    return { tone: 'locked', text: '需提取码', tip: '该分享需要提取码，但原始结果里没有带。' }
+  }
+  return null
+})
+
 // 点击走 beacon：链接是 target=_blank，但用户可能秒关标签页，
 // 常规 fetch 不保证发得出去。这是转化率指标的源头，不能丢。
 function onClick() {
@@ -162,6 +175,14 @@ async function onCopyPwd() {
           <span v-if="fileCountText">{{ fileCountText }}</span>
           <i v-if="fileCountText" class="dot"></i>
           <span>{{ sizeText }}</span>
+          <!-- 存活检测结论：只在有问题时出现（失效/需提取码），
+               有效不标——每条都挂"已核验"等于噪声 -->
+          <span
+            v-if="checkChip"
+            class="state-chip"
+            :class="checkChip.tone"
+            :title="checkChip.tip"
+          >{{ checkChip.text }}</span>
           <!-- 时效提示收敛成一个小徽标：完整说明整页只出现一次（列表顶部），
                悬停可看全文；一页十条整句提示等于免责声明刷屏 -->
           <span
@@ -233,6 +254,29 @@ async function onCopyPwd() {
   border-color: var(--line-2);
   box-shadow: var(--shadow-md);
   transform: translateY(-1px);
+}
+
+/* 存活检测徽标：失效=红，需提取码=琥珀。只在异常时出现 */
+.state-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.6;
+  font-weight: 600;
+  cursor: help;
+  user-select: none;
+}
+
+.state-chip.bad {
+  color: var(--danger);
+  background: rgba(200, 60, 50, 0.08);
+}
+
+.state-chip.locked {
+  color: var(--warn);
+  background: rgba(201, 106, 9, 0.08);
 }
 
 /* 时效徽标：弱化的暖色药丸，悬停出全文提示 */
