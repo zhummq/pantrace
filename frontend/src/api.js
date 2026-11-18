@@ -46,13 +46,17 @@ async function request(path, params = {}, extraHeaders = {}) {
   return checked(out)
 }
 
-export function searchResources({ q, platforms, page, pageSize, searchIn = 'title' }) {
+export function searchResources({ q, platforms, page, pageSize, searchIn = 'title', refresh = false }) {
   return request('/api/search', {
     q,
     platforms,
     page,
     page_size: pageSize,
     search_in: searchIn,
+    // 强制回源会真实消耗上游额度（后端按 3 份配额计），只有用户主动点
+    // 「强制刷新」才带。翻页 / 换平台 / 检测结论补拉一律走缓存。
+    // 传 undefined 时 rawRequest 会跳过，不会给普通请求拼上 refresh=0。
+    refresh: refresh ? 1 : undefined,
   })
 }
 

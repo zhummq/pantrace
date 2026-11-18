@@ -17,10 +17,16 @@ const keyword = ref('')
 const lastKeyword = ref('')
 const activePlatform = ref('')
 const platforms = ref([])
+// 没选网盘就去点搜索时置 true：搜索框不动，把提示打到平台行上，
+// 让用户看见"缺的是这一步"，而不是弹一个说完就没的 tostring。
+const needPlatform = ref(false)
 
 // ---- 平台偏好 ----
-// 只记"用户主动选了哪个平台"，下次进站默认就查它。
-// 没选过（或点回"全部平台"）就是空 = 全平台，新用户完全不受影响。
+// 只记"用户主动选了哪个网盘"，下次进站默认用它。
+//
+// **不选 = 不搜**（2026-11-18 改）。以前空值代表"全部平台"，一次搜索背后是
+// 5 个平台 × 2 页 = 10 个计费请求；改成"先选网盘再搜"以后，一次搜索最多
+// 2 个请求。所以这里再没有"全部"这个选项，空值只表示"还没选"。
 const PREF_KEY = 'pt_pref_platform'
 
 const items = ref([])
@@ -29,10 +35,38 @@ const totalPages = ref(0)
 const total = ref(0)
 const tookMs = ref(0)
 
+// 后端单飞锁 / 响应缓存 / 分层通道的回声。用来告诉用户眼前这一屏是
+// 刚回源拿的、命中 5 分钟缓存的，还是和同时到达的同键请求合并出来的。
+const cached = ref(false)
+const shared = ref(false)
+const tier = ref('')
+
+// 强制刷新不进骨架屏：结果面板原地更新，只把刷新按钮切成「刷新中」。
+// 和 loading 分开是刻意的 —— 刷新失败时 20 条结果必须留在原地，
+// 不能因为一次 429 就把用户已经看到的东西换成错误页。
+const refreshing = ref(false)
+const refreshError = ref('')
+
 const loading = ref(false)
 // 等 40 秒的时候，一个跳动的秒数比一句"加载中"有用得多
 const elapsed = ref(0)
 let elapsedTimer = null
+
+// 防重入统一看这里：刷新期间也不允许切平台 / 翻页 / 再发一次搜索，
+// 否则两个请求会互相覆盖，或者白白多花一份额度。
+const busy = computed(() => loading.value || refreshing.value)
+
+const resultLabel = computed(() => {
+  if (shared.value) return '并发合并'
+  if (cached.value) return '缓存结果'
+  return '实时结果'
+})
+
+const tierLabel = computed(() => {
+  if (tier.value === 'tg') return 'TG 免费通道'
+  if (tier.value === 'plugin') return '已切换备用源'
+  return ''
+})
 
 // 序号用于丢弃过期请求：用户连搜两次时，先发那次的后台补拉不能覆盖新结果
 let searchSeq = 0
@@ -43,6 +77,13 @@ const searched = ref(false)
 
 const showEmpty = computed(() => !loading.value && !error.value && searched.value && items.value.length === 0)
 const sourceCount = computed(() => platforms.value.length)
+
+// 加载文案里点名在查哪个盘：单平台查询时"正在聚合各平台"是假的，
+// 用户也该知道自己这次等的是哪个盘的结果。
+const activePlatformName = computed(() => {
+  const p = platforms.value.find((x) => x.key === activePlatform.value)
+  return p?.name || '网盘'
+})
 
 const totalText = computed(() =>
   total.value > 0 ? total.value.toLocaleString('zh-CN') : String(total.value)
@@ -250,24 +291,38 @@ async function refreshCheckStates(seq, args) {
   }
 }
 
-async function doSearch(targetPage = 1) {
+async function doSearch(targetPage = 1, opts = {}) {
+  const force = !!opts.refresh
   const q = keyword.value.trim()
   if (!q) return
-  if (loading.value) return
+  if (busy.value) return
+  // 没选网盘就不打上游。以前这里会退化成"全平台"，一次 10 个计费请求，
+  // 用户还以为自己只是搜了个词。现在缺这一步就把提示推到平台行上。
+  if (!activePlatform.value) {
+    needPlatform.value = true
+    return
+  }
+  needPlatform.value = false
 
   const seq = ++searchSeq
   clearCheckRefresh()
-  loading.value = true
+  refreshError.value = ''
+  // 刷新只置 refreshing：模板的骨架屏看 loading，结果面板因此不会被闪掉。
+  if (force) refreshing.value = true
+  else loading.value = true
   error.value = ''
   searched.value = true
   page.value = targetPage
   lastKeyword.value = q
 
-  elapsed.value = 0
-  if (elapsedTimer) clearInterval(elapsedTimer)
-  elapsedTimer = setInterval(() => {
-    elapsed.value += 1
-  }, 1000)
+  // 刷新不启动秒表：结果面板没消失，没有"等了多久"这一说。
+  if (!force) {
+    elapsed.value = 0
+    if (elapsedTimer) clearInterval(elapsedTimer)
+    elapsedTimer = setInterval(() => {
+      elapsed.value += 1
+    }, 1000)
+  }
 
   try {
     const data = await searchResources({
@@ -275,15 +330,30 @@ async function doSearch(targetPage = 1) {
       platforms: activePlatform.value,
       page: targetPage,
       pageSize: PAGE_SIZE,
+      refresh: force,
     })
     items.value = data.items || []
     total.value = data.pagination?.total || 0
     totalPages.value = data.pagination?.totalPages || 0
     tookMs.value = data.tookMs || 0
+    cached.value = !!data.cached
+    shared.value = !!data.shared
+    tier.value = data.tier || ''
+    if (force) {
+      // 后端自己会记一条 search(cached=0)，但分不出是首搜还是主动刷新。
+      // 这条事件只记"用户点了刷新"这个意图，用于判断结果是否不够新。
+      track('refresh', {
+        query: q,
+        platform: activePlatform.value,
+        resultCount: items.value.length,
+        meta: { tier: tier.value, page: targetPage },
+      })
+    }
     syncUrl()
     if (targetPage > 1) window.scrollTo({ top: 0, behavior: 'smooth' })
     // 探活跑在响应之后（后端 BackgroundTasks），这一屏注定还没有角标。
     // 不补拉一次，用户只能靠手动刷新才看得到"可访问 / 已失效"，而多数人不会刷。
+    // 刷新后同样重排：补拉不带 refresh，命中的正是刚写回的那份缓存。
     if (targetPage === 1) {
       scheduleCheckRefresh(seq, {
         q,
@@ -293,17 +363,34 @@ async function doSearch(targetPage = 1) {
       })
     }
   } catch (e) {
-    items.value = []
-    total.value = 0
-    totalPages.value = 0
-    error.value = e.message || '搜索失败，请稍后重试'
+    if (force) {
+      // 刷新失败（多为 429 配额 / 上游抖动）保留当前结果。把已看到的 20 条
+      // 清空换成错误页是纯粹的倒退，只给一条就地提示。
+      refreshError.value = e.message || '刷新失败，请稍后重试'
+    } else {
+      items.value = []
+      total.value = 0
+      totalPages.value = 0
+      cached.value = false
+      shared.value = false
+      tier.value = ''
+      error.value = e.message || '搜索失败，请稍后重试'
+    }
   } finally {
-    loading.value = false
+    if (force) refreshing.value = false
+    else loading.value = false
     if (elapsedTimer) {
       clearInterval(elapsedTimer)
       elapsedTimer = null
     }
   }
+}
+
+// 跳过 5 分钟缓存重新查一次。后端按 3 份配额计（30 次/分钟 → 最多 10 次），
+// 所以按钮只在有结果时可用，且刷新期间禁用，避免连点把额度打光。
+function forceRefresh() {
+  if (busy.value || !items.value.length) return
+  doSearch(page.value, { refresh: true })
 }
 
 // 手机端 chip 用短名（夸克 / 百度 / 阿里…），避免"网盘"后缀把 14 个平台
@@ -347,14 +434,17 @@ function writePrefPlatform(key) {
   }
 }
 
-// 按当前选中的平台重新查一次上游：单平台查询拿到的是这个平台自己的完整排序，
+// 按选中的网盘查上游：单平台查询拿到的是这个平台自己的完整排序，
 // 比"从混排的 20 条里挑出属于它的几条"准得多，这是用户点 chip 期待的东西。
+// 也是唯一一次搜索只有 1~2 个请求的原因：一次只问一个盘。
 function pickPlatform(key) {
+  if (!key) return                 // 没有"全部"档了，空值只表示还没选
   if (activePlatform.value === key) return
   // 正在查询时不给切：否则要么结果和选中的 chip 对不上，
-  // 要么并发两个请求互相覆盖。一次查询只有一两秒，等它落地再切。
-  if (loading.value) return
+  // 要么并发两个请求互相覆盖（刷新期间同样不让切）。
+  if (busy.value) return
   activePlatform.value = key
+  needPlatform.value = false
   writePrefPlatform(key)
   // 筛选行为本身值得记：哪个平台被偏爱、筛选后还有没有人继续搜
   track('filter', {
@@ -365,13 +455,15 @@ function pickPlatform(key) {
   if (searched.value) doSearch(1)
 }
 
-// 空结果时点"搜索全部平台"：换平台本身就会重新查，不需要再补一次
-function searchAllPlatforms() {
-  pickPlatform('')
+// 空结果时用：把视线拉回平台行，让用户换一个盘再试。
+// 这里不再有"搜索全部平台"——那正是要砍掉的那个 10 请求动作。
+function backToPlatforms() {
+  needPlatform.value = true
+  document.querySelector('.filter-rows')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 function goPage(p) {
-  if (p < 1 || p > totalPages.value || p === page.value || loading.value) return
+  if (p < 1 || p > totalPages.value || p === page.value || busy.value) return
   track('page', {
     query: lastKeyword.value,
     platform: activePlatform.value,
@@ -386,7 +478,7 @@ function retry() {
 }
 
 function quickSearch(word) {
-  if (loading.value) return
+  if (busy.value) return
   keyword.value = word
   doSearch(1)
 }
@@ -527,16 +619,17 @@ onBeforeUnmount(() => {
           <input
             v-model="keyword"
             type="search"
-            placeholder="搜影视、电子书、学习资料…"
+            :placeholder="activePlatform ? '搜影视、电子书、学习资料…' : '先在下面选一个网盘，再搜资源'"
             autocomplete="off"
             autocapitalize="off"
             spellcheck="false"
             enterkeyhint="search"
             maxlength="100"
             aria-label="搜索关键词"
+            @focus="needPlatform = !activePlatform"
           />
-          <button class="sb-go" type="submit" :disabled="loading || !keyword.trim()">
-            {{ loading ? '搜索中' : '搜索' }}
+          <button class="sb-go" type="submit" :disabled="busy || !keyword.trim()">
+            {{ busy ? '搜索中' : '搜索' }}
           </button>
           <span v-if="loading" class="scanline" aria-hidden="true"></span>
         </form>
@@ -555,23 +648,12 @@ onBeforeUnmount(() => {
         </div>
 
         <!-- 平台筛选放在搜索框正下方：这一行本身就是"收录了哪些网盘"的说明书，
-             不用先去搜一次才知道能筛什么。不选 = 全平台。 -->
-        <div class="filter-rows" role="group" aria-label="平台筛选">
+             不用先去搜一次才知道能筛什么。**必须选一个**——没选就不发搜索请求，
+             因为每个网盘都是一次独立计费上游查询。 -->
+        <div class="filter-rows" :class="{ 'need-pick': needPlatform }" role="group" aria-label="选择网盘">
           <div class="frow">
-            <span class="frow-label">云盘</span>
+            <span class="frow-label">{{ needPlatform ? '先选一个' : '云盘' }}</span>
             <div class="frow-body">
-              <button
-                class="pchip"
-                :class="{ on: activePlatform === '' }"
-                @click="pickPlatform('')"
-              >
-                <i class="pchip-ic all" aria-hidden="true">
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round">
-                    <path d="M4 6h16M4 12h16M4 18h16" />
-                  </svg>
-                </i>
-                <span>全部</span>
-              </button>
               <button
                 v-for="p in platforms"
                 :key="p.key"
@@ -586,6 +668,9 @@ onBeforeUnmount(() => {
               </button>
             </div>
           </div>
+          <p v-if="needPlatform" class="frow-hint">
+            选一个网盘再搜 —— 每次搜索只查你选的那个，速度更快
+          </p>
         </div>
       </div>
     </section>
@@ -596,7 +681,7 @@ onBeforeUnmount(() => {
           <span class="scan-label mono">SCANNING</span>
           <span class="scan-count mono" v-if="elapsed">{{ elapsed }}s</span>
         </div>
-        <p class="loading-hint">正在聚合各平台结果，通常 1–3 秒。</p>
+        <p class="loading-hint">正在检索 {{ activePlatformName }}，通常 1–3 秒。</p>
         <div class="scan-track" aria-hidden="true"><i></i></div>
         <div class="skeleton-list">
           <div v-for="i in 4" :key="i" class="skeleton">
@@ -619,8 +704,8 @@ onBeforeUnmount(() => {
       <div v-else-if="showEmpty" class="state">
         <div class="state-icon empty">∅</div>
         <p class="state-title">没有找到「{{ lastKeyword }}」</p>
-        <p class="state-desc">换个关键词试试，或者先取消平台筛选看看全部来源。</p>
-        <button v-if="activePlatform" class="retry" @click="searchAllPlatforms">搜索全部平台</button>
+        <p class="state-desc">换个关键词试试，或者换一个网盘再搜。</p>
+        <button class="retry" @click="backToPlatforms">换个网盘</button>
         <p class="state-more">
           都没有？
           <button class="link" @click="openFeedback('request')">告诉我你要找什么</button>
@@ -630,10 +715,29 @@ onBeforeUnmount(() => {
       <section v-else-if="items.length" class="panel">
         <header class="panel-head">
           <span class="panel-title"><i class="panel-dot"></i>搜索结果</span>
-          <span class="panel-meta mono">
-            {{ totalText }} 条 · {{ tookMs }}ms · {{ page }}/{{ totalPages }} 页
-          </span>
+          <div class="panel-tools">
+            <span class="state-chip" :class="{ saved: cached || shared }">{{ resultLabel }}</span>
+            <span v-if="tierLabel" class="state-chip">{{ tierLabel }}</span>
+            <button
+              class="refresh-btn"
+              type="button"
+              :disabled="busy"
+              title="跳过 5 分钟缓存重新查一次（会消耗搜索额度）"
+              @click="forceRefresh"
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+                <path d="M21 3v6h-6" />
+              </svg>
+              <span>{{ refreshing ? '刷新中' : '强制刷新' }}</span>
+            </button>
+            <span class="panel-meta mono">
+              {{ totalText }} 条 · <template v-if="shared">复用</template><template v-else>{{ tookMs }}ms</template> · {{ page }}/{{ totalPages }} 页
+            </span>
+          </div>
         </header>
+        <!-- 刷新失败只就地提示，结果不清空：被限流时把已看到的 20 条换成错误页是倒退 -->
+        <p v-if="refreshError" class="refresh-note">{{ refreshError }}</p>
 
         <!-- 时效说明整页只出现一次：贴着结果头，信息完整但不刷屏；
              每张卡片内的「30 分钟内有效」徽标负责就近提醒 -->
@@ -1070,6 +1174,20 @@ onBeforeUnmount(() => {
   display: contents;
 }
 
+/* 没选网盘时的提示：跨两列贴在 chip 下方，和 chip 同属一个视觉块，
+   不能挤进 44px 的 label 列，也不能把 chip 顶下去。 */
+.frow-hint {
+  grid-column: 1 / -1;
+  margin: calc(-1 * var(--sp-1)) 0 0;
+  font-size: var(--text-sm);
+  color: var(--brand-400);
+}
+
+/* 缺的就是这一步：把标签点亮点，视线自然会落到该点的地方 */
+.filter-rows.need-pick .frow-label {
+  color: var(--brand-400);
+}
+
 .frow-label {
   padding-top: 6px;
   font-size: var(--text-sm);
@@ -1214,6 +1332,78 @@ onBeforeUnmount(() => {
 .panel-meta {
   font-size: var(--text-xs);
   color: var(--muted);
+}
+
+/* 结果头右侧：状态徽标 + 强制刷新 + 计数。窄屏靠 flex-wrap 自然换行，
+   不把 panel-head 拆成定高两行，行数由内容自己决定。 */
+.panel-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.state-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: var(--text-2xs);
+  line-height: 1;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* 缓存命中 / 同键搭车 = 这一轮没花额度，用品牌色点出来。
+   --warn 只留给真正的警示，不用在这里。 */
+.state-chip.saved {
+  border-color: var(--brand-ring);
+  background: var(--brand-soft);
+  color: var(--brand-ink);
+}
+
+.refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--brand-ring);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-size: var(--text-xs);
+  color: var(--brand-ink);
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+}
+
+.refresh-btn svg {
+  flex-shrink: 0;
+}
+
+/* 静止态淡青绿描边，hover 才填满：结果头只该有一个实心亮块 */
+.refresh-btn:hover:not(:disabled) {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: var(--on-brand);
+}
+
+.refresh-btn:disabled {
+  opacity: .45;
+  cursor: default;
+}
+
+.refresh-note {
+  margin: 0;
+  padding: 8px var(--sp-5);
+  border-bottom: 1px solid var(--warn-soft);
+  background: var(--warn-soft);
+  font-size: var(--text-sm);
+  color: var(--warn-ink);
 }
 
 .ttl-note {
@@ -1711,6 +1901,11 @@ onBeforeUnmount(() => {
     flex-direction: column;
     align-items: flex-start;
     gap: 4px;
+  }
+
+  .panel-tools {
+    justify-content: flex-start;
+    gap: 5px;
   }
 
   .pg {
