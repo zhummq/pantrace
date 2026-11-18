@@ -33,6 +33,7 @@ import httpx
 
 from ...config import get_settings
 from ..base import BasePlugin
+from ..tg import config_store as tg_config
 from ..registry import register
 from ..tg import TG, search_tg, tg_cache_key
 from ..types import SearchResult
@@ -51,14 +52,17 @@ class TGUnreachable(httpx.ConnectError):
 
 
 def _channels(value) -> list[str]:
-    """ext 里给了频道就用给的，否则读配置。`@name` 和 `name` 等价。"""
+    """优先级：ext 指定 > 库中配置（后台改的）> .env 的 TG_CHANNELS。
+
+    `@name` 和 `name` 等价。ext 用于单通道强制查询，不能被后台配置盖掉。
+    """
     if isinstance(value, str):
         value = value.split(",")
     if isinstance(value, (list, tuple)):
         channels = [str(c).strip().lstrip("@") for c in value if str(c).strip()]
         if channels:
             return channels
-    return get_settings().tg_channel_list
+    return tg_config.effective(get_settings().tg_channel_list)
 
 
 @register

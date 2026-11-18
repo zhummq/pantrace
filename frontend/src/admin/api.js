@@ -94,6 +94,14 @@ export const linkCheck = (state = '', limit = 30) =>
 export const linkCheckTest = (url, pwd) =>
   api('/api/admin/link-check/test', { method: 'POST', body: { url, pwd: pwd || '' } })
 
+// TG 频道：库优先于 .env，保存即热更；空列表 = 暂停采集，不是回退到默认
+export const tgChannels = () => api('/api/admin/tg-channels')
+export const saveTgChannels = (payload) =>
+  api('/api/admin/tg-channels', { method: 'POST', body: payload })
+export const resetTgChannels = () => api('/api/admin/tg-channels/reset', { method: 'POST' })
+export const probeTgChannel = (channel) =>
+  api('/api/admin/tg-channels/probe', { method: 'POST', body: { channel } })
+
 // 广告过滤：读的是"当前生效值"（库优先于 .env），保存后热更，不用重启
 export const adFilter = () => api('/api/admin/ad-filter')
 export const saveAdFilter = (payload) =>

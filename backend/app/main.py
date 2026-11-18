@@ -32,13 +32,18 @@ from .search.registry import close_clients as close_source_clients, load_all as 
 from .search.singleflight import SingleFlight
 from .search.observe import liveness
 from .search.pool import stats as source_stats
-from .search.tg import TG as TG_GATE
+from .search.tg import TG as TG_GATE, search_channel as tg_search_channel
+from .search.tg import config_store as tg_channels
 from .sdk import adfilter, registry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pantrace")
 
 settings = get_settings()
+
+# TG 频道：库里改过就用库里的，没改过沿用 .env。必须在加载插件之前初始化，
+# 否则插件第一次搜索读到的还是旧值（插件本身每次实时取，不会缓存这个列表）。
+tg_channels.init(settings.analytics_path, default_channels=settings.tg_channel_list)
 
 # 防刷：IP 滑动窗口 + 匿名票据。放在所有接口前面，后面 /api/ticket 和
 # /api/search 都用它。密钥留空时跟转存签名一样从 apikey|签名派生。
@@ -680,7 +685,11 @@ async def health():
             # 重启后第一次搜索失败时，靠这个才能知道是谁失败了、什么分类。
             "lastRound": search_engine.last_round(),
         },
-        "tgGate": TG_GATE.snapshot() if any(p.name == "tg_searchers" for p in _sources) else {"enabled": False},
+        "tgGate": (
+            {**TG_GATE.snapshot(), "channels": tg_channels.effective(settings.tg_channel_list)}
+            if any(p.name == "tg_searchers" for p in _sources)
+            else {"enabled": False}
+        ),
         "analytics": ANALYTICS_ON,
         "feedback": FEEDBACK_ON,
         "mirror": MIRROR_ON,
@@ -1456,6 +1465,79 @@ async def admin_ad_filter_probe(payload: AdProbeIn, request: Request):
             is_dir=payload.is_dir,
         ),
     }
+
+
+# ---- TG 频道配置 ----
+#
+# 频道从 .env 的 TG_CHANNELS 搬进了库，后台直接维护，保存即热更。
+# .env 仍保留为"恢复默认"的基线，不再需要为了加一个频道去重启服务。
+
+
+class TgChannelsIn(BaseModel):
+    channels: list[str] | str = Field(default_factory=list)
+
+
+class TgProbeIn(BaseModel):
+    channel: str = ""
+
+
+def _tg_payload() -> dict:
+    """把"当前生效值"和"默认值"分开给前端，不然用户分不清改没改过。"""
+    override = tg_channels.configured()
+    return {
+        "channels": override if override is not None else settings.tg_channel_list,
+        "source": "admin" if override is not None else "env",
+        "defaults": settings.tg_channel_list,
+        "max": tg_channels.MAX_CHANNELS,
+        # TG 源没启用时配置照样能存，但不会生效——界面必须说清楚
+        "enabled": any(p.name == "tg_searchers" for p in _sources),
+    }
+
+
+@app.get("/api/admin/tg-channels", include_in_schema=False)
+async def admin_tg_channels_get(request: Request):
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    return {"code": 0, "data": _tg_payload()}
+
+
+@app.post("/api/admin/tg-channels", include_in_schema=False)
+async def admin_tg_channels_save(payload: TgChannelsIn, request: Request):
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        tg_channels.save(payload.channels)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+    return {"code": 0, "data": _tg_payload()}
+
+
+@app.post("/api/admin/tg-channels/reset", include_in_schema=False)
+async def admin_tg_channels_reset(request: Request):
+    """删掉库里的覆盖，回到 .env。空列表是有效配置，不能当成"没配置"。"""
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    tg_channels.clear()
+    return {"code": 0, "data": _tg_payload()}
+
+
+@app.post("/api/admin/tg-channels/probe", include_in_schema=False)
+async def admin_tg_channels_probe(payload: TgProbeIn, request: Request):
+    """抓一次频道公开页，确认它存在且能被解析器读懂。
+
+    不走可达性门：门是给搜索路径省时间的，后台排障要的是这个频道的真实结论。
+    """
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        names = tg_channels.normalize(payload.channel, allow_empty=False)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+    try:
+        results = await tg_search_channel("", names[0], timeout=6.0)
+    except Exception as exc:  # noqa: BLE001 - 排障接口要把失败原因原样给人看
+        return {"code": 0, "data": {"ok": False, "channel": names[0], "error": str(exc) or type(exc).__name__}}
+    return {"code": 0, "data": {"ok": True, "channel": names[0], "count": len(results)}}
 
 
 # ---- 网盘账号管理 ----

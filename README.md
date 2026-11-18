@@ -122,6 +122,8 @@ sed -i '/^TG_CHANNELS=/d' .env && echo 'TG_CHANNELS=tgsearchers7' >> .env
 sudo systemctl restart pantrace
 ```
 
+**频道列表不用再改 .env**：进 `/admin` →「TG 频道」直接增删，保存即热更，下一次搜索就用新频道。库里的值优先于 `TG_CHANNELS`；「恢复 .env 默认」会删掉覆盖，回到上面那份配置。两点容易踩：`ENABLED_SOURCES` 改的是**源开关**，仍需重启；频道留空表示**暂停 TG 采集**，是有效配置，不会偷偷回退到 `.env`。每个频道可以点「探测」，走线上同一套抓取与解析确认它还在，t.me 不通时会直接报网络错误。
+
 验证顺序，别跳过第一步就去搜：
 
 ```bash
