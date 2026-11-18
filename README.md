@@ -71,7 +71,7 @@ npm run dev
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/search?q=关键词&platforms=quark,baidu&page=1&page_size=20` | 搜索 |
+| GET | `/api/search?q=关键词&platforms=quark,baidu&page=1&page_size=20` | 搜索。`src=auto\|tg\|plugin` 选通道，`refresh=1`（或 pansou 叫法 `force_refresh=true`）跳过响应缓存强制回源，**会真实消耗额度** |
 | GET | `/api/platforms` | 平台列表（前端筛选用） |
 | GET | `/api/health` | 健康检查 |
 | GET | `/api/ticket` | 领匿名票据（前端进站静默调用，返回 `ticket` + `expiresIn`） |
@@ -95,6 +95,46 @@ npm run dev
 
 前端只拿到清洗后的字段（`platform` / `title` / `shareUrl` / `sharePwd` / `fileCount` / `sizeBytes`），**拿不到 apikey，也拿不到上游的 `highlightedTitle`**（那是远端 HTML，直接渲染就是 XSS 口子；高亮由前端自己按关键词标记，且先转义）。开了点击转存后，`shareUrl` 是 `/go/<签名token>` 而不是真实链接，`sharePwd` 恒为空。
 
+取数走 `backend/app/search/`（pansou 的插件机制：每源独立响应窗口、`complete` 语义缓存、失败分类、合并去重）。`providers.py` 现在只负责上游协议（拼请求体 / 鉴权头 / 返回码归一化），**不发请求**。启用哪些源由 `ENABLED_SOURCES` 决定，空 = 全关，默认 `tg_searchers,haisou`。
+
+**通道是分层的，不是并行的**：`tg_searchers` 是基础通道（免费无额度），`haisou` 是按量计费的兜底。同时启用时先跑 TG，拿到可用结果就结束——一次接口都不调；TG 不可达 / 零结果 / 没有用户要的网盘，才去调 haisou。`/api/search?src=` 可以强制单通道：`auto`（默认，分层）、`tg`（零成本）、`plugin`（只走计费）。响应里的 `tier` 告诉你这一轮花的钱是 TG 挣的还是 haisou 换的。
+
+**同一条查询同时来多个请求时，只打一次上游**（`search/singleflight.py`，对应 pansou 的 `main_cache_lock.go`）。缓存未命中期间的并发请求里，第一个当 leader 真去取数，其余搭车拿同一份结果（响应带 `shared: true`、`tookMs: 0`）。触发条件是用户连点、首屏多个组件同时发、或者有人拿脚本刷同一个词——正是最容易把额度烧成倍数的地方。leader 失败时搭车的一起失败，不会各自重试（那会把一次失败放大成 N 倍计费）；follower 等超过 30 秒会自己降级跑一遍，不会被 leader 拖死。
+
+`refresh=1`（或 pansou 叫法 `force_refresh=true`）绕过**两层**缓存（响应缓存 + 插件缓存）强制回源。两个细节别改坏：它不能被拼进缓存键（否则刷新和普通查询各留一份，用户刷完再搜还是旧的），它按 3 份限流配额计（30 次/分钟时最多刷 10 次，因为每一次都是真金白银）。
+
+**前端结果头把这些字段摊开给用户看**（`frontend/src/App.vue`）：`cached` + `shared` 翻成「实时结果 / 缓存结果 / 并发合并」，`tier` 翻成「TG 免费通道 / 已切换备用源」；`shared=true` 时耗时显示「复用」而不是那个会让人误以为超快的 `0ms`。右侧「强制刷新」按钮是**唯一**会带 `refresh=1` 的入口——翻页、换平台、检测结论补拉一律走缓存。刷新走独立的 `refreshing` 状态、不进骨架屏：面板原地更新，撞到 429 也只出一条就地提示，不清空用户已经看到的 20 条结果。前端另记一条 `refresh` 埋点，用来区分「首搜」和「用户主动要更新」——后端的 `search` 事件只能看到 `cached=0`，分不出这两者。
+
+### 启用 TG 通道（只在能直连 t.me 的机器上）
+
+前置：`curl -I https://t.me/s/tgsearchers7` 能拿到响应头。连不上就别开——门会自己关，但首次搜索要白等一个请求窗口。
+
+```bash
+# 1) 服务器上确认能通（返回 HTTP 200/302 都算通，超时/连接失败就是不通）
+curl -sI https://t.me/s/tgsearchers7 | head -1
+
+# 2) 改 .env（幂等：没有这行就追加，有就覆盖）
+cd /srv/pantrace/backend   # 换成你的部署路径
+sed -i '/^ENABLED_SOURCES=/d' .env && echo 'ENABLED_SOURCES=tg_searchers,haisou' >> .env
+sed -i '/^TG_CHANNELS=/d' .env && echo 'TG_CHANNELS=tgsearchers7' >> .env
+
+# 3) 重启（systemd 启动时才会读 .env）
+sudo systemctl restart pantrace
+```
+
+验证顺序，别跳过第一步就去搜：
+
+```bash
+# a. 源加载了、门开了（reachable=true，checked_seconds_ago 有数字）
+curl -s localhost:8000/api/health | python3 -m json.tool | grep -A6 tgGate
+
+# b. 零成本验一轮：src=tg 只跑 TG，不碰 haisou，一分额度都不花
+T=$(curl -s localhost:8000/api/ticket | python3 -c 'import sys,json;print(json.load(sys.stdin)["ticket"])')
+curl -s -H "x-ticket: $T" 'localhost:8000/api/search?q=电影&src=tg&platforms=quark&page_size=3' | head -c 600
+```
+
+`tier` 字段的含义：`tg` = 这一轮没花钱；`plugin` = TG 没给到能用的结果，兜底花了一份额度。如果 b 步返回空且 `tgGate.reachable=true`，是频道里真没这个词，不是通道坏了——换个更泛的词再试。
+
 ## 上游实测踩到的坑（改代码前先看）
 
 这几个都不在文档里，是实际调出来的：
@@ -102,9 +142,9 @@ npm run dev
 1. **不带浏览器 UA → 403**。请求必须带 `User-Agent`。
 2. **`platforms: []` 空数组 → 参数错误**。没有平台筛选时必须整个字段省略。
 3. **apikey 的位置跟着协议走**：控制台 MAPI 是放在请求体的 `params.apikey` 里（外层还套一层 `{path, method, params}`），早期直连套壳时才是 query string。别凭印象改。
-4. **httpx 走本机代理读超时，requests 正常**。所以后端用 requests + `asyncio.to_thread`，别改回 httpx。
-5. **平台 key 与文档示例不一致**。实测到的是 `quark` / `baidu` / `ali` / `xunlei` / `guangya` / `yidong`，阿里云盘是 `ali` 不是 `aliyun`。平台中文名一律以上游返回的 `platformName` 为准。
-6. **上游对连续请求极敏感**，同一 query 紧接第二次会挂到 120 秒超时。后端做了串行排队（最小间隔 2 秒）+ 5 分钟结果缓存，这是可用性底线，不要去掉。
+4. **httpx 必须显式 `trust_env=False`**。本机环境变量里有 `HTTP_PROXY`，httpx 默认会挂上，于是"直连"实际走了代理、表现为读超时。插件层的客户端统一关了（`search/base.build_clients`），别去掉。
+5. **平台 key 与文档示例不一致**。实测到的是 `quark` / `baidu` / `ali` / `xunlei` / `guangya` / `yidong`，阿里云盘是 `ali` 不是 `aliyun`。平台中文名一律以上游返回的 `platformName` 为准。插件里用的 `Link.type` 是 pansou 口径（`aliyun`），出口由 `search/adapter.py` 换回 `ali`，两套别混。
+6. **上游对连续请求敏感**，同一 query 紧接第二次容易撞 `code 1003`（限流）。处理在插件层：`MAX_CONCURRENCY=5` + `1003 → 429` 退避重试，再加 5 分钟响应缓存挡住重复查询。**`MIN_INTERVAL=2s` 的全局串行排队已经删掉**（那是旧单通道时代的东西，会把多源并发重新串起来、每次搜索白等 2 秒）——别照着老笔记加回去。
 7. **鉴权只认 `x-idr-sign`**。拆变量验证过：只带 `sid` 通，带 `sid`+`cf_clearance` 但去掉签名报 `1004`，完全不带 cookie 只有签名也通。所以后端不需要维护浏览器会话，也不需要存 `cf_clearance`。
 8. **签名会过期**，过期返回 `code 1004`。这条必须报给用户看，不要当成网络错误含糊过去。
 
@@ -145,6 +185,7 @@ python -c "import secrets;print(secrets.token_urlsafe(18))"   # 生成
 | `copy_pwd` | 前端 | 复制了提取码 |
 | `mirror` | **后端** | 点击转存的落地结果：`ok`/耗时/`source=cached/fresh/fallback`/失败原因 |
 | `filter` / `page` / `retry` | 前端 | 换平台、翻页、失败重试 |
+| `refresh` | 前端 | 结果页主动点「强制刷新」：跳过缓存回源，记录词、平台、刷新后条数与通道 |
 
 搜索走服务端记录，不怕广告拦截插件；点击这类动作必须前端报，所以用 `navigator.sendBeacon`，页面跳走也能发出去。
 
@@ -796,7 +837,7 @@ sudo rm -rf /var/www/pantrace
 | 点 | 说明 |
 |---|---|
 | **.env 用绝对路径读取** | 代码已按文件位置定位 `backend/.env`，不再依赖当前工作目录。如果你改了启动方式（比如 `cd /` 再起 uvicorn），也照样能读到。 |
-| **只能单 worker** | 缓存和上游串行锁都在进程内。`--workers 4` 会让四个进程各排各的队，等于没排队，上游立刻把你打到超时。要横向扩展必须先把这两样换成 Redis。 |
+| **只能单 worker** | 插件缓存（L1 内存 + L2 SQLite 合并写）、工作池、存活统计、TG 可达性门全在进程内。`--workers 4` 会变成四份各自独立的缓存和四套健康统计，日志里还分不清哪个进程在报错。要横向扩展必须先把 L1 缓存和统计换成 Redis。 |
 | **Nginx 超时要大于 75 秒** | `proxy_read_timeout 90s`。Nginx 默认 60 秒，会在后端还没返回时先断，用户看到 504，但上游其实已经扣了费。 |
 
 另一个容易忽略的：**别在 `.env` 里开 `USE_ENV_PROXY=true`**，除非服务器确实只能通过代理出网。海外机器和大部分云主机都能直连，走代理反而慢。
