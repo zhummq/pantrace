@@ -3,18 +3,24 @@ import { computed, ref } from 'vue'
 import Panel from './Panel.vue'
 import { platformName, shortTime } from '../format'
 
+/**
+ * 搜不到的词。
+ *
+ * 后端零结果口径有两个细节，界面上必须保留：
+ * - 只算首屏（page=1）：翻页越界造成的空页是分页边界，不是缺资源
+ * - 同时给 n 和 total：10 次里空 1 次和 10 次全空，补资源的优先级不是一回事
+ */
 const props = defineProps({
   data: { type: Object, default: () => ({}) },
+  limit: { type: Number, default: 0 },
 })
 
-// 后端 summary().zero_keywords：上游成功返回但 0 条的搜索词，按落空次数排序。
-// 只统计首屏（page=1），翻页越界造成的空页不算——那是分页边界，不是缺资源。
-const rows = computed(() => props.data.zero_keywords || [])
+const emit = defineEmits(['more'])
 
-const totalZero = computed(() =>
-  rows.value.reduce((s, r) => s + (Number(r.n) || 0), 0)
-)
-const max = computed(() => rows.value.reduce((m, r) => Math.max(m, Number(r.n) || 0), 1))
+const all = computed(() => props.data.zero_keywords || [])
+const rows = computed(() => (props.limit > 0 ? all.value.slice(0, props.limit) : all.value))
+const totalZero = computed(() => all.value.reduce((s, r) => s + (Number(r.n) || 0), 0))
+const max = computed(() => all.value.reduce((m, r) => Math.max(m, Number(r.n) || 0), 1))
 
 const copied = ref(false)
 
@@ -22,12 +28,11 @@ function barW(r) {
   return Math.max(3, Math.round(((Number(r.n) || 0) / max.value) * 100)) + '%'
 }
 
-// 点词直接去站内重搜一次：面板上看到的词，得能当场验证是不是真的没有
 function searchUrl(q) {
   return '/?q=' + encodeURIComponent(q)
 }
 
-// platform 是逗号分隔的 key 拼接，GROUP_CONCAT 之后会重复，这里先拆再去重
+// platform 是 GROUP_CONCAT 出来的逗号串，会重复，先拆再去重
 function plat(v) {
   const keys = String(v || '')
     .split(',')
@@ -38,13 +43,13 @@ function plat(v) {
 }
 
 async function copyAll() {
-  const text = rows.value.map((r) => r.q).join('\n')
+  const text = all.value.map((r) => r.q).join('\n')
   try {
     await navigator.clipboard.writeText(text)
     copied.value = true
     setTimeout(() => (copied.value = false), 1600)
   } catch {
-    /* 剪贴板不可用（非 https / 权限拒绝）就当没点，不弹错 */
+    /* 剪贴板不可用就当没点，不弹错 */
   }
 }
 </script>
@@ -52,41 +57,45 @@ async function copyAll() {
 <template>
   <Panel
     title="搜不到的词"
-    :tag="`${rows.length} 个词 · 零结果 ${totalZero} 次`"
-    :open="true"
+    :tag="all.length ? `${all.length} 个词 · 落空 ${totalZero} 次` : '没有零结果'"
   >
-    <p class="zk-hint">
-      首屏搜索、上游返回 0 条。点关键词直接去站内重搜验证；「零/总」是落空次数与总搜索次数——
-      10 次里空 1 次和 10 次全空，补资源的优先级不是一回事。
+    <template v-if="limit > 0" #extra>
+      <a v-if="all.length" @click="emit('more')">查看全部 {{ all.length }} 个</a>
+    </template>
+
+    <p v-if="limit === 0 && rows.length" class="zk-hint">
+      首屏搜索、上游返回 0 条。点词去站内重搜验证；「零/总」是落空次数与总搜索次数。
     </p>
 
     <div v-if="!rows.length" class="empty">这个区间没有零结果——上游都给得出东西</div>
 
     <template v-else>
-      <div class="zk-head">
-        <span>关键词</span>
-        <span></span>
-        <span class="zk-n">零/总</span>
-        <span>平台</span>
-        <span class="zk-t">最近</span>
-      </div>
-      <div class="zk-list">
-        <div v-for="r in rows" :key="r.q" class="zk-row">
-          <a
-            class="zk-q"
-            :href="searchUrl(r.q)"
-            target="_blank"
-            rel="noopener"
-            :title="`去站内搜一次「${r.q}」`"
-          >{{ r.q }}</a>
-          <span class="zk-bar"><i :style="{ width: barW(r) }"></i></span>
-          <span class="zk-n"><b>{{ r.n }}</b><em>/{{ r.total || r.n }}</em></span>
-          <span class="zk-plat" :title="plat(r.platforms)">{{ plat(r.platforms) }}</span>
-          <span class="zk-t">{{ r.last_ts ? shortTime(r.last_ts) : '-' }}</span>
+      <div class="zk-wrap" :class="{ slim: limit > 0 }">
+        <div class="zk-head">
+          <span>关键词</span>
+          <span></span>
+          <span class="zk-n">零/总</span>
+          <span v-if="limit === 0">平台</span>
+          <span class="zk-t">最近</span>
+        </div>
+        <div class="zk-list" :style="limit > 0 ? 'max-height:none' : ''">
+          <div v-for="r in rows" :key="r.q" class="zk-row">
+            <a
+              class="zk-q"
+              :href="searchUrl(r.q)"
+              target="_blank"
+              rel="noopener"
+              :title="`去站内搜一次「${r.q}」`"
+            >{{ r.q }}</a>
+            <span class="zk-bar"><i :style="{ width: barW(r) }"></i></span>
+            <span class="zk-n"><b>{{ r.n }}</b><em>/{{ r.total || r.n }}</em></span>
+            <span v-if="limit === 0" class="zk-plat" :title="plat(r.platforms)">{{ plat(r.platforms) }}</span>
+            <span class="zk-t">{{ r.last_ts ? shortTime(r.last_ts) : '-' }}</span>
+          </div>
         </div>
       </div>
 
-      <div class="zk-foot">
+      <div v-if="limit === 0" class="zk-foot">
         <button class="ghost zk-copy" @click="copyAll">
           {{ copied ? '已复制' : '复制全部关键词' }}
         </button>
@@ -98,7 +107,7 @@ async function copyAll() {
 
 <style scoped>
 .zk-hint {
-  margin: 12px 0 10px;
+  margin: 0 0 10px;
   font-size: 12px;
   line-height: 1.65;
   color: var(--muted);
@@ -107,9 +116,13 @@ async function copyAll() {
 .zk-head,
 .zk-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 76px 62px 110px 62px;
+  grid-template-columns: minmax(0, 1fr) 76px 86px 110px 62px;
   align-items: center;
   gap: 10px;
+}
+.zk-wrap.slim .zk-head,
+.zk-wrap.slim .zk-row {
+  grid-template-columns: minmax(0, 1fr) 64px 82px 62px;
 }
 
 .zk-head {
@@ -146,16 +159,16 @@ async function copyAll() {
 }
 
 .zk-bar {
-  height: 7px;
+  height: 6px;
   background: #f0f4f8;
-  border-radius: 5px;
+  border-radius: 3px;
   overflow: hidden;
 }
 .zk-bar i {
   display: block;
   height: 100%;
-  border-radius: 5px;
-  background: #e04f16;
+  border-radius: 3px;
+  background: #e08a3c;
 }
 
 .zk-n {

@@ -1,7 +1,6 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import Panel from './Panel.vue'
-import StatGrid from './StatGrid.vue'
 import * as api from '../api'
 import { platformName } from '../format'
 
@@ -65,7 +64,6 @@ const PLATFORMS = [
 
 const PLATFORM_MAP = Object.fromEntries(PLATFORMS.map((p) => [p.key, p]))
 
-const panel = ref(null)
 const loading = ref(true)
 const error = ref('')
 const items = ref([])
@@ -76,6 +74,7 @@ const saving = ref(false)
 const message = ref('')
 const messageErr = ref(false)
 const editingId = ref(null)
+const formEl = ref(null)
 
 const formOpen = ref(false)
 const toolsOpen = ref(false)
@@ -113,18 +112,33 @@ const showToken = computed(() => pf.value.token !== 'none')
 const editing = computed(() => !!editingId.value)
 const editingItem = computed(() => items.value.find((a) => a.id === editingId.value) || null)
 
-const tag = computed(() => `${stats.value.enabled || 0} / ${stats.value.total || 0} 个启用`)
+const tag = computed(() =>
+  items.value.length ? `${enabledCount.value} / ${items.value.length} 个启用` : '还没有账号'
+)
 // 后端回的是类型 key（c139、guangya 这种），面板上给人看的是中文名
 const supportedNameText = computed(() =>
   supported.value.map((k) => (PLATFORM_MAP[k] ? PLATFORM_MAP[k].name : platformName(k))).join(' / ')
 )
+// 只看一个数：有几个号要修。"账号总数 / 启用中 / 支持平台"都是常量，
+// 看到它们不会改变当天要做的动作，所以不占位置。
 const badCount = computed(() => items.value.filter((a) => a.failCount > 0 || a.lastError).length)
-const statItems = computed(() => [
-  { k: '账号总数', v: stats.value.total || 0 },
-  { k: '启用中', v: stats.value.enabled || 0, hi: (stats.value.enabled || 0) > 0 },
-  { k: '可用网盘', v: supported.value.length, hint: supportedNameText.value || '无' },
-  { k: '待修复', v: badCount.value, hi: badCount.value > 0, hint: '失败过或登录态失效 · 越低越好' },
-])
+const enabledCount = computed(() => items.value.filter((a) => a.status).length)
+
+/** 到期时间给倒计时，别让人拿绝对时间戳自己做减法。 */
+function expText(item) {
+  const ts = Number(item.expiresAt) || 0
+  if (!ts) return ''
+  const left = ts - Math.floor(Date.now() / 1000)
+  if (left <= 0) return '已过期'
+  const d = Math.floor(left / 86400)
+  if (d >= 1) return `还有 ${d} 天到期`
+  return `还有 ${Math.max(1, Math.floor(left / 3600))} 小时到期`
+}
+
+function expWarn(item) {
+  const ts = Number(item.expiresAt) || 0
+  return ts > 0 && ts - Math.floor(Date.now() / 1000) < 3 * 86400
+}
 
 const typeOptions = computed(() =>
   PLATFORMS.filter((p) => supported.value.includes(p.key))
@@ -166,11 +180,16 @@ function resetForm() {
   }
 }
 
+async function scrollToForm() {
+  formOpen.value = true
+  await nextTick()
+  if (formEl.value) formEl.value.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
 function openAdd() {
   resetForm()
   if (typeOptions.value.length) form.type = typeOptions.value[0].key
-  formOpen.value = true
-  if (panel.value) panel.value.show()
+  scrollToForm()
 }
 
 function edit(item) {
@@ -188,8 +207,7 @@ function edit(item) {
     expires_at: item.expiresAt || 0,
     status: item.status,
   })
-  formOpen.value = true
-  if (panel.value) panel.value.show()
+  scrollToForm()
 }
 
 /** 换平台时把上一个平台的凭据清掉，否则会把夸克的 cookie 提交成迅雷的。 */
@@ -371,8 +389,18 @@ defineExpose({ reload, openAdd })
 </script>
 
 <template>
-  <Panel ref="panel" title="网盘账号" :tag="tag">
-    <StatGrid :items="statItems" />
+  <Panel title="网盘账号" :tag="tag" :tag-bad="badCount > 0">
+    <div
+      v-if="items.length"
+      style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px"
+    >
+      <span v-if="badCount" class="quick-badge bad">待修 {{ badCount }}</span>
+      <span v-else class="quick-badge ok">全部可用</span>
+      <span class="card-sub">
+        {{ items.length }} 个账号 · {{ enabledCount }} 个启用
+        <template v-if="supportedNameText"> · 支持 {{ supportedNameText }}</template>
+      </span>
+    </div>
 
     <div v-if="error" class="err">读取失败：{{ error }}</div>
     <div v-else-if="loading" class="empty">载入中…</div>
@@ -395,14 +423,10 @@ defineExpose({ reload, openAdd })
             失败 {{ item.failCount }} 次
           </span>
           <span v-else class="quick-badge ok">正常</span>
-          <span class="t">#{{ item.id }}</span>
         </div>
 
-        <div class="fb-meta">
-          临时目录：{{ item.tempDir || '（未设，用盘根目录）' }}
-          <template v-if="item.expiresAt > 0">
-            · 令牌到期 {{ new Date(item.expiresAt * 1000).toLocaleString('zh-CN', { hour12: false }) }}
-          </template>
+        <div v-if="item.expiresAt > 0" class="fb-meta">
+          <span :class="{ 'exp-warn': expWarn(item) }">{{ expText(item) }}</span>
         </div>
         <div v-if="item.lastError" class="acct-err">{{ item.lastError }}</div>
 
@@ -418,13 +442,13 @@ defineExpose({ reload, openAdd })
         </div>
       </div>
 
-      <div class="quick-bar" style="margin-top: 12px">
+      <div v-if="items.length" class="quick-bar" style="margin-top: 12px">
         <button class="grp-btn grp-add" @click="openAdd">添加账号</button>
         <span class="quick-status" :class="{ bad: messageErr }">{{ message }}</span>
       </div>
 
       <!-- 添加 / 编辑 -->
-      <details class="quick-manual" :open="formOpen" @toggle="formOpen = $event.target.open">
+      <details ref="formEl" class="quick-manual" :open="formOpen" @toggle="formOpen = $event.target.open">
         <summary>{{ editing ? '修改账号配置' : '添加账号' }}</summary>
 
         <div class="acct-tip">{{ pf.tip }}</div>

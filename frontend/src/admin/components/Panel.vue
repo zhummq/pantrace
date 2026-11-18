@@ -1,45 +1,30 @@
 <script setup>
-import { ref } from 'vue'
-
-const props = defineProps({
+/**
+ * 内容卡片。
+ *
+ * 早先这里是个 <details>：九个面板摞成一列，折叠状态就是导航——刷新回顶部、
+ * 找不到东西。现在导航交给左栏，卡片只负责"一块内容"，不再承担折叠职责。
+ * show() / close() 保留成空实现，避免老的调用点炸掉。
+ */
+defineProps({
   title: { type: String, required: true },
   tag: { type: String, default: '' },
-  open: { type: Boolean, default: false },
+  tagBad: { type: Boolean, default: false },
+  sub: { type: String, default: '' },
 })
 
-const emit = defineEmits(['first-open'])
-const root = ref(null)
-let opened = false
-
-function onToggle(e) {
-  if (e.target.open && !opened) {
-    opened = true
-    emit('first-open')
-  }
-}
-
-// 供父组件主动展开并滚到这里（比如"补录"按钮）
-function show() {
-  if (!root.value) return
-  root.value.open = true
-  onToggle({ target: root.value })
-  root.value.scrollIntoView({ behavior: 'smooth', block: 'start' })
-}
-
-function close() {
-  if (root.value) root.value.open = false
-}
-
-defineExpose({ show, close })
+defineExpose({ show() {}, close() {} })
 </script>
 
 <template>
-  <details ref="root" class="panel" :open="props.open" @toggle="onToggle">
-    <summary>
-      {{ props.title }}
-      <span v-if="props.tag" class="tag">{{ props.tag }}</span>
-      <span class="arrow">▾</span>
-    </summary>
-    <div class="body"><slot /></div>
-  </details>
+  <section class="card">
+    <header class="card-head">
+      <div class="card-title">
+        {{ title }}<span v-if="tag" class="card-tag" :class="{ bad: tagBad }">{{ tag }}</span>
+      </div>
+      <span v-if="sub" class="card-sub">{{ sub }}</span>
+      <div class="card-extra"><slot name="extra" /></div>
+    </header>
+    <div class="card-body"><slot /></div>
+  </section>
 </template>

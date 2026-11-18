@@ -1,10 +1,9 @@
 <script setup>
-import { reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 import Panel from './Panel.vue'
 import * as api from '../api'
 import { GROUP_TYPES } from '../format'
 
-const panel = ref(null)
 const loaded = ref(false)
 const message = ref('')
 const messageErr = ref(false)
@@ -63,6 +62,9 @@ async function reload() {
 function onFirstOpen() {
   if (!loaded.value) reload()
 }
+
+// 早期挂在折叠面板上，靠展开才拉数据；现在是一级页面，进来就加载
+onMounted(onFirstOpen)
 
 function addGroup() {
   if (cfg.groups.length >= 4) return flash('最多 4 个群', true)
@@ -134,7 +136,7 @@ defineExpose({ reload })
 </script>
 
 <template>
-  <Panel ref="panel" title="群入口配置" tag="改二维码 / 群号 / 弹窗" @first-open="onFirstOpen">
+  <Panel title="群入口配置" tag="改二维码 / 群号 / 弹窗">
     <label class="grp-row">
       <input v-model="cfg.enabled" type="checkbox" /> 启用群入口（进站弹窗 + 获取链接拦截 + 页脚入口）
     </label>

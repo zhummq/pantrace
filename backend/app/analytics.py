@@ -296,9 +296,10 @@ def summary(days: int = 7) -> dict:
     days = max(1, min(365, _to_int(days, 7)))
     start = _range_start(days, time.time())
 
-    with _session() as conn:
-        overview = conn.execute(
-            """SELECT
+    # 上一个等长区间：只用来算环比。没有参照的数字（"1,284 次"）看不出好坏。
+    prev_start = start - days * 86400
+
+    _overview_sql = """SELECT
                  SUM(CASE WHEN kind='pv' THEN 1 ELSE 0 END) AS pv,
                  COUNT(DISTINCT CASE WHEN visitor<>'' THEN visitor END) AS uv,
                  SUM(CASE WHEN kind='search' THEN 1 ELSE 0 END) AS searches,
@@ -312,8 +313,12 @@ def summary(days: int = 7) -> dict:
                  COUNT(DISTINCT CASE WHEN visitor<>'' AND is_new=1 THEN visitor END)
                           AS new_visitors
                FROM events
-               WHERE kind IN ('pv', 'search', 'click') AND ts >= ? AND bot=0""",
-            (start,),
+               WHERE kind IN ('pv', 'search', 'click') AND ts >= ? AND bot=0{upper}"""
+
+    with _session() as conn:
+        overview = conn.execute(_overview_sql.format(upper=""), (start,)).fetchone()
+        prev = conn.execute(
+            _overview_sql.format(upper=" AND ts < ?"), (prev_start, start)
         ).fetchone()
         bot_searches = conn.execute(
             "SELECT COUNT(*) AS n FROM events WHERE kind='search' AND ts >= ? AND bot=1",
@@ -435,6 +440,12 @@ def summary(days: int = 7) -> dict:
     cached_hits = overview["cached_hits"] or 0
     successful = searches - fails  # 零结果率、缓存命中率都按成功搜索算
 
+    prev_searches = prev["searches"] or 0
+    prev_clicks = prev["clicks"] or 0
+    prev_zero = prev["zero"] or 0
+    prev_fails = prev["fails"] or 0
+    prev_successful = prev_searches - prev_fails
+
     hourly = [0] * 24
     for r in hourly_rows:
         h = _to_int(r["hour"], -1)
@@ -460,6 +471,16 @@ def summary(days: int = 7) -> dict:
             "returning_visitors": max(
                 0, (overview["uv"] or 0) - (overview["new_visitors"] or 0)
             ),
+            # 上一个等长区间的同口径数字，前端只拿它算环比
+            "prev": {
+                "searches": prev_searches,
+                "clicks": prev_clicks,
+                "ctr": round(prev_clicks / prev_searches, 4) if prev_searches else 0,
+                "zero_rate": round(prev_zero / prev_successful, 4)
+                if prev_successful
+                else 0,
+                "fail_rate": round(prev_fails / prev_searches, 4) if prev_searches else 0,
+            },
         },
         "keywords": [{"q": r["q"], "n": r["n"]} for r in keywords],
         "zero_keywords": [
