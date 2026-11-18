@@ -38,9 +38,8 @@ const color = computed(() => PLATFORM_COLORS[props.item.platform] || 'var(--slat
 // 徽章底色/描边由平台色推导，用 color-mix 而不是拼十六进制——
 // 拼字符串遇到 var(--slate-400) 这种值会直接拼出非法色号。
 const badgeStyle = computed(() => ({
-  color: color.value,
-  background: `color-mix(in srgb, ${color.value} 8%, var(--surface))`,
-  borderColor: `color-mix(in srgb, ${color.value} 24%, var(--surface))`,
+  background: `color-mix(in srgb, ${color.value} 18%, var(--surface))`,
+  borderColor: `color-mix(in srgb, ${color.value} 34%, var(--surface))`,
 }))
 
 // 站内跳转地址（/go/xxx）与外部链接都放行；伪协议一律挡掉。
@@ -268,8 +267,15 @@ async function onCopyPwd() {
 </template>
 
 <style scoped>
+/* 结果行：它活在 .panel 里面，所以自己不再是"卡片"——
+   没有独立边框和圆角，只靠行间发丝线分隔。这样一页 20 条不会变成 20 个盒子。 */
 .card-unit {
   display: block;
+  border-bottom: 1px solid var(--line);
+}
+
+.card-unit:last-child {
+  border-bottom: none;
 }
 
 .card {
@@ -277,31 +283,27 @@ async function onCopyPwd() {
   display: flex;
   align-items: center;
   gap: 18px;
-  padding: 16px 18px 16px 22px;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow-xs);
+  padding: 15px 20px 15px 22px;
+  background: transparent;
   transition:
-    border-color var(--dur-2) var(--ease),
-    box-shadow var(--dur-2) var(--ease),
-    transform var(--dur-2) var(--ease);
+    background-color var(--dur-2) var(--ease),
+    box-shadow var(--dur-2) var(--ease);
 }
 
+/* 行内悬停只做底色变化，不上浮：列表里一行行跳动会让人以为点错了 */
 .card:hover {
-  border-color: var(--line-2);
-  box-shadow: var(--shadow-md);
-  transform: translateY(-2px);
+  background: var(--surface-2);
 }
 
-/* 平台色只留一条 3px 标记，不做整块染色 */
+/* 平台色只留一条 2px 标记，不做整块染色 */
 .bar {
   position: absolute;
   left: 0;
-  top: 14px;
-  bottom: 14px;
-  width: 3px;
-  border-radius: 0 3px 3px 0;
+  top: 13px;
+  bottom: 13px;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  opacity: 0.9;
 }
 
 .main {
@@ -325,6 +327,8 @@ async function onCopyPwd() {
   font-size: var(--text-2xs);
   font-weight: 600;
   letter-spacing: 0.02em;
+  /* 文字不跟平台色走：深色底上「蓝底蓝字」只有 2.7:1，读不清 */
+  color: var(--ink-2);
 }
 
 .title {
@@ -332,7 +336,7 @@ async function onCopyPwd() {
   overflow: hidden;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
-  font-size: 15.5px;
+  font-size: 15px;
   font-weight: 600;
   line-height: 1.5;
   letter-spacing: -0.005em;
@@ -359,7 +363,7 @@ a.title:hover {
   width: 3px;
   height: 3px;
   border-radius: 50%;
-  background: var(--line-2);
+  background: var(--line-strong);
 }
 
 .pwd b {
@@ -401,7 +405,7 @@ a.title:hover {
 }
 
 .state-chip.locked {
-  color: var(--warn);
+  color: var(--warn-ink);
   background: var(--warn-soft);
 }
 
@@ -415,7 +419,7 @@ a.title:hover {
   background: var(--warn-soft);
   font-size: var(--text-xs);
   line-height: 1.6;
-  color: var(--warn);
+  color: var(--warn-ink);
   cursor: help;
   user-select: none;
 }
@@ -435,7 +439,7 @@ a.title:hover {
   border: none;
   background: none;
   font-size: var(--text-xs);
-  color: var(--faint);
+  color: var(--muted);
   text-decoration: underline;
   text-decoration-color: var(--line-2);
   text-underline-offset: 3px;
@@ -468,16 +472,19 @@ a.title:hover {
 }
 
 .btn.ghost {
-  background: var(--surface);
+  background: var(--surface-3);
   border-color: var(--line-2);
   color: var(--ink-2);
-  box-shadow: var(--shadow-xs);
 }
 
 .btn.ghost:hover {
-  border-color: var(--brand-300);
-  background: var(--brand-25);
+  border-color: var(--brand-ring);
+  background: var(--brand-soft);
   color: var(--brand-ink);
+}
+
+.btn.ghost:active {
+  background: var(--brand-soft-2);
 }
 
 .btn.ghost.done {
@@ -487,17 +494,20 @@ a.title:hover {
 }
 
 .btn.solid {
-  background: var(--brand);
-  color: var(--on-brand);
-  box-shadow: var(--shadow-brand);
+  border-color: var(--brand-ring);
+  background: var(--brand-soft);
+  color: var(--brand-ink);
 }
 
 .btn.solid:hover {
-  background: var(--brand-hover);
+  border-color: transparent;
+  background: var(--brand);
+  color: var(--on-brand);
 }
 
 .btn.solid:active {
   background: var(--brand-active);
+  color: var(--on-brand);
 }
 
 /* ---------- 平板 860 ---------- */
@@ -506,13 +516,7 @@ a.title:hover {
     flex-direction: column;
     align-items: stretch;
     gap: var(--sp-3);
-    padding: 14px 14px 14px 18px;
-  }
-
-  /* 触屏没有 hover，浮起效果没意义，还会糊掉滚动 */
-  .card:hover {
-    transform: none;
-    box-shadow: var(--shadow-xs);
+    padding: 14px 16px 14px 18px;
   }
 
   .title {

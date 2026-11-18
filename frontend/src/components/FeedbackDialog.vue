@@ -348,12 +348,12 @@ h2 {
 }
 
 .opt:hover {
-  border-color: var(--brand-200);
-  background: var(--brand-25);
+  border-color: var(--brand-ring);
+  background: var(--brand-soft);
 }
 
 .opt.on {
-  border-color: var(--brand-300);
+  border-color: var(--brand-ring);
   background: var(--brand-soft);
 }
 

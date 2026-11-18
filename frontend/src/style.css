@@ -112,11 +112,11 @@ select {
   font-feature-settings: 'tnum' 1;
 }
 
-/* 关键词高亮：完整浅蓝底 + 圆角，明确是"记号笔"，
+/* 关键词高亮：完整青绿底 + 圆角，明确是"记号笔"，
    不用半高色带——小字号中文里像拖选出的选区，会被当成渲染 bug */
 mark.hl {
-  background: var(--brand-soft-2);
-  color: var(--brand-800);
+  background: var(--brand-soft);
+  color: var(--brand-ink);
   padding: 1px 3px;
   margin: 0 -1px;
   border-radius: 3px;

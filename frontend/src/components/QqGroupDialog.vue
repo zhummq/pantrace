@@ -280,14 +280,14 @@ function switchTab(i) {
 }
 
 .pt-tab:hover {
-  border-color: var(--brand-200);
-  background: var(--brand-25);
+  border-color: var(--brand-ring);
+  background: var(--brand-soft);
   color: var(--brand-ink);
 }
 
 .pt-tab.on {
   background: var(--brand-soft);
-  border-color: var(--brand-300);
+  border-color: var(--brand-ring);
   color: var(--brand-ink);
   font-weight: 600;
 }
@@ -356,8 +356,8 @@ function switchTab(i) {
 }
 
 .pt-copy:hover {
-  border-color: var(--brand-300);
-  background: var(--brand-25);
+  border-color: var(--brand-ring);
+  background: var(--brand-soft);
   color: var(--brand-ink);
 }
 
@@ -407,8 +407,8 @@ function switchTab(i) {
 }
 
 .pt-continue:hover {
-  border-color: var(--brand-300);
-  background: var(--brand-25);
+  border-color: var(--brand-ring);
+  background: var(--brand-soft);
   color: var(--brand-ink);
 }
 

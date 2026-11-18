@@ -321,6 +321,13 @@ function shortPlatform(name) {
   return full
 }
 
+// 平台图标方块里放的字：用简称，最多两字，115/123 这类纯数字原样显示。
+// 没有各家的真实 logo，用品牌色方块 + 简称比清一色的灰点更容易一眼认出。
+function platformGlyph(name) {
+  const s = shortPlatform(name)
+  return s.length > 3 ? s.slice(0, 2) : s
+}
+
 // 偏好：只记"用户主动选了哪个平台"，下次进站默认就用它。
 // 没选过（或主动点回"全部平台"）就是空 = 全平台，新用户完全不受影响。
 function readPrefPlatform() {
@@ -342,11 +349,6 @@ function writePrefPlatform(key) {
 
 // 按当前选中的平台重新查一次上游：单平台查询拿到的是这个平台自己的完整排序，
 // 比"从混排的 20 条里挑出属于它的几条"准得多，这是用户点 chip 期待的东西。
-const activeName = computed(() => {
-  const p = platforms.value.find((x) => x.key === activePlatform.value)
-  return p ? shortPlatform(p.name) : ''
-})
-
 function pickPlatform(key) {
   if (activePlatform.value === key) return
   // 正在查询时不给切：否则要么结果和选中的 chip 对不上，
@@ -463,17 +465,33 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="page">
+    <!-- 背景辉光：两层极低透明度的径向渐变，固定在视口上。
+         它们是这个站唯一的装饰，别再加第三层——再多就成了"发光海报" -->
+    <div class="aura" aria-hidden="true"></div>
+
     <header class="topbar">
       <div class="wrap topbar-inner">
-        <a class="brand" href="/" @click.prevent="resetHome">
-          <span class="logo">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+        <nav class="topnav" aria-label="主导航">
+          <a class="tn on" href="/" @click.prevent="resetHome">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
               <circle cx="11" cy="11" r="7" />
               <path d="m20 20-3.6-3.6" />
             </svg>
-          </span>
-          <span class="brand-text">盘迹<em>PANTRACE</em></span>
-        </a>
+            搜资源
+          </a>
+          <button class="tn" type="button" @click="openFeedback('request')">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+            求资源
+          </button>
+          <button class="tn" type="button" @click="showGroupManual">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M20 15a3 3 0 0 1-3 3H8l-4 3V6a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3z" />
+            </svg>
+            进群交流
+          </button>
+        </nav>
         <div class="topbar-right">
           <span class="status mono">
             <i class="status-dot"></i>
@@ -485,15 +503,23 @@ onBeforeUnmount(() => {
 
     <section class="hero" :class="{ compact: searched }">
       <div class="wrap hero-inner">
-        <template v-if="!searched">
-          <p class="eyebrow"><span class="eb-dot"></span>全网网盘聚合搜索</p>
+        <a class="lockup" href="/" @click.prevent="resetHome">
           <h1 class="title">盘迹</h1>
-          <p class="subtitle">一次搜索，翻遍所有网盘</p>
-        </template>
+          <span class="domain mono">PANTRACE · 全网网盘聚合搜索</span>
+        </a>
+
+        <p class="hero-stats mono">
+          <span v-if="sourceCount">{{ sourceCount }} 个来源</span>
+          <span v-else>来源同步中</span>
+          <i>·</i>
+          <span>通常 1–3s</span>
+          <i>·</i>
+          <span>链接 30 分钟内有效</span>
+        </p>
 
         <form class="searchbar" :class="{ loading }" @submit.prevent="doSearch(1)">
           <span class="search-icon" aria-hidden="true">
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
               <circle cx="11" cy="11" r="7" />
               <path d="m20 20-3.6-3.6" />
             </svg>
@@ -509,8 +535,7 @@ onBeforeUnmount(() => {
             maxlength="100"
             aria-label="搜索关键词"
           />
-          <kbd class="kbd mono" aria-hidden="true">↵</kbd>
-          <button type="submit" :disabled="loading || !keyword.trim()">
+          <button class="sb-go" type="submit" :disabled="loading || !keyword.trim()">
             {{ loading ? '搜索中' : '搜索' }}
           </button>
           <span v-if="loading" class="scanline" aria-hidden="true"></span>
@@ -529,69 +554,43 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <div v-if="!searched" class="hero-meta mono">
-          <span>{{ sourceCount ? `${sourceCount} 个来源` : '来源同步中' }}</span>
-          <i>/</i>
-          <span>通常 1–3s</span>
-          <i>/</i>
-          <span>结果实时聚合</span>
+        <!-- 平台筛选放在搜索框正下方：这一行本身就是"收录了哪些网盘"的说明书，
+             不用先去搜一次才知道能筛什么。不选 = 全平台。 -->
+        <div class="filter-rows" role="group" aria-label="平台筛选">
+          <div class="frow">
+            <span class="frow-label">云盘</span>
+            <div class="frow-body">
+              <button
+                class="pchip"
+                :class="{ on: activePlatform === '' }"
+                @click="pickPlatform('')"
+              >
+                <i class="pchip-ic all" aria-hidden="true">
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round">
+                    <path d="M4 6h16M4 12h16M4 18h16" />
+                  </svg>
+                </i>
+                <span>全部</span>
+              </button>
+              <button
+                v-for="p in platforms"
+                :key="p.key"
+                class="pchip"
+                :class="{ on: activePlatform === p.key }"
+                :style="{ '--pc': p.color || 'var(--slate-500)' }"
+                :title="p.name"
+                @click="pickPlatform(p.key)"
+              >
+                <i class="pchip-ic" aria-hidden="true">{{ platformGlyph(p.name) }}</i>
+                <span>{{ shortPlatform(p.name) }}</span>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </section>
 
     <main class="wrap content">
-      <!-- 没搜过就不给筛：不选等于全选，这时的 chip 只是首屏噪音。
-           平台偏好在真的产生结果之后才需要被调整 -->
-      <div v-if="searched" class="filters" role="group" aria-label="平台筛选">
-        <button class="chip" :class="{ on: activePlatform === '' }" @click="pickPlatform('')">
-          <span class="chip-full">全部平台</span>
-          <span class="chip-short">全部</span>
-        </button>
-        <button
-          v-for="p in platforms"
-          :key="p.key"
-          class="chip"
-          :class="{ on: activePlatform === p.key }"
-          @click="pickPlatform(p.key)"
-        >
-          <i class="chip-dot" :style="{ background: p.color }"></i>
-          <span class="chip-full">{{ p.name }}</span>
-          <span class="chip-short">{{ shortPlatform(p.name) }}</span>
-        </button>
-      </div>
-
-      <!-- 偏好带进来的平台要明说，否则用户看到结果偏少会以为站坏了 -->
-      <p v-if="!searched && activePlatform" class="pref-note">
-        这次只搜 <b>{{ activeName }}</b>
-        <button type="button" class="link" @click="pickPlatform('')">改成全部平台</button>
-      </p>
-
-      <!-- 网站介绍：放在平台筛选下方，只在首页出现。
-           它同时是给用户看的说明书，也是这个站唯一成段的可用收录内容——
-           没有它，搜索引擎眼里这就是个空壳页 -->
-      <section v-if="!searched" class="intro">
-        <div class="intro-grid">
-          <div class="intro-block">
-            <h2 class="intro-h mono">这是什么</h2>
-            <p>
-              盘迹（PanTrace）是一个网盘资源聚合搜索引擎。夸克、百度、阿里、迅雷、微云等各家网盘的公开分享散落在不同的角落，盘迹把它们收进同一个搜索框——输入一次，全部检索。
-            </p>
-          </div>
-          <div class="intro-block">
-            <h2 class="intro-h mono">能搜什么</h2>
-            <p>
-              影视剧、综艺、动漫、纪录片、电子书、学习资料、软件安装包。只要有人在网盘里分享过，这里就有机会一次翻到，不用再挨个平台碰运气。
-            </p>
-          </div>
-          <div class="intro-block">
-            <h2 class="intro-h mono">怎么用</h2>
-            <p>
-              输入关键词，按平台筛选结果，点开链接即可转存。所有资源均来自第三方公开分享，本站不存储任何文件；失效链接可一键报错，被多人报错后会自动隐藏。
-            </p>
-          </div>
-        </div>
-      </section>
-
       <div v-if="loading" class="scan-state">
         <div class="scan-head">
           <span class="scan-label mono">SCANNING</span>
@@ -628,15 +627,13 @@ onBeforeUnmount(() => {
         </p>
       </div>
 
-      <template v-else-if="items.length">
-        <div class="result-head mono">
-          <span class="rh-label">RESULT</span>
-          <span class="rh-num">{{ totalText }}</span>
-          <span class="rh-sep">/</span>
-          <span>{{ tookMs }}ms</span>
-          <span class="rh-sep">/</span>
-          <span>第 {{ page }} 页 · 共 {{ totalPages }} 页</span>
-        </div>
+      <section v-else-if="items.length" class="panel">
+        <header class="panel-head">
+          <span class="panel-title"><i class="panel-dot"></i>搜索结果</span>
+          <span class="panel-meta mono">
+            {{ totalText }} 条 · {{ tookMs }}ms · {{ page }}/{{ totalPages }} 页
+          </span>
+        </header>
 
         <!-- 时效说明整页只出现一次：贴着结果头，信息完整但不刷屏；
              每张卡片内的「30 分钟内有效」徽标负责就近提醒 -->
@@ -659,22 +656,47 @@ onBeforeUnmount(() => {
             @open="handleOpen"
           />
         </div>
+      </section>
 
-        <div v-if="totalPages > 1" class="pager">
-          <button class="pg" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
-          <button
-            v-for="p in pageWindow"
-            :key="p"
-            class="pg num"
-            :class="{ on: p === page }"
-            @click="goPage(p)"
-          >
-            {{ p }}
-          </button>
-          <span class="pg-info mono">{{ page }} / {{ totalPages }}</span>
-          <button class="pg" :disabled="page >= totalPages" @click="goPage(page + 1)">下一页</button>
+      <div v-if="!loading && items.length && totalPages > 1" class="pager">
+        <button class="pg" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
+        <button
+          v-for="p in pageWindow"
+          :key="p"
+          class="pg num"
+          :class="{ on: p === page }"
+          @click="goPage(p)"
+        >
+          {{ p }}
+        </button>
+        <span class="pg-info mono">{{ page }} / {{ totalPages }}</span>
+        <button class="pg" :disabled="page >= totalPages" @click="goPage(page + 1)">下一页</button>
+      </div>
+
+      <!-- 网站介绍：位置挪到内容之后。首屏留给搜索框，说明文字放在这一屏的下方，
+           既不抢注意力，也保住这个站唯一能被搜索引擎抓到的成段内容。 -->
+      <section v-if="!searched" class="intro">
+        <div class="intro-grid">
+          <div class="intro-block">
+            <h2 class="intro-h mono">这是什么</h2>
+            <p>
+              盘迹（PanTrace）是一个网盘资源聚合搜索引擎。夸克、百度、阿里、迅雷、微云等各家网盘的公开分享散落在不同的角落，盘迹把它们收进同一个搜索框——输入一次，全部检索。
+            </p>
+          </div>
+          <div class="intro-block">
+            <h2 class="intro-h mono">能搜什么</h2>
+            <p>
+              影视剧、综艺、动漫、纪录片、电子书、学习资料、软件安装包。只要有人在网盘里分享过，这里就有机会一次翻到，不用再挨个平台碰运气。
+            </p>
+          </div>
+          <div class="intro-block">
+            <h2 class="intro-h mono">怎么用</h2>
+            <p>
+              输入关键词，按平台筛选结果，点开链接即可转存。所有资源均来自第三方公开分享，本站不存储任何文件；失效链接可一键报错，被多人报错后会自动隐藏。
+            </p>
+          </div>
         </div>
-      </template>
+      </section>
     </main>
 
     <footer class="footer">
@@ -709,11 +731,34 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* ==========================================================================
+   主站（搜索页）
+   --------------------------------------------------------------------------
+   深色底 + 青绿强调。首屏从上到下只有四件事：品牌、搜索框、快捷词、平台筛选，
+   没有别的。结果装在一块独立面板里，跟首屏在视觉上分开——搜索是"输入"，
+   结果是"输出"，两者不该长得一样。
+   ========================================================================== */
+
 .page {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 100vh;
-  min-height: 100dvh;
+  background: var(--bg);
+  isolation: isolate;
+}
+
+/* 背景辉光：固定不随内容滚动，两层径向 + 一道斜向微光。
+   已经是这个站全部的装饰了，不要再加 */
+.aura {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(1040px 620px at 4% -12%, var(--glow-mint), transparent 66%),
+    radial-gradient(1080px 660px at 96% -4%, var(--glow-cyan), transparent 68%),
+    linear-gradient(112deg, transparent 46%, var(--glow-sheen) 60%, transparent 76%);
 }
 
 .wrap {
@@ -724,189 +769,177 @@ onBeforeUnmount(() => {
 }
 
 /* ---------- 顶栏 ---------- */
+
 .topbar {
   position: sticky;
   top: 0;
   z-index: 30;
   background: var(--surface-glass);
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
   border-bottom: 1px solid var(--line);
 }
 
 .topbar-inner {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--sp-3);
+  justify-content: center;
   height: var(--nav-h);
 }
 
-.brand {
+.topnav {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+
+.tn {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
-  min-width: 0;
+  gap: 6px;
+  height: 32px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  font-size: var(--text-base);
+  color: var(--muted);
 }
 
-.logo {
-  display: grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  flex-shrink: 0;
-  border-radius: 9px;
-  background: var(--brand);
-  color: var(--on-brand);
-  box-shadow: var(--shadow-brand);
-}
-
-.brand-text {
-  font-size: 15.5px;
-  font-weight: 600;
-  letter-spacing: 0.01em;
-  white-space: nowrap;
+.tn:hover {
   color: var(--ink);
-  transition: color var(--dur-1) var(--ease);
+  background: var(--surface-3);
 }
 
-.brand:hover .brand-text {
+.tn:active {
+  background: var(--surface-hover);
+}
+
+.tn.on {
   color: var(--brand-ink);
-}
-
-.brand-text em {
-  font-family: var(--mono);
-  font-style: normal;
-  font-size: var(--text-2xs);
-  font-weight: 500;
-  letter-spacing: 0.12em;
-  color: var(--faint);
-  margin-left: 8px;
+  background: var(--brand-soft);
+  border-color: var(--brand-ring);
 }
 
 .topbar-right {
+  position: absolute;
+  right: 0;
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
+  gap: var(--sp-3);
 }
 
 .status {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   height: 26px;
   padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius-pill);
-  background: var(--surface);
-  font-size: var(--text-xs);
-  letter-spacing: 0.02em;
+  background: var(--surface-2);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.08em;
   color: var(--muted);
-  white-space: nowrap;
 }
 
 .status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--cyan-500);
-  box-shadow: 0 0 0 3px var(--cyan-ring);
-  animation: pulse 2.4s ease-in-out infinite;
-}
-
-@keyframes pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.4;
-  }
-}
-
-/* ---------- 首屏 ---------- */
-.hero {
-  position: relative;
-  padding: 76px 0 44px;
-  /* 一层极淡的顶部光晕：给首屏一点纵深，不参与信息表达 */
-  background:
-    radial-gradient(920px 340px at 50% -140px, var(--hero-glow), transparent 72%),
-    var(--bg);
-  border-bottom: 1px solid var(--line);
-}
-
-.hero-inner {
-  text-align: center;
-}
-
-.eyebrow {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  margin: 0 0 var(--sp-5);
-  padding: 4px 12px 4px 10px;
-  border: 1px solid var(--brand-100);
-  border-radius: var(--radius-pill);
-  background: var(--brand-25);
-  font-size: var(--text-xs);
-  font-weight: 500;
-  letter-spacing: 0.02em;
-  color: var(--brand-ink);
-}
-
-.eb-dot {
   width: 5px;
   height: 5px;
   border-radius: 50%;
   background: var(--brand);
-  box-shadow: 0 0 0 3px var(--brand-ring);
+  box-shadow: 0 0 0 3px var(--cyan-ring);
+}
+
+/* ---------- 首屏 ---------- */
+
+.hero {
+  padding: var(--sp-7) 0 var(--sp-7);
+}
+
+.hero-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.lockup {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--sp-2);
 }
 
 .title {
-  margin: 0 0 var(--sp-3);
-  font-size: clamp(34px, 5.2vw, 46px);
-  line-height: 1.12;
+  font-size: clamp(30px, 5vw, 40px);
   font-weight: 700;
-  letter-spacing: -0.01em;
+  line-height: 1.1;
+  letter-spacing: 0.04em;
   color: var(--ink);
+  transition: font-size var(--dur-3) var(--ease);
 }
 
-.subtitle {
-  margin: 0 auto var(--sp-7);
-  max-width: 520px;
-  font-size: var(--text-md);
-  line-height: 1.7;
+.domain {
+  font-size: var(--text-xs);
+  letter-spacing: 0.14em;
+  color: var(--faint);
+  text-transform: uppercase;
+}
+
+.hero-stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-1);
+  margin-top: var(--sp-3);
+  font-size: var(--text-xs);
   color: var(--muted);
 }
 
-/* ---------- 搜索条 ---------- */
+.hero-stats i {
+  font-style: normal;
+  color: var(--line-strong);
+}
+
+/* ---------- 搜索框 ---------- */
+
 .searchbar {
   position: relative;
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  max-width: 620px;
-  margin: 0 auto;
-  padding: 7px 7px 7px var(--sp-4);
-  background: var(--surface);
+  width: 100%;
+  max-width: 680px;
+  height: 56px;
+  margin-top: var(--sp-6);
+  padding: 0 6px 0 18px;
   border: 1px solid var(--line-2);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  box-shadow: var(--inset-top), var(--shadow-sm);
   transition:
     border-color var(--dur-2) var(--ease),
-    box-shadow var(--dur-2) var(--ease);
+    box-shadow var(--dur-3) var(--ease),
+    background-color var(--dur-2) var(--ease);
 }
 
+.searchbar:hover {
+  border-color: var(--line-strong);
+}
+
+/* 聚焦时的光圈：整页唯一的"发光"交互，用来说明"现在可以打字了" */
 .searchbar:focus-within {
-  border-color: var(--brand-400);
-  box-shadow: var(--ring), var(--shadow-md);
+  border-color: var(--brand);
+  background: var(--surface-3);
+  box-shadow: 0 0 0 4px var(--brand-soft), 0 18px 44px -24px var(--brand-ring);
 }
 
 .search-icon {
-  display: grid;
-  place-items: center;
+  display: flex;
   flex-shrink: 0;
   color: var(--faint);
+  transition: color var(--dur-2) var(--ease);
 }
 
 .searchbar:focus-within .search-icon {
@@ -916,7 +949,8 @@ onBeforeUnmount(() => {
 .searchbar input {
   flex: 1;
   min-width: 0;
-  padding: 10px 0;
+  height: 100%;
+  padding: 0 var(--sp-3) 0 var(--sp-3);
   border: none;
   outline: none;
   background: transparent;
@@ -929,363 +963,357 @@ onBeforeUnmount(() => {
 }
 
 .searchbar input::-webkit-search-cancel-button {
-  cursor: pointer;
+  -webkit-appearance: none;
 }
 
-.kbd {
+.sb-go {
   flex-shrink: 0;
-  padding: 2px 6px;
-  font-size: var(--text-2xs);
-  line-height: 1.4;
-  color: var(--faint);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-xs);
-  background: var(--surface-3);
-}
-
-.searchbar button {
-  flex-shrink: 0;
-  height: 40px;
-  padding: 0 var(--sp-6);
-  border: none;
-  border-radius: var(--radius);
+  height: 44px;
+  padding: 0 24px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
   background: var(--brand);
-  color: var(--on-brand);
   font-size: var(--text-base);
   font-weight: 600;
-  letter-spacing: 0.02em;
+  color: var(--on-brand);
   box-shadow: var(--shadow-brand);
 }
 
-.searchbar button:hover:not(:disabled) {
+.sb-go:hover:not(:disabled) {
   background: var(--brand-hover);
 }
 
-.searchbar button:active:not(:disabled) {
+.sb-go:active:not(:disabled) {
   background: var(--brand-active);
+  box-shadow: none;
 }
 
-.searchbar button:disabled {
-  background: var(--surface-3);
+/* 禁用态不是"消失"，是"还不能点"：文字必须读得出来 */
+.sb-go:disabled {
+  background: var(--surface-hover);
   color: var(--muted);
   box-shadow: none;
-  transform: none;
+  cursor: not-allowed;
 }
 
-/* 搜索中的进度条：安静的一条，不抢注意力 */
+/* 搜索时沿输入框跑一圈的青绿扫描线 */
 .scanline {
   position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: -1px;
-  height: 2px;
+  right: 96px;
+  bottom: 6px;
+  left: 46px;
+  height: 1px;
   overflow: hidden;
-  border-radius: 2px;
-  background: var(--brand-50);
+  border-radius: var(--radius-pill);
 }
 
 .scanline::before {
   content: '';
   position: absolute;
-  top: 0;
-  left: 0;
-  width: 36%;
-  height: 100%;
-  border-radius: 2px;
+  inset: 0;
   background: linear-gradient(90deg, transparent, var(--brand), transparent);
-  animation: scan 1.3s ease-in-out infinite;
+  transform: translateX(-100%);
+  animation: scan 1.4s var(--ease) infinite;
 }
 
 @keyframes scan {
-  0% {
-    transform: translateX(-100%);
-    opacity: 0;
-  }
-  25%,
-  75% {
-    opacity: 1;
-  }
-  100% {
-    transform: translateX(280%);
-    opacity: 0;
+  to {
+    transform: translateX(100%);
   }
 }
 
-.hero-meta {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-top: var(--sp-4);
-  font-size: var(--text-xs);
-  color: var(--faint);
-}
+/* ---------- 快捷词 ---------- */
 
-/* 分隔符本身不用「/」——那个字符太小，在弱色下像渲染残渣 */
-.hero-meta i {
-  width: 3px;
-  height: 3px;
-  border-radius: 50%;
-  background: var(--line-2);
-  font-size: 0;
-  line-height: 0;
-}
-
-/* ---------- 快捷搜索词 ---------- */
 .hero-try {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   gap: var(--sp-2);
-  flex-wrap: wrap;
   margin-top: var(--sp-4);
 }
 
 .ht-label {
-  font-size: var(--text-xs);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.14em;
   color: var(--faint);
-  margin-right: 2px;
+  text-transform: uppercase;
 }
 
 .ht-word {
-  height: 30px;
-  padding: 0 var(--sp-3);
+  padding: 5px 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius-pill);
-  background: var(--surface);
+  background: transparent;
   font-size: var(--text-sm);
-  color: var(--ink-2);
-  box-shadow: var(--shadow-xs);
+  color: var(--muted);
 }
 
 .ht-word:hover {
-  border-color: var(--brand-200);
-  background: var(--brand-25);
-  color: var(--brand-ink);
-  transform: translateY(-1px);
-}
-
-/* ---------- 首页介绍区 ---------- */
-.intro {
-  margin-top: var(--sp-6);
-  padding-top: var(--sp-6);
-  border-top: 1px solid var(--line);
-}
-
-.intro-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: var(--sp-7);
-}
-
-.intro-h {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  margin: 0 0 var(--sp-2);
-  font-family: var(--sans);
-  font-size: var(--text-md);
-  font-weight: 600;
-  letter-spacing: 0;
   color: var(--ink);
+  border-color: var(--line-2);
+  background: var(--surface-3);
 }
 
-.intro-h::before {
-  content: '';
-  width: 3px;
-  height: 12px;
-  border-radius: 2px;
-  background: var(--brand);
+/* ---------- 平台筛选 ---------- */
+
+.filter-rows {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: var(--sp-3);
+  width: 100%;
+  max-width: 760px;
+  margin-top: var(--sp-5);
 }
 
-.intro-block p {
-  margin: 0;
-  font-size: var(--text-base);
-  line-height: 1.75;
-  color: var(--muted);
+.frow {
+  display: contents;
 }
 
-/* 已搜索：搜索条吸顶，翻长列表随时能改词 */
-.hero.compact {
-  position: sticky;
-  top: var(--nav-h);
-  z-index: 20;
-  padding: var(--sp-2) 0;
-  background: rgba(255, 255, 255, 0.9);
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
+.frow-label {
+  padding-top: 6px;
+  font-size: var(--text-sm);
+  color: var(--faint);
+  text-align: right;
 }
 
-.hero.compact .searchbar {
-  max-width: none;
-}
-
-/* ---------- 内容区 ---------- */
-.content {
-  flex: 1;
-  padding-bottom: var(--sp-9);
-}
-
-.filters {
+.frow-body {
   display: flex;
   flex-wrap: wrap;
   gap: var(--sp-2);
-  padding: var(--sp-5) 0;
+  min-width: 0;
 }
 
-.chip {
+.pchip {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 34px;
-  padding: 0 14px;
+  gap: 7px;
+  height: 30px;
+  padding: 0 12px 0 5px;
   border: 1px solid var(--line);
   border-radius: var(--radius-pill);
-  background: var(--surface);
-  color: var(--ink-2);
+  background: var(--surface-2);
   font-size: var(--text-sm);
-  white-space: nowrap;
-  box-shadow: var(--shadow-xs);
-  transition:
-    background-color var(--dur-1) var(--ease),
-    border-color var(--dur-1) var(--ease),
-    color var(--dur-1) var(--ease),
-    transform var(--dur-1) var(--ease),
-    box-shadow var(--dur-2) var(--ease);
+  /* 平台名用主文字色：chip 里已经有一块彩色方块，文字再压暗就整片发灰 */
+  color: var(--ink);
 }
 
-.chip:hover:not(.on) {
-  border-color: var(--brand-200);
-  background: var(--brand-25);
-  color: var(--brand-ink);
-  transform: translateY(-1px);
+.pchip:hover {
+  border-color: var(--line-2);
+  background: var(--surface-3);
+  color: var(--ink);
 }
 
-.chip:active {
-  transform: translateY(0);
-}
-
-.chip.on {
+.pchip.on {
+  border-color: var(--brand-ring);
   background: var(--brand-soft);
-  border-color: var(--brand-300);
   color: var(--brand-ink);
-  font-weight: 600;
-  box-shadow: none;
 }
 
-.chip-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-}
-
-/* 从偏好带进来的平台，进站就说清楚，别让用户以为结果漏了 */
-.pref-note {
-  display: flex;
+/* 品牌色方块：没有各家真实 logo，用品牌色 + 简称，比清一色灰点好认 */
+.pchip-ic {
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
-  margin: -4px 0 var(--sp-4);
-  font-size: var(--text-sm);
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 4px;
+  border-radius: 6px;
+  background: var(--pc, var(--slate-500));
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--on-color);
+}
+
+.pchip-ic.all {
+  background: var(--surface-hover);
   color: var(--muted);
 }
 
-.pref-note b {
-  color: var(--ink);
-  font-weight: 600;
+.pchip.on .pchip-ic.all {
+  background: var(--brand);
+  color: var(--on-brand);
 }
 
-/* 手机端才显示简称，桌面端沿用全名 */
-.chip-short {
+/* ---------- 首屏收窄（已有结果时） ---------- */
+
+.hero.compact {
+  padding: var(--sp-5) 0 var(--sp-5);
+}
+
+.hero.compact .lockup {
+  flex-direction: row;
+  align-items: baseline;
+  gap: var(--sp-3);
+}
+
+.hero.compact .title {
+  font-size: var(--text-2xl);
+  letter-spacing: 0.02em;
+}
+
+.hero.compact .hero-stats {
   display: none;
 }
 
-/* ---------- 结果头 ---------- */
-.result-head {
+.hero.compact .searchbar {
+  height: 52px;
+  margin-top: var(--sp-4);
+}
+
+.hero.compact .filter-rows {
+  margin-top: var(--sp-4);
+}
+
+/* ---------- 内容区 ---------- */
+
+.content {
+  flex: 1;
+  padding-bottom: var(--sp-8);
+}
+
+/* ---------- 结果面板 ---------- */
+
+.panel {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--inset-top), var(--shadow-md);
+}
+
+.panel-head {
   display: flex;
   align-items: center;
-  gap: var(--sp-2);
-  flex-wrap: wrap;
-  margin: 0 0 var(--sp-3);
-  padding-bottom: var(--sp-3);
+  justify-content: space-between;
+  gap: var(--sp-4);
+  padding: 13px var(--sp-5);
   border-bottom: 1px solid var(--line);
-  font-size: var(--text-sm);
-  color: var(--muted);
 }
 
-.rh-label {
-  padding: 2px 8px;
-  border-radius: var(--radius-xs);
-  background: var(--surface-3);
-  font-size: var(--text-2xs);
+.panel-title {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: var(--text-base);
   font-weight: 600;
-  letter-spacing: 0.08em;
-  color: var(--muted);
-}
-
-.rh-num {
   color: var(--ink);
-  font-weight: 600;
 }
 
-.rh-sep {
-  width: 3px;
-  height: 3px;
+.panel-dot {
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: var(--line-2);
-  font-size: 0;
+  background: var(--brand);
+  box-shadow: 0 0 0 3px var(--brand-soft);
 }
 
-/* 一次性时效说明：弱化正文色，重点数字用暖色 */
+.panel-meta {
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+
 .ttl-note {
   display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  margin: 0 0 var(--sp-3);
+  align-items: center;
+  gap: 7px;
+  padding: 9px var(--sp-5);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-2);
   font-size: var(--text-sm);
   line-height: 1.5;
   color: var(--muted);
-  /* 窄屏折行时把词均分到两行，避免最后一行只剩一两个字 */
   text-wrap: pretty;
 }
 
 .ttl-note svg {
   flex-shrink: 0;
-  margin-top: 2px;
   color: var(--warn);
 }
 
 .ttl-note b {
   font-weight: 600;
-  color: var(--warn);
+  color: var(--ink-2);
 }
 
 .result-list {
   display: flex;
   flex-direction: column;
-  gap: var(--sp-2);
 }
 
-/* ---------- 加载态 ---------- */
+/* ---------- 分页 ---------- */
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  margin-top: var(--sp-6);
+}
+
+.pg {
+  min-width: 32px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: var(--text-sm);
+  color: var(--muted);
+}
+
+.pg:hover:not(:disabled):not(.on) {
+  color: var(--ink);
+  border-color: var(--line-2);
+  background: var(--surface-3);
+}
+
+.pg.on {
+  border-color: var(--brand-ring);
+  background: var(--brand-soft);
+  font-weight: 600;
+  color: var(--brand-ink);
+}
+
+.pg:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.pg.num {
+  padding: 0 8px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pg-info {
+  padding: 0 var(--sp-2);
+  font-size: var(--text-xs);
+  color: var(--faint);
+}
+
+/* ---------- 加载 / 空 / 错误 ---------- */
+
 .scan-state {
-  padding-top: var(--sp-1);
+  padding-top: var(--sp-2);
 }
 
 .scan-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--sp-3);
-  margin-bottom: var(--sp-2);
+  margin-bottom: var(--sp-3);
 }
 
 .scan-label {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  font-size: var(--text-xs);
-  font-weight: 600;
-  letter-spacing: 0.08em;
+  gap: var(--sp-2);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.16em;
   color: var(--brand-ink);
 }
 
@@ -1295,7 +1323,13 @@ onBeforeUnmount(() => {
   height: 6px;
   border-radius: 50%;
   background: var(--brand);
-  animation: pulse 1.4s ease-in-out infinite;
+  animation: pulse 1.2s var(--ease) infinite;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
 }
 
 .scan-count {
@@ -1304,29 +1338,35 @@ onBeforeUnmount(() => {
 }
 
 .loading-hint {
-  margin: 0 0 var(--sp-3);
-  font-size: var(--text-sm);
+  margin-bottom: var(--sp-4);
+  font-size: var(--text-base);
   color: var(--muted);
 }
 
 .scan-track {
-  position: relative;
-  height: 3px;
+  height: 2px;
   margin-bottom: var(--sp-5);
-  border-radius: 2px;
-  background: var(--surface-3);
   overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: var(--surface-3);
 }
 
 .scan-track i {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 30%;
+  display: block;
+  width: 34%;
   height: 100%;
-  border-radius: 2px;
+  border-radius: inherit;
   background: linear-gradient(90deg, transparent, var(--brand), transparent);
-  animation: scan 1.5s ease-in-out infinite;
+  animation: track 1.3s var(--ease) infinite;
+}
+
+@keyframes track {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(320%);
+  }
 }
 
 .skeleton-list {
@@ -1336,23 +1376,36 @@ onBeforeUnmount(() => {
 }
 
 .skeleton {
-  padding: 18px;
-  background: var(--surface);
+  padding: var(--sp-5);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  box-shadow: var(--shadow-xs);
+  background: var(--surface);
 }
 
 .sk-line {
-  height: 11px;
-  border-radius: var(--radius-xs);
-  background: linear-gradient(90deg, var(--surface-3) 25%, var(--slate-25) 37%, var(--surface-3) 63%);
+  height: 10px;
+  border-radius: 4px;
+  background: linear-gradient(
+    90deg,
+    var(--surface-3) 25%,
+    var(--surface-hover) 37%,
+    var(--surface-3) 63%
+  );
   background-size: 400% 100%;
-  animation: shimmer 1.4s ease-in-out infinite;
+  animation: shimmer 1.5s var(--ease) infinite;
 }
 
 .sk-line + .sk-line {
-  margin-top: 11px;
+  margin-top: 10px;
+}
+
+@keyframes shimmer {
+  from {
+    background-position: 100% 50%;
+  }
+  to {
+    background-position: 0 50%;
+  }
 }
 
 .w60 {
@@ -1360,181 +1413,144 @@ onBeforeUnmount(() => {
 }
 
 .w30 {
-  width: 26%;
+  width: 30%;
 }
 
-@keyframes shimmer {
-  0% {
-    background-position: 100% 50%;
-  }
-  100% {
-    background-position: 0 50%;
-  }
-}
-
-/* ---------- 空 / 错误 ---------- */
 .state {
   padding: var(--sp-9) var(--sp-5);
   text-align: center;
 }
 
 .state-icon {
-  display: inline-grid;
-  place-items: center;
-  width: 48px;
-  height: 48px;
-  margin-bottom: var(--sp-4);
-  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  margin: 0 auto var(--sp-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
   background: var(--surface-3);
-  color: var(--muted);
-  font-family: var(--mono);
   font-size: var(--text-lg);
-  font-weight: 600;
+  color: var(--muted);
 }
 
 .state-icon.empty {
-  font-weight: 400;
   color: var(--faint);
 }
 
 .error-state .state-icon {
+  border-color: var(--danger-line);
   background: var(--danger-soft);
-  color: var(--danger);
+  color: var(--danger-ink);
 }
 
 .state-title {
-  margin: 0 0 6px;
-  font-size: var(--text-lg);
+  font-size: var(--text-md);
   font-weight: 600;
   color: var(--ink);
 }
 
 .state-desc {
-  margin: 0 auto;
   max-width: 440px;
+  margin: var(--sp-2) auto 0;
   font-size: var(--text-base);
-  line-height: 1.65;
+  line-height: 1.7;
   color: var(--muted);
-}
-
-.retry {
-  height: 38px;
-  margin-top: var(--sp-4);
-  padding: 0 var(--sp-5);
-  border: 1px solid var(--line-2);
-  border-radius: var(--radius);
-  background: var(--surface);
-  font-size: var(--text-base);
-  font-weight: 500;
-  color: var(--ink-2);
-  box-shadow: var(--shadow-xs);
-}
-
-.retry:hover {
-  border-color: var(--brand-300);
-  background: var(--brand-25);
-  color: var(--brand-ink);
 }
 
 .state-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: center;
-  gap: var(--sp-4);
-  flex-wrap: wrap;
-  margin-top: var(--sp-4);
-}
-
-.state-actions .retry {
-  margin-top: 0;
+  gap: var(--sp-3);
+  margin-top: var(--sp-5);
 }
 
 .state-more {
-  margin: var(--sp-4) 0 0;
+  margin-top: var(--sp-4);
   font-size: var(--text-base);
   color: var(--muted);
+}
+
+.retry {
+  height: 36px;
+  padding: 0 18px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--brand);
+  font-size: var(--text-base);
+  font-weight: 600;
+  color: var(--on-brand);
+}
+
+.retry:hover {
+  background: var(--brand-hover);
+}
+
+.retry:active {
+  background: var(--brand-active);
 }
 
 .link {
   padding: 0;
   border: none;
   background: none;
-  font-size: inherit;
+  font-size: var(--text-base);
   color: var(--brand-ink);
   text-decoration: underline;
-  text-decoration-color: var(--brand-200);
+  text-decoration-color: var(--brand-ring);
   text-underline-offset: 3px;
 }
 
 .link:hover {
-  color: var(--brand-hover);
-  text-decoration-color: var(--brand-400);
+  color: var(--brand);
+  text-decoration-color: var(--brand);
 }
 
-/* ---------- 分页 ---------- */
-.pager {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-top: var(--sp-6);
+/* ---------- 网站介绍（首屏之下） ---------- */
+
+.intro {
+  margin-top: var(--sp-9);
+  padding-top: var(--sp-6);
+  border-top: 1px solid var(--line);
 }
 
-.pg {
-  min-width: 36px;
-  height: 36px;
-  padding: 0 var(--sp-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--ink-2);
-  font-size: var(--text-sm);
-  box-shadow: var(--shadow-xs);
+.intro-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--sp-7);
 }
 
-.pg.num {
-  font-family: var(--mono);
-}
-
-.pg:hover:not(:disabled):not(.on) {
-  border-color: var(--brand-200);
-  background: var(--brand-25);
-  color: var(--brand-ink);
-}
-
-.pg.on {
-  background: var(--brand);
-  border-color: var(--brand);
-  color: var(--on-brand);
-  font-weight: 600;
-  box-shadow: var(--shadow-brand);
-}
-
-.pg:disabled {
-  opacity: 0.45;
-  box-shadow: none;
-}
-
-.pg-info {
-  display: none;
+.intro-h {
+  margin-bottom: var(--sp-2);
   font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.intro-block p {
+  font-size: var(--text-base);
+  line-height: 1.8;
   color: var(--muted);
 }
 
 /* ---------- 页脚 ---------- */
+
 .footer {
-  padding: var(--sp-5) 0 var(--sp-6);
   border-top: 1px solid var(--line);
-  background: var(--surface);
+  padding: var(--sp-5) 0 var(--sp-7);
 }
 
 .footer-inner {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: var(--sp-3);
-  flex-wrap: wrap;
 }
 
 .footer-brand {
@@ -1543,45 +1559,39 @@ onBeforeUnmount(() => {
 }
 
 .footer-links {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: var(--sp-4);
-  font-size: var(--text-sm);
+  gap: var(--sp-5);
 }
 
-/* ---------- 平板 860 ---------- */
+.footer-links .link {
+  font-size: var(--text-sm);
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.footer-links .link:hover {
+  color: var(--brand-ink);
+}
+
+/* ---------- 平板 ---------- */
+
 @media (max-width: 860px) {
-  .page {
-    --nav-h: 56px;
-  }
-
   .wrap {
-    padding: 0 var(--sp-4);
-  }
-
-  .brand-text em {
-    display: none;
+    padding: 0 var(--sp-5);
   }
 
   .hero {
-    padding: 52px 0 var(--sp-6);
-  }
-
-  .subtitle {
-    margin-bottom: var(--sp-6);
-    font-size: var(--text-base);
+    padding: var(--sp-7) 0 var(--sp-6);
   }
 
   .searchbar {
-    padding: 6px 6px 6px var(--sp-3);
+    max-width: none;
   }
 
-  .kbd {
-    display: none;
-  }
-
-  .hero-meta {
-    margin-top: var(--sp-3);
+  .filter-rows {
+    grid-template-columns: 40px minmax(0, 1fr);
+    max-width: none;
   }
 
   .intro-grid {
@@ -1589,103 +1599,145 @@ onBeforeUnmount(() => {
     gap: var(--sp-5);
   }
 
-  .hero.compact {
-    top: 0;
+  .panel-head {
+    padding: 12px var(--sp-4);
   }
 
-  /* 手机端品牌栏不吸顶（滚走），只留搜索条贴顶——
-     双行吸顶要吃掉 130px+，长列表可视区太小 */
+  .ttl-note {
+    padding: 9px var(--sp-4);
+  }
+
+  .state {
+    padding: var(--sp-8) var(--sp-4);
+  }
+}
+
+/* ---------- 手机 ---------- */
+
+@media (max-width: 560px) {
   .topbar {
     position: static;
   }
 
-  .filters {
-    padding: var(--sp-3) 0;
-    gap: 6px;
+  .topbar-inner {
+    justify-content: space-between;
+    height: 56px;
   }
 
-  .content {
-    padding-bottom: var(--sp-7);
+  .topnav {
+    gap: 0;
   }
 
-  .state {
-    padding: var(--sp-7) var(--sp-2);
+  .tn {
+    gap: 4px;
+    padding: 0 9px;
+    font-size: var(--text-sm);
   }
 
-  /* 手机分页只留前后翻 + 页码读数，数字按钮排开太挤 */
-  .pg.num {
+  .tn svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  /* 来源数在手机上占地方，且对手机用户没有决策价值 */
+  .status {
     display: none;
   }
 
-  .pg-info {
-    display: inline;
-    margin: 0 var(--sp-1);
+  .hero {
+    padding: var(--sp-6) 0 var(--sp-5);
   }
 
-  .pager {
+  .hero.compact .lockup {
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .hero.compact .title {
+    font-size: var(--text-xl);
+  }
+
+  .hero-stats {
+    font-size: var(--text-2xs);
+  }
+
+  .searchbar {
+    height: 50px;
+    margin-top: var(--sp-5);
+    padding-left: var(--sp-4);
+  }
+
+  .searchbar input {
+    font-size: var(--text-base);
+  }
+
+  .sb-go {
+    height: 40px;
+    padding: 0 18px;
+    font-size: var(--text-sm);
+  }
+
+  .scanline {
+    right: 74px;
+    left: 40px;
+  }
+
+  /* 手机上标签改到 chip 上方一行：44px 的标签列会白白吃掉十分之一屏宽 */
+  .filter-rows {
+    grid-template-columns: 1fr;
     gap: var(--sp-2);
+    margin-top: var(--sp-5);
+  }
+
+  .frow-label {
+    padding-top: 0;
+    text-align: left;
+  }
+
+  /* 手机上十几个平台自然排成四行。不做限高滚动：
+     切成半行比多占 40px 更像 bug */
+  .frow-body {
+    gap: 6px;
+    justify-content: flex-start;
+  }
+
+  .pchip {
+    height: 28px;
+    padding: 0 10px 0 4px;
+  }
+
+  .panel-head {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .pg {
+    min-width: 30px;
+    height: 30px;
+    padding: 0 9px;
+  }
+
+  .pg.num {
+    padding: 0 6px;
+  }
+
+  .pg-info {
+    display: none;
+  }
+
+  .intro {
+    margin-top: var(--sp-7);
   }
 
   .footer-inner {
     flex-direction: column;
     align-items: flex-start;
-    gap: var(--sp-3);
   }
 
   .footer-links {
-    gap: var(--sp-5);
-  }
-}
-
-/* ---------- 手机 560 ---------- */
-@media (max-width: 560px) {
-  .hero {
-    padding: 40px 0 var(--sp-5);
-  }
-
-  .title {
-    font-size: 32px;
-  }
-
-  .eyebrow {
-    margin-bottom: var(--sp-4);
-  }
-
-  /* iOS 输入框 <16px 会触发自动缩放，这条不能省 */
-  .searchbar input {
-    font-size: 16px;
-    padding: 9px 0;
-  }
-
-  .searchbar button {
-    height: 42px;
-    padding: 0 var(--sp-4);
-  }
-
-  .hero-try {
-    gap: 6px;
-  }
-
-  .chip {
-    height: 32px;
-    padding: 0 11px;
-    font-size: var(--text-sm);
-  }
-
-  .chip-full {
-    display: none;
-  }
-
-  .chip-short {
-    display: inline;
-  }
-
-  .result-head {
-    gap: 6px;
-  }
-
-  .footer-links {
-    font-size: var(--text-base);
+    gap: var(--sp-4);
   }
 }
 </style>

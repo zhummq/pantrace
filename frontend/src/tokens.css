@@ -5,88 +5,100 @@
    再自己定义一套同名 token。改颜色只改这里。
 
    规则：
-   1. 只有这一层允许出现十六进制色值，页面样式一律引用变量。
+   1. 只有这一层允许出现十六进制 / rgb 色值，页面样式一律引用变量。
    2. 颜色按「语义」取名（surface / ink / line / brand），不按外观取名。
-   3. 品牌色是科技蓝，青色只做信号（状态点、检测通过），不做大面积填充。
+   3. 底色是深海军蓝，强调色是青绿（mint）；青色只做辉光与信号。
+   4. 深色下不要用纯白纯黑：白是 #eaf2f8，黑是 #060b12，纯值会让画面发灰发脏。
    ========================================================================== */
 
 :root {
-  /* ---------- 品牌蓝阶 ---------- */
-  --brand-25: #f7faff;
-  --brand-50: #eef4ff;
-  --brand-100: #dbe7ff;
-  --brand-200: #c2d6ff;
-  --brand-300: #96b6fd;
-  --brand-400: #6b93fb;
-  --brand-500: #3b74f0;
-  --brand-600: #2563eb;
-  --brand-700: #1d4ed8;
-  --brand-800: #1e40af;
+  color-scheme: dark;
 
-  /* ---------- 青：只做信号，不做填充 ---------- */
-  --cyan-400: #22c1dc;
-  --cyan-500: #06a5c0;
-  --cyan-600: #0e8ea6;
+  /* ---------- 青绿阶（强调色） ---------- */
+  --mint-200: #a7f3d0;
+  --mint-300: #6ee7b7;
+  --mint-400: #34d399;
+  --mint-500: #10b981;
+  --mint-600: #059669;
+  --mint-700: #047857;
 
-  /* ---------- 中性（冷灰，和蓝同色温） ---------- */
-  --slate-25: #fbfcfe;
-  --slate-50: #f5f7fb;
-  --slate-100: #eef2f8;
-  --slate-200: #e2e8f2;
-  --slate-300: #cfd8e6;
-  --slate-400: #9aa7bb;
-  --slate-500: #6b7a90;
-  --slate-600: #4e5c72;
-  --slate-700: #36445a;
-  --slate-800: #1f2b3d;
-  --slate-900: #101a2b;
+  /* ---------- 青（只做辉光与信号，不做大面积填充） ---------- */
+  --cyan-300: #67e8f9;
+  --cyan-400: #22d3ee;
+  --cyan-500: #06b6d4;
+  --cyan-600: #0891b2;
+
+  /* ---------- 中性阶（冷调，和青绿同色温；深色下越高越亮） ---------- */
+  --slate-950: #04080f;
+  --slate-900: #060b12;
+  --slate-850: #09111a;
+  --slate-800: #0c1621;
+  --slate-750: #101c27;
+  --slate-700: #16232f;
+  --slate-600: #24333f;
+  --slate-500: #64768c;
+  --slate-400: #8d9fb3;
+  --slate-300: #b9c8d6;
+  --slate-200: #d3dde8;
+  --slate-100: #e8eff6;
+  --slate-50: #f2f7fb;
 
   /* ---------- 语义：表面 ---------- */
-  --bg: var(--slate-50);
-  --surface: #ffffff;
-  --surface-2: var(--slate-25);
-  --surface-3: var(--slate-100);
-  --surface-hover: var(--slate-50);
-  --veil: rgba(16, 26, 43, 0.42);
-  /* 吸顶栏的玻璃底：半透明白 + 模糊，滚动时透出内容 */
-  --surface-glass: rgba(255, 255, 255, 0.86);
-  /* 首屏顶部光晕：唯一的装饰性渐变，极低透明度 */
-  --hero-glow: rgba(37, 99, 235, 0.1);
+  --bg: var(--slate-900);
+  --bg-deep: var(--slate-950);
+  --surface: var(--slate-800);
+  --surface-2: var(--slate-850);
+  --surface-3: var(--slate-750);
+  --surface-hover: var(--slate-700);
+  /* 浮起层：弹窗、下拉、悬浮卡片 */
+  --surface-float: #0e1a24;
+  --veil: rgba(2, 6, 12, 0.72);
+  /* 吸顶栏的玻璃底：半透明深色 + 模糊，滚动时透出内容 */
+  --surface-glass: rgba(7, 13, 20, 0.78);
+  /* 首屏辉光：唯一的装饰性渐变来源，由页面用 radial-gradient 组合 */
+  --glow-mint: rgba(16, 185, 129, 0.34);
+  --glow-cyan: rgba(34, 211, 238, 0.22);
+  /* 斜向微光：给纯径向的辉光加一点方向感，否则整屏像两个灯泡 */
+  --glow-sheen: rgba(34, 211, 238, 0.045);
 
   /* ---------- 语义：文字 ---------- */
-  --ink: var(--slate-900);
-  --ink-2: var(--slate-700);
-  --muted: var(--slate-500);
-  --faint: var(--slate-400);
+  --ink: var(--slate-100);
+  --ink-2: var(--slate-300);
+  --muted: var(--slate-400);
+  --faint: var(--slate-500);
 
   /* ---------- 语义：描边 ---------- */
-  --line: var(--slate-200);
-  --line-2: var(--slate-300);
-  --line-strong: var(--slate-300);
+  --line: rgba(255, 255, 255, 0.09);
+  --line-2: rgba(255, 255, 255, 0.14);
+  --line-strong: rgba(255, 255, 255, 0.2);
 
   /* ---------- 语义：品牌 ---------- */
-  --brand: var(--brand-600);
-  --brand-hover: var(--brand-700);
-  --brand-active: var(--brand-800);
-  /* 品牌底上的前景色：只此一处，避免全站散落 color: #fff */
-  --on-brand: #ffffff;
-  --brand-soft: var(--brand-50);
-  --brand-soft-2: var(--brand-100);
-  --brand-ink: var(--brand-700);
-  --brand-ring: rgba(37, 99, 235, 0.18);
+  --brand: var(--mint-400);
+  --brand-hover: var(--mint-300);
+  --brand-active: var(--mint-500);
+  --brand-deep: var(--mint-600);
+  /* 品牌底上的前景色：青绿底是亮的，前景必须用深色才够对比 */
+  --on-brand: #04140e;
+  /* 任何「实色底」上的前景：平台品牌色方块、徽标这类，不随主题变 */
+  --on-color: #ffffff;
+  --brand-soft: rgba(52, 211, 153, 0.1);
+  --brand-soft-2: rgba(52, 211, 153, 0.18);
+  --brand-ink: var(--mint-300);
+  --brand-ring: rgba(52, 211, 153, 0.24);
   /* 青只做信号：状态点的呼吸光圈 */
-  --cyan-ring: rgba(6, 165, 192, 0.14);
+  --cyan-ring: rgba(34, 211, 238, 0.18);
 
   /* ---------- 语义：状态 ---------- */
-  --success: #0f9d76;
-  --success-ink: #0a7c5e;
-  --success-soft: #e6f7f1;
-  --warn: #b45309;
-  --warn-soft: #fef4e6;
-  --danger: #dc2626;
-  --danger-ink: #b42318;
-  --danger-soft: #fdecea;
-  --danger-line: #f4cfca;
+  --success: var(--mint-400);
+  --success-ink: var(--mint-300);
+  --success-soft: rgba(52, 211, 153, 0.12);
+  --warn: #fbbf24;
+  --warn-ink: #fcd34d;
+  --warn-soft: rgba(251, 191, 36, 0.12);
+  --danger: #f87171;
+  --danger-ink: #fca5a5;
+  --danger-soft: rgba(248, 113, 113, 0.12);
+  --danger-line: rgba(248, 113, 113, 0.34);
 
   /* ---------- 圆角 ---------- */
   --radius-xs: 6px;
@@ -96,14 +108,16 @@
   --radius-xl: 20px;
   --radius-pill: 999px;
 
-  /* ---------- 阴影（蓝调、低透明度，不做大黑边） ---------- */
-  --shadow-xs: 0 1px 2px rgba(16, 26, 43, 0.04);
-  --shadow-sm: 0 1px 2px rgba(16, 26, 43, 0.05), 0 1px 3px rgba(16, 26, 43, 0.04);
+  /* ---------- 阴影（深色下阴影要更黑才看得出层次，另配顶部高光） ---------- */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45), 0 2px 8px -2px rgba(0, 0, 0, 0.55);
   --shadow: var(--shadow-sm);
-  --shadow-md: 0 8px 20px -8px rgba(16, 26, 43, 0.14), 0 2px 6px -2px rgba(16, 26, 43, 0.06);
-  --shadow-lg: 0 28px 56px -24px rgba(16, 26, 43, 0.24), 0 8px 20px -12px rgba(16, 26, 43, 0.1);
-  --shadow-brand: 0 6px 18px -8px rgba(37, 99, 235, 0.5);
+  --shadow-md: 0 14px 32px -14px rgba(0, 0, 0, 0.75), 0 2px 6px -2px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 36px 72px -28px rgba(0, 0, 0, 0.85), 0 4px 12px -6px rgba(0, 0, 0, 0.5);
+  --shadow-brand: 0 8px 26px -12px rgba(52, 211, 153, 0.5);
   --ring: 0 0 0 3px var(--brand-ring);
+  /* 深色卡片的"上边缘受光"：一条极淡的内高光，替代浅色下靠阴影做出的厚度 */
+  --inset-top: inset 0 1px 0 rgba(255, 255, 255, 0.05);
 
   /* ---------- 字体与字号层级 ---------- */
   --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
@@ -149,11 +163,22 @@
      只在这里映射到新语义，页面里不要再新增对别名的依赖。
      ========================================================================== */
   --accent: var(--brand);
-  --accent-deep: var(--brand-ink);
+  --accent-deep: var(--brand-deep);
   --accent-soft: var(--brand-soft);
   --blue: var(--brand);
   --red: var(--danger);
-  /* admin 里的 --shadow 已在上面映射为 --shadow-sm */
+  /* 浅色体系里的蓝阶，深色下统一映射到青绿阶，避免旧引用失效 */
+  --brand-25: var(--slate-850);
+  --brand-50: var(--brand-soft);
+  --brand-100: var(--brand-soft-2);
+  --brand-200: var(--brand-soft-2);
+  --brand-300: var(--mint-300);
+  --brand-400: var(--mint-400);
+  --brand-500: var(--mint-500);
+  --brand-600: var(--mint-500);
+  --brand-700: var(--mint-600);
+  --brand-800: var(--mint-300);
+  --slate-25: var(--slate-850);
 }
 
 /* 统一断点（媒体查询不支持变量，作为约定写在这里）：
