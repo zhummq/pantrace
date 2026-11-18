@@ -367,18 +367,6 @@ function renderView() {
   tookMs.value = p.tookMs
 }
 
-// 池里每个平台各有几条。一次遍历算完，别让模板里 14 个 chip 各扫一遍。
-// 只在"全平台查询过"之后才有意义：池本身就是单平台时，另外 13 个全是 0，看着像挂了。
-const poolCounts = computed(() => {
-  const m = { '': pool.value.items.length }
-  for (const it of pool.value.items) m[it.platform] = (m[it.platform] || 0) + 1
-  return m
-})
-
-const showPoolCounts = computed(
-  () => searched.value && !loading.value && !pool.value.platforms && pool.value.items.length > 0
-)
-
 // 用户停在一个"池里没单独查过"的平台上：先给本地结果，不够再让他自己决定要不要深搜
 const localOnly = computed(
   () => !!activePlatform.value && searched.value && activePlatform.value !== pool.value.platforms
@@ -601,19 +589,17 @@ onBeforeUnmount(() => {
         <button class="chip" :class="{ on: activePlatform === '' }" @click="pickPlatform('')">
           <span class="chip-full">全部平台</span>
           <span class="chip-short">全部</span>
-          <span v-if="showPoolCounts" class="chip-n">{{ poolCounts[''] }}</span>
         </button>
         <button
           v-for="p in platforms"
           :key="p.key"
           class="chip"
-          :class="{ on: activePlatform === p.key, dim: showPoolCounts && !poolCounts[p.key] }"
+          :class="{ on: activePlatform === p.key }"
           @click="pickPlatform(p.key)"
         >
           <i class="chip-dot" :style="{ background: p.color }"></i>
           <span class="chip-full">{{ p.name }}</span>
           <span class="chip-short">{{ shortPlatform(p.name) }}</span>
-          <span v-if="showPoolCounts" class="chip-n">{{ poolCounts[p.key] || 0 }}</span>
         </button>
       </div>
 
@@ -674,16 +660,17 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- 池里没有这个平台的东西：不是"搜不到"，是"这次没单独查它"。
+      <!-- 池里没有这个平台的东西：不是"搜不到"，是"这一页没排到它"。
            这两件事在用户眼里差别巨大，说清楚，再让他决定要不要花一次查询。 -->
       <div v-else-if="localOnly && !items.length" class="state">
         <div class="state-icon empty">∅</div>
-        <p class="state-title">本次结果里没有{{ activeName }}的内容</p>
+        <p class="state-title">这一页没有{{ activeName }}的结果</p>
         <p class="state-desc">
-          上面那次是跨平台聚合，这个平台返回的条目不在里面。单独查它要再走一次上游。
+          「{{ lastKeyword }}」的结果由所有平台混排，一页只有 {{ PAGE_SIZE }} 个位置，
+          {{ activeName }}这次没排进来——不等于它没有。单独查一次，能拿到它自己的完整排序。
         </p>
         <div class="state-actions">
-          <button class="retry" @click="deepSearch">只在{{ activeName }}内搜索</button>
+          <button class="retry" @click="deepSearch">单独查{{ activeName }}</button>
           <button class="link" @click="pickPlatform('')">先看全部平台</button>
         </div>
       </div>
@@ -738,15 +725,15 @@ onBeforeUnmount(() => {
           />
         </div>
 
-        <!-- 本地筛选只覆盖本次聚合拿到的这些条目，说清楚，再给一个显式的深搜入口。
+        <!-- 本地筛选只覆盖这一页拿到的条目，说清楚，再给一个显式的深搜入口。
              这里必须由用户点：一次深搜 = 一次上游查询，不能替他自动发。 -->
         <div v-if="localOnly" class="deep-cta">
           <p>
-            以上是本次聚合结果里的 <b>{{ items.length }}</b> 条{{ activeName }}内容。
-            只想要这个平台的话，可以再单独查一次。
+            这一页 {{ pool.items.length }} 条里，有 <b>{{ items.length }}</b> 条来自{{ activeName }}。
+            想让它单独出一份完整结果，就再查一次。
           </p>
           <button type="button" class="deep-btn" :disabled="loading" @click="deepSearch">
-            只在{{ activeName }}内搜索
+            单独查{{ activeName }}
           </button>
         </div>
 
@@ -1242,28 +1229,6 @@ onBeforeUnmount(() => {
   width: 5px;
   height: 5px;
   border-radius: 1px;
-}
-
-/* 池里的命中数：筛选从"装饰"变成"信息"。数字用 mono，视觉上比平台名更弱一档 */
-.chip-n {
-  font-family: var(--mono);
-  font-size: 10.5px;
-  font-weight: 500;
-  color: var(--faint);
-  transform: translateY(0.5px);
-}
-
-.chip.on .chip-n {
-  color: rgba(255, 255, 255, 0.62);
-}
-
-/* 全平台查询过、但这家一条没有：留着可见（说明真的搜了），只是退到背景里 */
-.chip.dim {
-  opacity: 0.45;
-}
-
-.chip.dim:hover {
-  opacity: 1;
 }
 
 /* 从偏好带进来的平台，进站就说清楚，别让用户以为结果漏了 */
