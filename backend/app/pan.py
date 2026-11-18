@@ -58,12 +58,20 @@ _cfg: dict = {
     # 曾经是 30，用来防"一个 100G 合集废掉一个账号"；取消后容量完全交给
     # 30 分钟窗口 + 旧副本回收来控制，账号满了就只能等回收或人工清
     "max_gb": 0.0,
+    # 转存**前**跳过顶层广告附件。默认开：判据是"三重命中"（关键词 + 附件
+    # 后缀 + 体积小），改动的是待转清单，不产生任何请求、不影响耗时。
+    # 它和下面的 ad_filter 是两个开关：这个只决定"少转几个引流附件"，
+    # 那个决定"转完再去删"。要彻底关掉广告处理，两个都关。
+    "ad_preskip": True,
     # 转存后清掉源分享里夹带的广告文件（"加群领福利"那一类）。默认关：
     # 关键词配错会删掉正片，先手工验一条再开
     "ad_filter": False,
     "ad_keywords": "",
     # 往下探几层。1 = 只看转存内容的直接子项，2 = 再进一层
     "ad_depth": 2,
+    # 判定广告的体积上限（MB）。附件型后缀 + 命中关键词 + 小于这个体积，
+    # 三条全中才动手；0 = 不限体积（但后缀和关键词仍然要过）
+    "ad_max_mb": 2.0,
     # 建出去那条分享本身的有效期（小时）。真正让链接失效的是 link_ttl 到点
     # 删源文件，这里只是安全网：回收任务没跑时，分享到期自己断。
     # 各平台档位不同，见各适配器 create_share；0 在这里没有"永久"的含义——
@@ -87,6 +95,8 @@ def init(db_path: str | Path, **cfg) -> None:
         if key in _cfg:
             _cfg[key] = value
     _ensure_schema()
+    # 库里的值**覆盖**环境变量：后台改过的配置以库为准，否则重启一次就回退了
+    _load_settings()
     _inited = True
 
 
@@ -98,6 +108,122 @@ def configure(**cfg) -> None:
     for key, value in cfg.items():
         if key in _cfg:
             _cfg[key] = value
+
+
+# ---- 配置：库优先于环境变量 ----
+#
+# 广告关键词这种东西是运营要随手调的，改 .env 重启一轮代价太高（而且线上
+# 是用 systemd 起的，改完没人记得 reload）。所以允许落到库里，启动时用库
+# 覆盖 .env，保存时直接热更 _cfg——下一次点击转存就用新词，不重启。
+
+#: 允许在后台维护的配置项。没列在这里的仍只认环境变量（超时、并发这类
+#: 参数改坏了会直接影响可用性，不给运营入口）
+AD_SETTING_KEYS = ("ad_preskip", "ad_filter", "ad_keywords", "ad_depth", "ad_max_mb")
+
+
+def _load_settings() -> None:
+    """启动时把库里的配置盖到 _cfg 上。读失败就沿用环境变量，不能让服务起不来。"""
+    try:
+        with _session() as conn:
+            rows = conn.execute("SELECT key, value FROM pan_settings").fetchall()
+    except sqlite3.Error as exc:
+        log.warning("读取库内配置失败，沿用环境变量：%s", exc)
+        return
+
+    for row in rows:
+        key = str(row["key"])
+        if key not in _cfg:
+            continue
+        raw = str(row["value"])
+        current = _cfg[key]
+        try:
+            # bool 是 int 的子类，必须先判它，否则 True/False 会被当成数字解析
+            if isinstance(current, bool):
+                value: object = raw.strip().lower() in ("1", "true", "yes", "on")
+            elif isinstance(current, int):
+                value = int(float(raw))
+            elif isinstance(current, float):
+                value = float(raw)
+            else:
+                value = raw
+        except (TypeError, ValueError):
+            log.warning("库内配置 %s 的值不合法（%r），沿用环境变量", key, raw)
+            continue
+        _cfg[key] = value
+
+
+def _save_settings(values: dict) -> None:
+    now = time.time()
+    with _session() as conn:
+        for key, value in values.items():
+            if isinstance(value, bool):
+                text = "true" if value else "false"
+            else:
+                text = str(value)
+            conn.execute(
+                "INSERT INTO pan_settings(key, value, updated_ts) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "updated_ts=excluded.updated_ts",
+                (key, text, now),
+            )
+
+
+def ad_settings() -> dict:
+    """当前**生效**的广告配置（不是 .env 里的原值）。"""
+    return {
+        "preskip": bool(_cfg.get("ad_preskip")),
+        "filter": bool(_cfg.get("ad_filter")),
+        "keywords": str(_cfg.get("ad_keywords") or ""),
+        "depth": int(_cfg.get("ad_depth") or 2),
+        "max_mb": float(_cfg.get("ad_max_mb") or 0),
+    }
+
+
+def save_ad_settings(
+    *,
+    preskip: bool,
+    filter: bool,  # noqa: A002 - 和前端字段同名，改名反而对不上
+    keywords: str,
+    depth: int,
+    max_mb: float,
+) -> dict:
+    """校验 + 落库 + **立即热更**。返回生效后的快照。
+
+    这里的校验比"能不能存"更重要：关键词是唯一能造成误杀的输入，所以
+    去空、去重、限长都在这里做，别指望前端。
+    """
+    words: list[str] = []
+    seen = set()
+    for raw in str(keywords or "").replace("，", ",").replace("\n", ",").split(","):
+        word = raw.strip().lower()
+        if not word or word in seen:
+            continue
+        if len(word) > 20:
+            raise ValueError(f"关键词太长（{len(word)} 字）：{word[:20]}…")
+        seen.add(word)
+        words.append(word)
+    if len(words) > 200:
+        raise ValueError(f"关键词最多 200 个，当前 {len(words)} 个")
+
+    depth_value = max(1, min(5, int(depth or 2)))
+    max_mb_value = max(0.0, min(10240.0, float(max_mb or 0)))
+
+    values = {
+        "ad_preskip": bool(preskip),
+        "ad_filter": bool(filter),
+        "ad_keywords": ",".join(words),
+        "ad_depth": depth_value,
+        "ad_max_mb": max_mb_value,
+    }
+    _save_settings(values)
+    for key, value in values.items():
+        _cfg[key] = value
+    log.info(
+        "广告配置已更新：preskip=%s filter=%s 词=%s 个 depth=%s max=%sMB",
+        values["ad_preskip"], values["ad_filter"], len(words),
+        depth_value, max_mb_value,
+    )
+    return ad_settings()
 
 
 def _connect() -> sqlite3.Connection:
@@ -142,6 +268,11 @@ def _ensure_schema() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_pan_accounts_type ON pan_accounts(type, status);
             CREATE INDEX IF NOT EXISTS idx_pan_accounts_fail ON pan_accounts(fail_count);
+            CREATE TABLE IF NOT EXISTS pan_settings (
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
+                updated_ts REAL NOT NULL
+            );
             """
         )
 
@@ -407,12 +538,18 @@ def transfer(url: str, pwd: str = "", platform: str = "", title: str = "") -> Sh
             max_bytes=max_bytes,
         )
         try:
+            # ad_keywords / ad_max_bytes 在 mirror() 里读，构造完再盖
+            #（同 max_file_bytes 的手法，不在五个 adapter 的构造签名里各抄一遍）
+            # 关键词置空 = 这一级不工作，这是把 MIRROR_AD_PRESKIP 关掉的方式
+            client.ad_keywords = ad_keywords() if _cfg.get("ad_preskip") else []
+            client.ad_max_bytes = ad_max_bytes()
             # 有效期一路传下去：以前这里只传三个参数，各适配器的默认值谁都不管，
             # 百度那边 0 就是永久分享。见 config.mirror_share_hours
             link = client.mirror(url, pwd, title, expire_hours=int(_cfg["share_hours"]))
             _reset_fail(account)
-            _scrub_ads(client, link)
             link.note = (link.note + f"|account={account.id}").strip("|")
+            # 兜底清理走后台：用户拿到链接就该走了，剩下的目录内翻找交给线程
+            _queue_scrub(account, link)
             return link
         except _SWITCHABLE as exc:
             _bump_fail(account, exc)
@@ -438,33 +575,71 @@ def transfer(url: str, pwd: str = "", platform: str = "", title: str = "") -> Sh
     raise last or UpstreamError("所有账号都失败了")
 
 
-def _scrub_ads(client, link) -> None:
-    """转存完顺手把源分享夹带的广告文件删掉（"加群领福利"那一类）。
+def ad_keywords() -> list[str]:
+    """广告关键词（小写，去空）。配错会误杀，判据在 sdk/adfilter.py。"""
+    return [
+        k.strip().lower()
+        for k in str(_cfg.get("ad_keywords") or "").split(",")
+        if k.strip()
+    ]
 
-    失败一律吞掉：广告没清干净只是脏，转存失败是故障，两件事不能混。
-    删掉的文件必须从 `link.fids` 里摘掉——那串会进 mirrors，回收任务照着它
-    删，留着已经删过的 fid 只会让下一轮 delete 报错、连累同批正常文件。
+
+def ad_max_bytes() -> int:
+    """广告判定的体积上限。0 = 不限体积（后缀和关键词仍然要过）。"""
+    try:
+        return max(0, int(float(_cfg.get("ad_max_mb") or 0) * 1024 ** 2))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _queue_scrub(account: Account, link) -> None:
+    """把"清目录内广告"丢到后台线程，然后立刻返回。
+
+    两条硬约束决定了它必须是这样：
+
+    1. **不能留在请求线程里**。这段要列目录、翻页、删文件，最坏几十个请求、
+       十几秒，全压在用户"点击 → 拿到链接"的路上。用户不该为几个广告文件等。
+    2. **不能复用调用方的 client**。`transfer()` 的 finally 会 close 掉它，
+       后台再拿同一个 client 发请求就是用一个关掉的 session。所以后台重开
+       一个，带凭据回写（夸克刷 __puus 要落库，不落库下次就是死 cookie）。
+
+    清不掉只脏不坏：广告没删干净最坏是用户多看见一个"加群领福利.txt"，
+    而转存失败是故障。两件事不能混，所以这里一律吞异常。
     """
     if not _cfg.get("ad_filter") or not link.fids:
         return
-    keywords = [
-        k.strip() for k in str(_cfg.get("ad_keywords") or "").split(",") if k.strip()
-    ]
+    keywords = ad_keywords()
     if not keywords:
         log.warning("广告清理已开启但关键词为空（MIRROR_AD_KEYWORDS），本次跳过")
         return
+    threading.Thread(
+        target=_run_scrub,
+        args=(account, list(link.fids), keywords),
+        name=f"ad-scrub-{account.type}-{account.id}",
+        daemon=True,
+    ).start()
+
+
+def _run_scrub(account: Account, fids: list[str], keywords: list[str]) -> None:
+    """后台线程本体。任何异常都只记日志——这条线程没有调用方能接住它。"""
+    client = None
     try:
+        client = _client_for(account)
+        client.ad_keywords = keywords
+        client.ad_max_bytes = ad_max_bytes()
         removed = client.scrub_ads(
-            link.fids, keywords, max_depth=int(_cfg.get("ad_depth") or 2)
+            fids,
+            keywords,
+            max_depth=int(_cfg.get("ad_depth") or 2),
+            max_bytes=ad_max_bytes(),
         )
+        if removed:
+            log.info("后台清掉 %s 个目录内广告附件（账号 %s）", len(removed), account.id)
     except Exception as exc:  # noqa: BLE001
-        log.warning("广告文件清理失败（不影响转存）：%s", exc)
-        return
-    if not removed:
-        return
-    gone = set(removed)
-    link.fids = [f for f in link.fids if f not in gone]
-    log.info("广告文件已清 %s 个，分享里只剩正片", len(removed))
+        log.warning("后台广告清理失败（不影响转存）：%s", exc)
+    finally:
+        if client is not None:
+            client.close()
 
 
 def _client_for(account: Account):

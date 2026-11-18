@@ -93,3 +93,11 @@ export const linkCheck = (state = '', limit = 30) =>
   api(`/api/admin/link-check?state=${encodeURIComponent(state)}&limit=${limit}`)
 export const linkCheckTest = (url, pwd) =>
   api('/api/admin/link-check/test', { method: 'POST', body: { url, pwd: pwd || '' } })
+
+// 广告过滤：读的是"当前生效值"（库优先于 .env），保存后热更，不用重启
+export const adFilter = () => api('/api/admin/ad-filter')
+export const saveAdFilter = (payload) =>
+  api('/api/admin/ad-filter', { method: 'POST', body: payload })
+// 试算走线上同一个判断函数，不是前端复刻的规则
+export const probeAd = (name, size) =>
+  api('/api/admin/ad-filter/probe', { method: 'POST', body: { name, size } })

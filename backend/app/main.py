@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import analytics, check, feedback, group, guard, pan, providers, resolver
-from .sdk import registry
+from .sdk import adfilter, registry
 from .config import get_settings
 from .providers import UpstreamError
 
@@ -199,8 +199,10 @@ if MIRROR_ON:
             max_gb=settings.mirror_max_gb,
             min_interval=settings.mirror_min_interval,
             ad_filter=settings.mirror_ad_filter,
+            ad_preskip=settings.mirror_ad_preskip,
             ad_keywords=settings.mirror_ad_keywords,
             ad_depth=settings.mirror_ad_depth,
+            ad_max_mb=settings.mirror_ad_max_mb,
             share_hours=settings.mirror_share_hours,
         )
         # 老部署靠 MIRROR_QUARK_COOKIE 一个变量活着。表里没有夸克账号时
@@ -1253,6 +1255,89 @@ async def admin_mirror(request: Request):
 class MirrorTestIn(BaseModel):
     url: str = ""
     pwd: str = ""
+
+
+# ---- 广告过滤配置 ----
+#
+# 值存在库里的 pan_settings 表，后台改完**立即生效**，不用重启。给运营这个
+# 入口的原因很直接：关键词是唯一会造成误杀的东西，得边看日志边调词，
+# 改 .env + 重启一圈跟不上。
+
+
+class AdFilterIn(BaseModel):
+    preskip: bool = True
+    filter: bool = False
+    keywords: str = ""
+    depth: int = 2
+    max_mb: float = 2.0
+
+
+class AdProbeIn(BaseModel):
+    name: str = ""
+    size: int = 0
+    is_dir: bool = False
+
+
+def _ad_payload() -> dict:
+    """配置 + 判据里那张后缀白名单。前端要把它摆给人看，不然没人知道
+    "为什么我的 .mp4 没被拦"。
+    """
+    data = pan.ad_settings()
+    data["suffixes"] = sorted(adfilter.ATTACHMENT_SUFFIXES)
+    return data
+
+
+@app.get("/api/admin/ad-filter", include_in_schema=False)
+async def admin_ad_filter_get(request: Request):
+    """当前**生效**的广告配置（不是 .env 里的原值）。"""
+    if not MIRROR_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "点击转存已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    return {"code": 0, "data": _ad_payload()}
+
+
+@app.post("/api/admin/ad-filter", include_in_schema=False)
+async def admin_ad_filter_save(payload: AdFilterIn, request: Request):
+    """保存并热更。不重启，下一次点击转存就用新词。"""
+    if not MIRROR_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "点击转存已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        pan.save_ad_settings(
+            preskip=payload.preskip,
+            filter=payload.filter,
+            keywords=payload.keywords,
+            depth=payload.depth,
+            max_mb=payload.max_mb,
+        )
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+    return {"code": 0, "data": _ad_payload()}
+
+
+@app.post("/api/admin/ad-filter/probe", include_in_schema=False)
+async def admin_ad_filter_probe(payload: AdProbeIn, request: Request):
+    """拿一个真实文件名试会不会被拦。
+
+    走的是线上同一套判断函数（`adfilter.explain`），不是前端复刻一份规则——
+    复刻的那种过两个月一定和线上对不上。
+    """
+    if not MIRROR_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "点击转存已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    return {
+        "code": 0,
+        "data": adfilter.explain(
+            payload.name,
+            payload.size,
+            pan.ad_keywords(),
+            pan.ad_max_bytes(),
+            is_dir=payload.is_dir,
+        ),
+    }
 
 
 # ---- 网盘账号管理 ----

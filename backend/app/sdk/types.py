@@ -45,6 +45,11 @@ class ShareInfo:
     expired_at: int = 0
     files: list[File] = field(default_factory=list)
     total_size: int = 0
+    #: 转存前被判为广告、**没有参与转存**的顶层 fid。
+    #: 只在适配器支持"全量转存 + 排除名单"时才有意义（目前是夸克）；
+    #: 其余平台是按 `files` 里的 fid 逐个转，这几项已经不在 files 里了，
+    #: 读到空列表是正常的，不要拿它当"这次没有广告"的证据。
+    excluded: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
 
 

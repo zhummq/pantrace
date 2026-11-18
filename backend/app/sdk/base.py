@@ -25,6 +25,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable
 
+from . import adfilter
 from .errors import (
     NetdiskError,
     TaskTimeoutError,
@@ -47,6 +48,11 @@ class PanClient(ABC):
     display: str = ""
     #: 支持转存的最大单文件体积（字节），0 表示不限制
     max_file_bytes: int = 0
+    #: 转存前过滤顶层广告附件用的关键词（空 = 不过滤）；由业务层在
+    #: registry.create 之后覆盖，理由同 max_file_bytes
+    ad_keywords: list[str] = []
+    #: 判定广告的体积上限。超过这个体积的附件一律不判，见 adfilter 的说明
+    ad_max_bytes: int = adfilter.DEFAULT_MAX_BYTES
 
     def __init__(
         self,
@@ -163,6 +169,10 @@ class PanClient(ABC):
         info = self.share_info(url, pwd)
         if not info.files:
             raise NetdiskError("分享里没有文件")
+        # 位置很关键：必须在 transfer 之前。share_info 已经把顶层文件名都拿
+        # 到手里了，这时候拦下来的广告根本不会进我们的网盘——不用删、不占
+        # 容量、不进回收站，也不产生任何额外请求（纯内存判断）
+        self._prefilter_ads(info)
         limit = self.max_file_bytes
         if limit and info.total_size > limit:
             raise TooLargeError(
@@ -188,12 +198,54 @@ class PanClient(ABC):
         link.size = info.total_size
         return link
 
+    def _prefilter_ads(self, info: ShareInfo) -> None:
+        """转存前把顶层广告附件从待转清单里摘掉。就地改 `info`。
+
+        只动"三重命中"的附件（关键词 + 附件后缀 + 体积小），目录和正片一律
+        不动——判据在 `adfilter` 里，改之前先看那边的注释。
+
+        **顶层全中时放弃过滤**：那种分享要么整条是垃圾，要么我们的关键词配
+        歪了。无论哪种，给用户一个空分享都比多几个广告文件糟糕，所以原样
+        全转，日志留一笔。
+        """
+        keywords = [
+            k.strip().lower() for k in (self.ad_keywords or []) if k and k.strip()
+        ]
+        if not keywords or not info.files:
+            return
+
+        kept, dropped = adfilter.split(info.files, keywords, int(self.ad_max_bytes or 0))
+        if not dropped:
+            return
+
+        names = "、".join(f.name[:20] for f in dropped[:3])
+        if not kept:
+            log.warning(
+                "%s 顶层 %s 个条目全部命中广告判据，放弃过滤、整条转存：%s",
+                self.display, len(dropped), names,
+            )
+            return
+
+        info.excluded = [f.fid for f in dropped]
+        info.files = kept
+        # 体积跟着减：它要参与 max_file_bytes 判断，也算进 link.size
+        info.total_size = max(
+            0, int(info.total_size or 0) - sum(int(f.size or 0) for f in dropped)
+        )
+        log.info(
+            "%s 转存前跳过 %s 个广告附件（剩 %s 个）：%s",
+            self.display, len(dropped), len(kept), names,
+        )
+
     # ---- 转存后收尾 ----
 
-    #: 广告扫描的请求预算。这些请求都在用户点击的链路上——为了几个广告文件
-    #: 把跳转拖到十几秒是不划算的，宁可漏删。
-    AD_SCAN_REQUESTS = 24
-    AD_SCAN_SECONDS = 8.0
+    #: 广告扫描的请求预算。这段现在跑在后台线程里（见 pan._queue_scrub），
+    #: 不占用户等待时间，所以比原来宽松；但仍然是真实请求，翻页要有上限——
+    #: 一个几千条文件的目录能把账号翻出风控
+    AD_SCAN_REQUESTS = 40
+    AD_SCAN_SECONDS = 20.0
+    AD_SCAN_PAGE = 100
+    AD_SCAN_MAX_PAGES = 5
 
     def scrub_ads(
         self,
@@ -201,59 +253,66 @@ class PanClient(ABC):
         keywords: list[str],
         *,
         max_depth: int = 2,
+        max_bytes: int = adfilter.DEFAULT_MAX_BYTES,
         max_requests: int | None = None,
         seconds: float | None = None,
     ) -> list[str]:
         """删掉转存内容里夹带的广告文件，返回被删的 fid。
 
-        规则和竞品一致：递归下探 `max_depth` 层，文件名命中关键词就删；目录
-        本身命中就连目录一起删，否则只删里面命中的文件。
+        这是**兜底**，不是主路径：顶层广告在 `transfer` 之前就被 `adfilter`
+        拦掉了，这里只处理"目录内部夹着的那一份"，量很小。
 
-        两个刻意的限制：
-          - **只看文件名，不看路径**：路径里带上层目录名，"资源/微信"这种
-            会被误杀。
-          - **顶层文件删不到**：转存接口只回 fid 不回文件名，判断不了它是
-            不是广告。要补只能多打一次 info 接口，不值。
+        判据和转前拦截共用 `adfilter.is_ad`，两处不会各自漂移。三条硬规矩：
+          - **只删文件，目录一个都不删**。目录里可能装着正片，删目录就是删正片。
+          - 三重命中才删：附件型后缀 + 体积小于阈值 + 名字命中关键词。
+          - **只看文件名不看路径**：路径里带上层目录名，"资源/微信"这种会误杀。
         """
         pats = [k.strip().lower() for k in (keywords or []) if k and k.strip()]
         if not pats or not fids:
             return []
 
-        def matched(name: str) -> bool:
-            low = (name or "").lower()
-            return any(p in low for p in pats)
-
         budget = self.AD_SCAN_REQUESTS if max_requests is None else max(0, int(max_requests))
         deadline = time.monotonic() + (self.AD_SCAN_SECONDS if seconds is None else float(seconds))
+        page_size = self.AD_SCAN_PAGE
         removed: list[str] = []
 
         def walk(parent_id: str, depth: int) -> None:
             nonlocal budget
-            if depth > max_depth or budget <= 0 or time.monotonic() > deadline:
+            if depth > max_depth:
                 return
-            budget -= 1
-            try:
-                children = self.list_files(parent_id, 1, 100)
-            except NetdiskError as exc:
-                # 列不出来通常是"这是个文件，不是目录"，属正常情况，不打日志
-                log.debug("%s 广告扫描跳过 %s：%s", self.display, parent_id, exc)
-                return
-
-            hits = [c for c in children if matched(c.name)]
-            if hits:
+            page = 1
+            # 翻页：老版本只列第一页 100 条，超过 100 个子项的目录整块漏扫
+            while page <= self.AD_SCAN_MAX_PAGES:
+                if budget <= 0 or time.monotonic() > deadline:
+                    return
+                budget -= 1
                 try:
-                    self.delete([c.fid for c in hits])
-                    removed.extend(c.fid for c in hits)
-                    log.info(
-                        "%s 转存内容里删掉 %s 个广告文件：%s",
-                        self.display, len(hits),
-                        "、".join(h.name[:24] for h in hits[:3]),
-                    )
+                    children = self.list_files(parent_id, page, page_size)
                 except NetdiskError as exc:
-                    log.warning("%s 广告文件删除失败：%s", self.display, exc)
-            for child in children:
-                if child.is_dir and not matched(child.name):
-                    walk(child.fid, depth + 1)
+                    # 列不出来通常是"这是个文件，不是目录"，属正常情况，不打日志
+                    log.debug("%s 广告扫描跳过 %s：%s", self.display, parent_id, exc)
+                    return
+                if not children:
+                    return
+
+                hits = [c for c in children if adfilter.is_ad(c, pats, max_bytes)]
+                if hits:
+                    try:
+                        self.delete([c.fid for c in hits])
+                        removed.extend(c.fid for c in hits)
+                        log.info(
+                            "%s 目录内删掉 %s 个广告附件：%s",
+                            self.display, len(hits),
+                            "、".join(h.name[:24] for h in hits[:3]),
+                        )
+                    except NetdiskError as exc:
+                        log.warning("%s 广告文件删除失败：%s", self.display, exc)
+                for child in children:
+                    if child.is_dir:
+                        walk(child.fid, depth + 1)
+                if len(children) < page_size:
+                    return
+                page += 1
 
         for fid in fids:
             walk(fid, 1)

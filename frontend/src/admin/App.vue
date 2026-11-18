@@ -6,6 +6,7 @@ import RankCard from './components/RankCard.vue'
 import ZeroPanel from './components/ZeroPanel.vue'
 import FeedbackPanel from './components/FeedbackPanel.vue'
 import AccountsPanel from './components/AccountsPanel.vue'
+import AdFilterPanel from './components/AdFilterPanel.vue'
 import GroupPanel from './components/GroupPanel.vue'
 import ClicksPanel from './components/ClicksPanel.vue'
 import LinkCheckPanel from './components/LinkCheckPanel.vue'
@@ -26,6 +27,7 @@ const ICON = {
   pulse: '<svg viewBox="0 0 24 24" fill="none"><path d="M3 12.5h3.6L9 6l4 12 2.4-5.5H21" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
   key: '<svg viewBox="0 0 24 24" fill="none"><circle cx="8.2" cy="8.2" r="4.2" stroke="currentColor" stroke-width="1.8"/><path d="M11.2 11.2 19.6 19.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.6 16.6 18.6 14.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
   users: '<svg viewBox="0 0 24 24" fill="none"><circle cx="9.2" cy="8.8" r="3.2" stroke="currentColor" stroke-width="1.8"/><path d="M3.6 19.2c0-3 2.5-5 5.6-5s5.6 2 5.6 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M15.8 6.2a3.2 3.2 0 0 1 0 5.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M17.2 14.6c1.9.7 3.2 2.3 3.2 4.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
+  shield: '<svg viewBox="0 0 24 24" fill="none"><path d="M12 3.4 19 6v6c0 4.2-2.9 7.5-7 8.6C7.9 19.5 5 16.2 5 12V6l7-2.6z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9.2 12.1 11 13.9l3.9-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
 }
 
 const NAV = [
@@ -36,6 +38,7 @@ const NAV = [
   { key: 'clicks', label: '点击日志', icon: ICON.pulse },
   { type: 'group', label: '配置' },
   { key: 'accounts', label: '网盘凭据', icon: ICON.key },
+  { key: 'adfilter', label: '广告过滤', icon: ICON.shield },
   { key: 'group', label: '群引导配置', icon: ICON.users },
 ]
 
@@ -46,6 +49,7 @@ const TITLES = {
   check: '资源巡检',
   clicks: '点击日志',
   accounts: '网盘凭据',
+  adfilter: '广告过滤',
   group: '群引导配置',
 }
 
@@ -448,6 +452,10 @@ onUnmounted(() => {
         <!-- 配置 -->
         <template v-else-if="route === 'accounts'">
           <AccountsPanel />
+        </template>
+
+        <template v-else-if="route === 'adfilter'">
+          <AdFilterPanel />
         </template>
 
         <template v-else-if="route === 'group'">

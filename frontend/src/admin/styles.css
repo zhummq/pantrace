@@ -1993,3 +1993,202 @@ input::placeholder,
 textarea::placeholder {
   color: var(--faint);
 }
+
+/* ==========================================================================
+   广告过滤面板（AdFilterPanel）
+
+   判据说明要读得下去、探针结果要一眼看清。这里刻意不用表格：六行三列的
+   小表格在窄屏会塌成一行一个词，比段落更难读。
+   ========================================================================== */
+
+.ad-lead {
+  margin: 0 0 14px;
+  font-size: 12.5px;
+  line-height: 1.75;
+  color: var(--ink-2);
+}
+
+.ad-lead strong,
+.ad-hint strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.ad-hint {
+  margin: 10px 0 0;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+
+.ad-hint code {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: var(--surface-3);
+  color: var(--brand-400);
+}
+
+.ad-block {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.ad-words {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.8;
+  padding: 9px 11px;
+  resize: vertical;
+}
+
+.ad-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+  align-items: center;
+}
+
+.ad-chip-count {
+  font-size: 11px;
+  color: var(--faint);
+  margin-right: 2px;
+}
+
+.ad-chip {
+  font-size: 11.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--brand-ring);
+  background: var(--brand-25);
+  color: var(--brand-400);
+  white-space: nowrap;
+}
+
+.ad-suffix-box {
+  gap: 6px;
+  grid-column: span 2;
+}
+
+.ad-suffix-list {
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--faint);
+}
+
+/* 三列等宽。别复用 .grp-grid3：那个是 90px 1fr 1fr，给"类型"这种短标签用的，
+   拿来做开关行会把第一列压成两行字 */
+.ad-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+  align-items: end;
+}
+
+.ad-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.ad-row input,
+.ad-row select {
+  height: 34px;
+  padding: 0 10px;
+}
+
+/* 体积上限在窄屏是 10240 这种长数字，别让它撑破列 */
+.ad-row input[type='number'] {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.ad-h2 {
+  margin: 22px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.ad-probe {
+  display: grid;
+  grid-template-columns: 1fr 130px auto;
+  gap: 8px;
+  margin-top: 10px;
+  align-items: center;
+}
+
+.ad-result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-2);
+  background: var(--surface-2);
+  box-shadow: var(--inset-top);
+}
+
+/* 命中用警示色，不命中保持中性：这一块的颜色只回答"会不会被删" */
+.ad-result.hit {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+}
+
+.ad-verdict {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--success);
+}
+
+.ad-result.hit .ad-verdict {
+  color: var(--danger);
+}
+
+.ad-reason {
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.ad-meta {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+}
+
+@media (max-width: 860px) {
+  .ad-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+@media (max-width: 560px) {
+  .ad-row,
+  .ad-probe {
+    grid-template-columns: 1fr;
+  }
+}
+
+.ad-suffix-tip {
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+
+.ad-suffix-tip strong {
+  color: var(--ink-2);
+  font-weight: 600;
+}

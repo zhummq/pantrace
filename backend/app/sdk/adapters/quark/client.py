@@ -259,16 +259,37 @@ class QuarkClient(PanClient):
 
     def transfer(self, info: ShareInfo, to_dir: str = "") -> list[str]:
         target = self.ensure_dir(to_dir)
+        body = {
+            "pwd_id": info.pwd_id,
+            "stoken": info.stoken,
+            "to_pdir_fid": target,
+            "pdir_fid": "0",
+            "pdir_save_all": True,
+            "scene": "link",
+        }
+        # 转存前业务层已经把顶层广告附件挑出来了。这里保持"全量转存"，只把
+        # 那几个 fid 排除掉——不用 fid_list 是因为部分转存还要配 share_fid_token，
+        # 那个字段在社区实现里有两个名字（share_token_list / fid_token_list），
+        # 猜错就是整条转存失败。exclude_fids 是竞品线上跑着的写法。
+        #
+        # 万一它也被上游拒（参数没有文档，不敢赌），退回全量重转一次：这一路
+        # 的失败必须是"广告没被排除"，不能是"用户拿不到链接"。
+        if info.excluded:
+            body["exclude_fids"] = list(info.excluded)
+            try:
+                return self._save(body)
+            except (AuthError, QuotaExceededError):
+                raise
+            except NetdiskError as exc:
+                log.warning("夸克带 exclude_fids 转存失败（%s），退回全量重转", exc)
+                body.pop("exclude_fids", None)
+        return self._save(body)
+
+    def _save(self, body: dict) -> list[str]:
+        """发转存请求并等任务完成。抽出来只为了让 exclude_fids 能干净地重试。"""
         save = self.http.post(
             "/share/sharepage/save",
-            json_body={
-                "pwd_id": info.pwd_id,
-                "stoken": info.stoken,
-                "to_pdir_fid": target,
-                "pdir_fid": "0",
-                "pdir_save_all": True,
-                "scene": "link",
-            },
+            json_body=body,
             action="转存",
         )
         data = self._ok(save, "转存")
