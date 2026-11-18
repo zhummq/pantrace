@@ -38,17 +38,23 @@ class _WindowLimiter:
         self._hits: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
-    def allow(self, key: str) -> tuple[bool, int]:
-        """返回 (是否放行, 需等待秒数)。放行时等待秒数为 0。"""
+    def allow(self, key: str, cost: int = 1) -> tuple[bool, int]:
+        """返回 (是否放行, 需等待秒数)。放行时等待秒数为 0。
+
+        `cost` 是这次请求占几份配额。默认 1；会真实花上游额度的接口
+        （`refresh=1` 绕过缓存）按 3 份计，等于把刷新频率压到普通搜索的 1/3。
+        """
+        cost = max(1, int(cost))
         now = time.monotonic()
         with self._lock:
             q = self._hits[key]
             while q and now - q[0] >= self.window:
                 q.popleft()
-            if len(q) >= self.limit:
-                wait = int(self.window - (now - q[0])) + 1
+            if len(q) + cost > self.limit:
+                wait = int(self.window - (now - q[0])) + 1 if q else int(self.window)
                 return False, max(1, wait)
-            q.append(now)
+            # 用时间戳占位而不是另存计数：窗口滑出时按戳出队，语义和单次请求一致
+            q.extend([now] * cost)
             # 字典膨胀保护：只清已经过期的空队列，不动还活着的 IP
             if len(self._hits) > 4096:
                 for k in [k for k, v in self._hits.items() if not v]:
@@ -69,11 +75,14 @@ def init(secret: str, ttl: int, rate_limit: int, window: float = 60.0) -> None:
     _limiter = _WindowLimiter(rate_limit, window)
 
 
-def allow(ip: str) -> tuple[bool, int]:
-    """IP 限流。未初始化时放行——防止配置遗漏把整站打死。"""
+def allow(ip: str, cost: int = 1) -> tuple[bool, int]:
+    """IP 限流。未初始化时放行——防止配置遗漏把整站打死。
+
+    `cost` 见 `_WindowLimiter.allow`：会真实花额度的请求传 3。
+    """
     if _limiter is None:
         return True, 0
-    return _limiter.allow(ip or "-")
+    return _limiter.allow(ip or "-", cost)
 
 
 def _ip_hash(ip: str) -> str:

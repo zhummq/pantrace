@@ -40,6 +40,7 @@ KINDS = {
     "filter",    # 切换平台筛选
     "page",      # 翻页
     "retry",     # 失败后重试
+    "refresh",   # 结果页主动点「强制刷新」：跳过缓存回源，是真花钱的动作
     "mirror",    # 点击转存：ok=最终有没有给出可用链接，source=cached/fresh/fallback
 }
 

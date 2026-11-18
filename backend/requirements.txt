@@ -3,3 +3,9 @@ uvicorn[standard]>=0.30
 requests>=2.31
 pydantic-settings>=2.3
 cryptography>=42
+# 搜索层（app/search）依赖：base.py 的双超时客户端与 TG 频道抓取都要它。
+# 早期是别的包的间接依赖，显式声明，避免部署机装完缺包。
+httpx>=0.27,<1.0
+# TG 页面解析：lxml 提供 DOM，cssselect 让选择器字符串能从 goquery 直接粘贴。
+lxml>=5.0
+cssselect>=1.2

@@ -1,10 +1,17 @@
-"""上游调用：idatariver 控制台 MAPI（唯一通道）。
+"""上游协议层：请求体拼装 + 鉴权头 + 返回归一化。
 
-为什么只留一条：
-以前挂过 haisou.cc 直连和 apiok.us 套壳做降级，实际跑下来都不合适——
-haisou 匿名按 IP 每日 100 点，用完就废；apiok 按积分计费，耗时 2.5~75 秒波动。
-降级链更坏的副作用是：签名过期后请求被悄悄转到慢通道，日志里只剩"慢"，
-看不出真正原因是签名失效。单通道反而让故障一眼可见。
+**这里不发请求。** 取数已经统一走 `app/search/plugins/`（pansou 插件机制），
+本模块只提供"怎么跟这条上游说话"的三件事，插件和探针共用同一份口径：
+
+| 函数 | 作用 |
+|---|---|
+| `build_envelope()` | 拼 path / method / params（含 apikey、searchIn、分页、平台筛选） |
+| `upstream_headers()` | 鉴权头，唯一有效的是 `x-idr-sign` |
+| `normalize_payload()` | 校验 code（1004/1005 分人话）+ 字段归一化 |
+
+为什么不把这些留在插件里：pansou 的插件是"一个源一个文件"，而这条上游的
+参数与错误码是所有源共用的（以后接别的上游也是同样三件事）。写在插件里，
+加第二个源时就会出现第二份 envelope 拼装，迟早漂移成两套行为。
 
 鉴权实测结论（拆变量验证过）：
 - 只带 sid、去掉 cf_clearance：✅ 通
@@ -17,8 +24,6 @@ haisou 匿名按 IP 每日 100 点，用完就废；apiok 按积分计费，耗�
 from __future__ import annotations
 
 import re
-
-import requests
 
 from .config import get_settings
 
@@ -46,26 +51,6 @@ class UpstreamError(RuntimeError):
     def __init__(self, message: str, code: int | None = None):
         super().__init__(message)
         self.code = code
-
-
-_session: requests.Session | None = None
-
-
-def get_session() -> requests.Session:
-    global _session
-    if _session is None:
-        s = requests.Session()
-        settings = get_settings()
-        s.trust_env = settings.use_env_proxy
-        s.headers.update({
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": UA,
-        })
-        if settings.proxy_url:
-            s.proxies.update({"http": settings.proxy_url, "https": settings.proxy_url})
-        _session = s
-    return _session
 
 
 def _clean(value) -> str:
@@ -115,14 +100,14 @@ def _normalize(data: dict, page: int, page_size: int) -> dict:
     }
 
 
-def search(query: str, platforms: list[str], page: int, page_size: int, scope: str) -> dict:
-    """请求上游并归一化返回。失败抛 UpstreamError。"""
-    settings = get_settings()
-    if not settings.idr_sign:
-        raise UpstreamError("未配置 IDR_SIGN，无法请求上游")
+def build_envelope(query: str, platforms: list[str], page: int, page_size: int, scope: str) -> dict:
+    """拼上游请求体。
 
+    插件层（`app/search/plugins/haisou.py`）与探针共用这一份参数拼装，
+    避免"某处少传一个字段就搜出另一批结果"这种漂移。
+    """
     params = {
-        "apikey": settings.api_key,
+        "apikey": get_settings().api_key,
         "query": query,
         "searchIn": scope if scope in ("title", "all") else "title",
         "page": page,
@@ -132,8 +117,15 @@ def search(query: str, platforms: list[str], page: int, page_size: int, scope: s
     if platforms:
         params["platforms"] = platforms
 
-    envelope = {"path": UPSTREAM_PATH, "method": "POST", "params": params}
-    headers = {
+    return {"path": UPSTREAM_PATH, "method": "POST", "params": params}
+
+
+def upstream_headers() -> dict:
+    """上游鉴权头。唯一有效的是 `x-idr-sign`（拆变量实测过，见模块 docstring）。"""
+    settings = get_settings()
+    if not settings.idr_sign:
+        raise UpstreamError("未配置 IDR_SIGN，无法请求上游")
+    return {
         "accept": "application/json",
         "content-type": "application/json",
         "origin": "https://www.idatariver.com",
@@ -143,23 +135,13 @@ def search(query: str, platforms: list[str], page: int, page_size: int, scope: s
         "x-idr-time": settings.idr_time,
     }
 
-    try:
-        resp = get_session().post(
-            settings.idr_url, json=envelope, headers=headers,
-            timeout=(settings.connect_timeout, settings.request_timeout),
-        )
-    except requests.exceptions.ConnectTimeout as exc:
-        raise UpstreamError("连接上游超时（TLS 握手阶段）") from exc
-    except requests.exceptions.Timeout as exc:
-        raise UpstreamError("上游处理超时，未在限定时间内返回") from exc
-    except requests.exceptions.RequestException as exc:
-        raise UpstreamError(f"无法连接上游（{type(exc).__name__}）") from exc
 
-    try:
-        data = resp.json()
-    except ValueError as exc:
-        raise UpstreamError(f"上游返回非 JSON（HTTP {resp.status_code}）") from exc
+def normalize_payload(data: dict, page: int, page_size: int) -> dict:
+    """校验上游返回码 + 归一化。
 
+    错误码在这里统一分出人话，插件层直接复用：1004 签名过期、1005 apikey
+    无效/余额不足，两者都不是"重试能好"的错误。
+    """
     code = _to_int(data.get("code"), -1)
     if code == 1004:
         raise UpstreamError("IDR 签名已失效（1004），需在浏览器重新抓取 X-IDR-Sign 写入 .env", code=1004)
@@ -170,3 +152,4 @@ def search(query: str, platforms: list[str], page: int, page_size: int, scope: s
         raise UpstreamError(f"上游失败（{code}）{msg}", code=code)
 
     return _normalize(data, page, page_size)
+

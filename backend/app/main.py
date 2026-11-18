@@ -1,7 +1,7 @@
 """盘迹 PanTrace —— 后端入口。
 
-职责：收前端请求 → 走上游 → 结果洗干净还给前端。apikey 与签名只存在后端。
-上游只有一条通道（见 providers.py）：idatariver 控制台 MAPI。
+职责：收前端请求 → 走插件层取数 → 结果洗干净还给前端。apikey 与签名只存在后端。
+取数在 `app/search/`（pansou 插件机制），上游协议细节在 `providers.py`。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import logging
 import secrets
 import threading
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, Query, Request
@@ -22,10 +23,17 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, check, feedback, group, guard, pan, providers, resolver
-from .sdk import adfilter, registry
+from . import analytics, check, feedback, group, guard, pan, resolver
 from .config import get_settings
-from .providers import UpstreamError
+from .search import engine as search_engine
+from .search.cache import SearchCache
+from .search.pool import WorkerPool
+from .search.registry import close_clients as close_source_clients, load_all as load_sources
+from .search.singleflight import SingleFlight
+from .search.observe import liveness
+from .search.pool import stats as source_stats
+from .search.tg import TG as TG_GATE
+from .sdk import adfilter, registry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("pantrace")
@@ -53,7 +61,35 @@ if _SIGN_PROBLEM:
 else:
     log.info("签名已配置（%s…）", settings.idr_sign[:11])
 
-app = FastAPI(title="盘迹 PanTrace API", version="0.4.0")
+# ---- 搜索源（pansou 插件层）----
+# 白名单加载：ENABLED_SOURCES 为空 = 一个源都不启用。插件自带 4~6 秒窗口和
+# `complete` 语义缓存，这里不再套第二层超时。
+_search_cache = SearchCache(settings.search_cache_path)
+_sources = load_sources(
+    settings.enabled_sources,
+    cache=_search_cache,
+    pool=WorkerPool(),
+    proxy=settings.proxy_url or None,
+)
+if _sources:
+    log.info("搜索源就绪：%s（L2 缓存 %s）", [p.name for p in _sources], settings.search_cache_path)
+else:
+    log.error("没有启用任何搜索源（ENABLED_SOURCES=%r），/api/search 会返回 504", settings.enabled_sources)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # TG 可达性由后台探测循环维护（pansou 的 `tgProbeLoop`）：搜索路径只读结论、
+    # 绝不阻塞在探测上。只在 TG 源被启用时启动，否则白打一次 t.me。
+    if any(p.name == "tg_searchers" for p in _sources):
+        TG_GATE.start()
+    yield
+    # 退出时关连接池，否则 uvicorn --reload 会留一堆 TIME_WAIT
+    await close_source_clients()
+    _search_cache.close()
+
+
+app = FastAPI(title="盘迹 PanTrace API", version="0.4.0", lifespan=lifespan)
 
 # ---- 埋点 ----
 # 数据只落本地 SQLite，不出机器。写库失败不影响搜索。
@@ -583,10 +619,15 @@ _fail_cache: dict[str, tuple[float, str]] = {}
 FAIL_TTL = 20
 CACHE_TTL = settings.cache_ttl
 
-# 上游调用必须串行且留间隔：实测紧接着连发第二个请求，上游会挂住到超时（最长 120 秒）。
-# 这不是优化，是可用性底线。
-MIN_INTERVAL = 2.0
-_last_call_at = 0.0
+# 同键并发去重：同一条缓存键同时未命中时只放一个请求出去，其余搭车。
+# 这是**省钱**配置，不是性能配置 —— 见 search/singleflight.py 的说明。
+_SINGLEFLIGHT = SingleFlight()
+
+# 这里**不做全局串行排队**。
+# 旧链路（providers.search）是"一次请求打全平台"，上游对紧接的第二个请求会挂到超时，
+# 所以当年加了 MIN_INTERVAL=2s 的串行间隔。现在取数走插件层：并发控制在插件内部
+# （haisou 的 MAX_CONCURRENCY），限流有 1003→429 退避重试兜着，重复查询有 5 分钟
+# 响应缓存挡着。再留一道全局等待只会让每次搜索白等 2 秒，并且把多源并发重新串起来。
 # 最近一次失败原因，只在 /api/health 暴露，便于远程判断是不是签名过期
 _last_error = ""
 
@@ -622,6 +663,24 @@ async def health():
         "lastError": _last_error,
         "cached": len(_cache),
         "failed": len(_fail_cache),
+        # 正在跑的"同键去重"任务数。持续大于 0 是正常的（有人在搜）；
+        # 只有它和工作池同时打满才说明有人在并发刷同一个词。
+        "singleflight": _SINGLEFLIGHT.inflight,
+        # ---- 搜索源（pansou 插件层）----
+        # enabled 是**实际加载成功**的源，不是 .env 里写的：写错名字或导入失败
+        # 时这里会是空的，比去翻日志快。
+        "sources": {
+            "enabled": [p.name for p in _sources],
+            "configured": settings.enabled_sources,
+            "pool": source_stats.snapshot(),
+            # 只列"有病"的（degraded / failing / zero_yield），健康的源不占体积。
+            # zero_yield 是最隐蔽的一档：源可达、从不报错、但一条都抓不到。
+            "liveness": liveness.snapshot(),
+            # liveness 要攒够 5 轮才下结论，所以另外给一份"刚才那轮"的原始结果：
+            # 重启后第一次搜索失败时，靠这个才能知道是谁失败了、什么分类。
+            "lastRound": search_engine.last_round(),
+        },
+        "tgGate": TG_GATE.snapshot() if any(p.name == "tg_searchers" for p in _sources) else {"enabled": False},
         "analytics": ANALYTICS_ON,
         "feedback": FEEDBACK_ON,
         "mirror": MIRROR_ON,
@@ -656,14 +715,27 @@ async def search(
     page: int = Query(1, ge=1, le=100),
     page_size: int = Query(20, ge=1, le=settings.max_page_size),
     search_in: str = Query("title", description="title 或 all"),
+    src: str = Query("auto", description="auto/tg/plugin：auto = TG 优先、拿不到才走计费接口"),
+    refresh: bool = Query(
+        False,
+        description="跳过响应缓存强制回源。**会真实消耗上游额度**，普通查询不要带",
+    ),
+    force_refresh: bool = Query(
+        False, include_in_schema=False, description="refresh 的 pansou 兼容别名"
+    ),
 ):
-    global _last_call_at, _last_error
+    global _last_error
+
+    # 两个名字指同一件事：本项目习惯 `refresh`，pansou 的调用方习惯 `force_refresh`。
+    force = refresh or force_refresh
 
     # ---- 防刷：先限流，再验票 ----
     # 两道闸门共用一个 IP 计数池（领票接口也计数），无票探测也会消耗配额。
     # 顺序不能反：先验票的话，脚本可以无限发无票请求而不占配额。
     ip = client_ip(request)
-    allowed, wait = guard.allow(ip)
+    # refresh 绕过缓存直接回源，是真花钱的：按 3 份配额计。默认 30 次/分钟时
+    # 等于最多刷 10 次/分钟，普通搜索不受影响。
+    allowed, wait = guard.allow(ip, cost=3 if force else 1)
     if not allowed:
         return JSONResponse(
             status_code=429,
@@ -687,7 +759,20 @@ async def search(
         log.warning("忽略未知平台 key: %s", ",".join(dropped))
 
     scope = search_in if search_in in ("title", "all") else "title"
-    cache_key = f"{query}|{','.join(platform_list)}|{page}|{page_size}|{scope}"
+
+    # 来源通道：TG 是基础通道，拿不到结果才走计费接口（见 engine 分层说明）。
+    # `all` 是 pansou 的叫法，等价于 auto。不认识的值得回 400 —— 静默当 auto
+    # 会让调用方以为筛了通道，其实没筛。
+    source = "auto" if src == "all" else src
+    if source not in ("auto", "tg", "plugin"):
+        return JSONResponse(
+            status_code=400,
+            content={"code": 400, "msg": f"未知的来源类型：{src}（可用 auto/tg/plugin）"},
+        )
+
+    # 缓存键必须带通道：不带的话 src=tg 的空结果会顶掉 auto 的真实结果，
+    # 反过来 auto 的兜底结果也会被当成"TG 搜到的"返回。
+    cache_key = f"{query}|{','.join(platform_list)}|{page}|{page_size}|{scope}|{source}"
     now = time.time()
 
     # 埋点参数：真实 IP / UA / 匿名访客号，一次算好，几个出口复用
@@ -704,7 +789,9 @@ async def search(
         "is_new": is_new,
     }
 
-    cached = _cache.get(cache_key)
+    # refresh=true 时绕过响应缓存，直接回源。**不能**把 refresh 拼进 cache_key：
+    # 拼进去等于刷新和普通查询各留一份缓存，用户刷新完再搜拿到的还是老的那份。
+    cached = None if force else _cache.get(cache_key)
     if cached and now - cached[0] < CACHE_TTL:
         body = dict(cached[1])
         body["cached"] = True
@@ -719,7 +806,8 @@ async def search(
             )
         return _export_search(body, background, page=page)
 
-    failed = _fail_cache.get(cache_key)
+    # 刷新时也不看失败缓存：刚失败就点刷新，还回同一个 504，等于这个参数白给。
+    failed = None if force else _fail_cache.get(cache_key)
     if failed and now - failed[0] < FAIL_TTL:
         wait = int(FAIL_TTL - (now - failed[0])) + 1
         if ANALYTICS_ON:
@@ -737,17 +825,55 @@ async def search(
             content={"code": 504, "msg": f"{failed[1]}（{wait} 秒后可重试）"},
         )
 
-    gap = MIN_INTERVAL - (time.monotonic() - _last_call_at)
-    if gap > 0:
-        await asyncio.sleep(gap)
-
     started = time.perf_counter()
-    try:
-        result = await asyncio.to_thread(
-            providers.search, query, platform_list, page, page_size, scope
+
+    async def _run_search() -> dict:
+        """回源 + 写缓存。抽成函数是为了让单飞锁只执行它一次。
+
+        leader 用自己的返回值，follower 拿到的是**同一个 dict 对象**——所以调用方
+        要改它必须先 `dict()` 复制。异常原样往外抛：失败也要广播给搭车的请求，
+        否则它们各自重试，等于这把锁白加。
+        """
+        # 分层降级在 engine 里：先 TG，拿不到可用结果才走计费接口。
+        # 每个源自己的窗口负责"别让用户干等"，超时未跑完的源会在后台继续抓并写缓存。
+        result = await search_engine.search(
+            query,
+            platform_list,
+            page,
+            page_size,
+            scope,
+            source=source,
+            force_refresh=force,
         )
-    except UpstreamError as exc:
-        _last_call_at = time.monotonic()
+        body = {
+            "code": 0,
+            "msg": "",
+            "query": query,
+            "items": result["items"],
+            "pagination": result["pagination"],
+            "credits": result["_meta"].get("credits", 0),
+            # 这一轮是哪个通道出的结果：tg = 没花额度，plugin = 兜底花了。
+            # 前端可以用它提示"TG 无结果，已切换备用源"，运维也能一眼看出扣费原因。
+            "tier": result["_meta"].get("tier", ""),
+            "tookMs": int((time.perf_counter() - started) * 1000),
+            "cached": False,
+        }
+        _fail_cache.pop(cache_key, None)
+        _cache[cache_key] = (time.time(), body)
+        if len(_cache) > settings.cache_max_entries:
+            oldest = sorted(_cache.items(), key=lambda kv: kv[1][0])[: len(_cache) // 4]
+            for k, _ in oldest:
+                _cache.pop(k, None)
+        return body
+
+    try:
+        body, shared = await _SINGLEFLIGHT.run(cache_key, _run_search)
+    except search_engine.SourceNotEnabledError as exc:
+        # 通道没启用是配置问题，不是上游故障：回 400，且**不写失败缓存**
+        # （否则改完配置还得等 20 秒才能重试）。
+        log.warning("source not enabled q=%s src=%s: %s", query, src, exc)
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+    except search_engine.SearchEngineError as exc:
         _last_error = str(exc)
         log.warning("upstream failed q=%s: %s", query, exc)
         msg = str(exc)
@@ -767,27 +893,17 @@ async def search(
             )
         return JSONResponse(status_code=504, content={"code": 504, "msg": msg})
 
-    _last_call_at = time.monotonic()
     _last_error = ""
     upstream_ms = int((time.perf_counter() - started) * 1000)
 
-    body = {
-        "code": 0,
-        "msg": "",
-        "query": query,
-        "items": result["items"],
-        "pagination": result["pagination"],
-        "credits": result["_meta"]["credits"],
-        "tookMs": upstream_ms,
-        "cached": False,
-    }
-
-    _fail_cache.pop(cache_key, None)
-    _cache[cache_key] = (time.time(), body)
-    if len(_cache) > settings.cache_max_entries:
-        oldest = sorted(_cache.items(), key=lambda kv: kv[1][0])[: len(_cache) // 4]
-        for k, _ in oldest:
-            _cache.pop(k, None)
+    if shared:
+        # 搭车：本轮上游开销算在 leader 头上，这个请求既没打上游也没花钱。
+        # body 是 leader 写进缓存的那个对象，动它等于污染其他请求 —— 先复制。
+        body = dict(body)
+        body["tookMs"] = 0
+        body["cached"] = True
+        body["shared"] = True
+        upstream_ms = 0
 
     if ANALYTICS_ON:
         background.add_task(
@@ -796,12 +912,14 @@ async def search(
             ok=True,
             duration_ms=upstream_ms,
             result_count=len(body["items"]),
-            cached=False,
+            # 搭车和缓存命中在"没为这个请求打上游"这件事上是一回事
+            cached=shared,
         )
 
     log.info(
-        "search q=%s page=%s items=%s %sms",
+        "search q=%s page=%s items=%s %sms%s",
         query, page, len(body["items"]), upstream_ms,
+        "（同键搭车）" if shared else "",
     )
     return _export_search(dict(body), background, page=page)
 

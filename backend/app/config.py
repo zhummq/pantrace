@@ -36,11 +36,31 @@ class Settings(BaseSettings):
     # 国内服务器更慢，原来 10 秒会让握手慢的连接直接判失败。
     connect_timeout: float = 25.0
 
+    # ---- 搜索源（pansou 插件层白名单）----
+    # 逗号分隔的插件名，**空 = 一个源都不启用**（pansou 的约定，新源必须显式批准）。
+    # 默认给 haisou：它是目前唯一的源，留空会让 /api/search 直接返回 504。
+    enabled_sources: str = "haisou"
+
+    # 上游**按请求计费**，而一次"全平台搜索"要发 5 平台 × 2 页 = 10 个请求。
+    # 所以前端改成"先选网盘再搜"，请求里不带 platforms 时只查这一个盘兜底，
+    # 绝不退化成全平台 —— 那等于用户随手点一下搜索就烧掉 10 份额度。
+    # 默认夸克：数据量最大（total 封顶 1000），覆盖率最高。
+    default_platform: str = "quark"
+
     # ---- 网络 ----
     # 默认不使用系统环境变量里的代理：本机 http_proxy 反而更慢/不可靠，直连更稳。
     # 如果部署环境必须走代理，把 use_env_proxy 设 true，或在 proxy_url 里写死代理地址。
     use_env_proxy: bool = False
     proxy_url: str = ""
+
+    # ---- TG 通道（pansou 的 searchTG 阶段）----
+    # 逗号分隔的频道名。默认值与 pansou `config/config.go:164` 一致（tgsearchers7）。
+    # 频道多不代表更好：每个频道一次请求，且都受可达性门控；线上直连 t.me 再启用。
+    tg_channels: str = "tgsearchers7"
+
+    @property
+    def tg_channel_list(self) -> list[str]:
+        return [c.strip().lstrip("@") for c in self.tg_channels.split(",") if c.strip()]
 
     # ---- 本地保护策略 ----
     cache_ttl: int = 300          # 搜索结果缓存秒数，同 query 不重复请求上游
@@ -241,6 +261,16 @@ class Settings(BaseSettings):
         if self.analytics_db:
             return self.analytics_db
         return str(BACKEND_DIR / "data" / "analytics.db")
+
+    @property
+    def search_cache_path(self) -> str:
+        """插件层搜索缓存（L2 SQLite）。和埋点同目录，备份一次全带走。
+
+        不复用 main.py 那个 5 分钟的内存缓存：那个存的是"已经拼好的响应体"，
+        这里存的是"每个源每次抓取的原始结果"，语义不同（后者带 complete 标记，
+        能表达"上一轮没跑完，下次重抓"）。
+        """
+        return str(BACKEND_DIR / "data" / "search_cache.db")
 
 
 @lru_cache
