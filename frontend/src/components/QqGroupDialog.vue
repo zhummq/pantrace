@@ -174,32 +174,32 @@ function switchTab(i) {
   z-index: 90;
   display: grid;
   place-items: center;
-  padding: 20px;
-  background: rgba(8, 12, 18, 0.46);
+  padding: var(--sp-5);
+  background: var(--veil);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
 }
 
 .pt-panel {
   position: relative;
-  width: 344px;
+  width: 352px;
   max-width: 100%;
   max-height: calc(100vh - 40px);
   max-height: calc(100dvh - 40px);
-  padding: 24px 24px 20px;
+  padding: var(--sp-6);
   overflow-y: auto;
-  background: var(--surface, #fff);
-  border: 1px solid var(--line, #e4e8ee);
-  border-radius: var(--radius, 9px);
-  box-shadow: var(--shadow-lg, 0 30px 70px -30px rgba(11, 16, 23, 0.45));
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-lg);
   text-align: center;
-  animation: pt-in 0.18s ease-out;
+  animation: pt-in var(--dur-3) var(--ease-out);
 }
 
 @keyframes pt-in {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(10px) scale(0.985);
   }
   to {
     opacity: 1;
@@ -209,49 +209,56 @@ function switchTab(i) {
 
 .pt-close {
   position: absolute;
-  top: 10px;
-  right: 10px;
+  top: 12px;
+  right: 12px;
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
   border: none;
-  border-radius: var(--radius-sm, 6px);
+  border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--faint, #96a1ad);
-  font-size: 13px;
-  cursor: pointer;
+  color: var(--faint);
+  font-size: var(--text-base);
 }
 
 .pt-close:hover {
-  background: var(--bg, #f5f7f9);
-  color: var(--ink, #0b1017);
+  background: var(--surface-3);
+  color: var(--ink);
 }
 
 .pt-head {
-  margin-bottom: 14px;
+  margin-bottom: var(--sp-4);
 }
 
 .pt-kicker {
-  margin: 0 0 8px;
-  font-size: 9px;
-  letter-spacing: 0.18em;
-  color: var(--faint, #96a1ad);
+  display: inline-block;
+  margin: 0 0 10px;
+  padding: 2px 8px;
+  border-radius: var(--radius-xs);
+  background: var(--brand-soft);
+  font-family: var(--sans);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--brand-ink);
 }
 
 .pt-title {
   margin: 0 0 6px;
-  font-size: 16.5px;
+  font-size: var(--text-lg);
   font-weight: 650;
-  letter-spacing: 0.01em;
-  color: var(--ink, #0b1017);
+  letter-spacing: -0.01em;
+  color: var(--ink);
 }
 
 .pt-desc {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.6;
-  color: var(--muted, #69747f);
+  color: var(--muted);
+  /* 两行时别把最后一个字甩到第二行 */
+  text-wrap: pretty;
 }
 
 .pt-tabs {
@@ -259,28 +266,30 @@ function switchTab(i) {
   justify-content: center;
   gap: 6px;
   flex-wrap: wrap;
-  margin-bottom: 12px;
+  margin-bottom: var(--sp-3);
 }
 
 .pt-tab {
-  height: 27px;
-  padding: 0 11px;
-  border: 1px solid var(--line, #e4e8ee);
-  border-radius: var(--radius-sm, 6px);
-  background: transparent;
-  color: var(--ink-2, #2c3644);
-  font-size: 12px;
-  cursor: pointer;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: var(--text-sm);
 }
 
 .pt-tab:hover {
-  border-color: var(--line-2, #ccd4de);
+  border-color: var(--brand-200);
+  background: var(--brand-25);
+  color: var(--brand-ink);
 }
 
 .pt-tab.on {
-  background: var(--ink, #0b1017);
-  border-color: var(--ink, #0b1017);
-  color: #fff;
+  background: var(--brand-soft);
+  border-color: var(--brand-300);
+  color: var(--brand-ink);
+  font-weight: 600;
 }
 
 .pt-body {
@@ -289,159 +298,145 @@ function switchTab(i) {
   align-items: center;
 }
 
-/* 二维码用取景框：四个角各一小段线，比投影更干净 */
+/* 二维码：干净的白底方框，靠圆角与描边收边，不再用取景框四角 */
 .pt-qr {
   position: relative;
   width: 208px;
   height: 208px;
   padding: 8px;
-  border: 1px solid var(--line, #e4e8ee);
-  border-radius: var(--radius-sm, 6px);
-  background: #fff;
-}
-
-.pt-qr::before,
-.pt-qr::after {
-  content: '';
-  position: absolute;
-  width: 12px;
-  height: 12px;
-  border: 1px solid var(--accent, #00a99d);
-}
-
-.pt-qr::before {
-  top: -1px;
-  left: -1px;
-  border-right: 0;
-  border-bottom: 0;
-}
-
-.pt-qr::after {
-  right: -1px;
-  bottom: -1px;
-  border-left: 0;
-  border-top: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-xs);
 }
 
 .pt-qr img {
   width: 100%;
   height: 100%;
   object-fit: contain;
+  border-radius: var(--radius-xs);
 }
 
 .pt-qr-empty {
   display: grid;
   place-items: center;
   height: 100%;
-  font-size: 12px;
-  color: var(--muted, #69747f);
+  font-size: var(--text-sm);
+  color: var(--muted);
 }
 
 .pt-number {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-top: 13px;
-  font-size: 12.5px;
+  gap: var(--sp-2);
+  margin-top: var(--sp-3);
+  font-size: var(--text-sm);
 }
 
 .pt-num-label {
-  font-size: 10px;
-  letter-spacing: 0.1em;
-  color: var(--faint, #96a1ad);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.06em;
+  color: var(--faint);
 }
 
 .pt-num {
-  font-size: 14px;
-  letter-spacing: 0.08em;
-  color: var(--ink, #0b1017);
+  font-size: var(--text-base);
+  letter-spacing: 0.06em;
+  color: var(--ink);
 }
 
 .pt-copy {
-  height: 25px;
-  padding: 0 10px;
-  border: 1px solid var(--line-2, #ccd4de);
-  border-radius: 5px;
-  background: #fff;
-  font-size: 11.5px;
-  color: var(--ink-2, #2c3644);
-  cursor: pointer;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-xs);
+  background: var(--surface);
+  font-size: var(--text-sm);
+  color: var(--ink-2);
 }
 
 .pt-copy:hover {
-  border-color: var(--ink-2, #2c3644);
+  border-color: var(--brand-300);
+  background: var(--brand-25);
+  color: var(--brand-ink);
 }
 
 .pt-copy.done {
-  border-color: rgba(0, 169, 157, 0.4);
-  background: var(--accent-soft, #e7f6f4);
-  color: var(--accent-deep, #07726b);
+  border-color: var(--success);
+  background: var(--success-soft);
+  color: var(--success-ink);
 }
 
 .pt-tip {
   margin: 10px 0 0;
-  font-size: 11.5px;
-  color: var(--muted, #69747f);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--muted);
 }
 
 .pt-join {
-  height: 38px;
-  margin-top: 12px;
-  padding: 0 18px;
+  height: 40px;
+  margin-top: var(--sp-3);
+  padding: 0 var(--sp-5);
   border: none;
-  border-radius: var(--radius-sm, 6px);
-  background: var(--ink, #0b1017);
-  color: #fff;
-  font-size: 12.5px;
-  letter-spacing: 0.04em;
-  cursor: pointer;
+  border-radius: var(--radius);
+  background: var(--brand);
+  color: var(--on-brand);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  box-shadow: var(--shadow-brand);
 }
 
 .pt-join:hover {
-  background: #1b2430;
+  background: var(--brand-hover);
+}
+
+.pt-join:active {
+  background: var(--brand-active);
 }
 
 .pt-continue {
   width: 100%;
-  height: 40px;
-  margin-top: 14px;
-  border: 1px solid var(--line-2, #ccd4de);
-  border-radius: var(--radius-sm, 6px);
-  background: transparent;
-  font-size: 12.5px;
-  color: var(--ink-2, #2c3644);
-  cursor: pointer;
+  height: 42px;
+  margin-top: var(--sp-4);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: var(--text-sm);
+  color: var(--ink-2);
 }
 
 .pt-continue:hover {
-  border-color: var(--ink-2, #2c3644);
-  color: var(--ink, #0b1017);
+  border-color: var(--brand-300);
+  background: var(--brand-25);
+  color: var(--brand-ink);
 }
 
-/* 今日不再弹出：放在最底下，字号压小，不抢二维码的视线 */
+/* 今日不再弹出：放最底下，字号压小，不抢二维码的视线 */
 .pt-mute {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  margin-top: 14px;
-  font-size: 11.5px;
-  color: var(--faint, #96a1ad);
+  margin-top: var(--sp-4);
+  font-size: var(--text-xs);
+  color: var(--muted);
   cursor: pointer;
   user-select: none;
 }
 
 .pt-mute input {
-  width: 13px;
-  height: 13px;
+  width: 14px;
+  height: 14px;
   margin: 0;
-  accent-color: var(--accent, #00a99d);
+  accent-color: var(--brand);
   cursor: pointer;
 }
 
 .pt-mute:hover {
-  color: var(--muted, #69747f);
+  color: var(--muted);
 }
 
+/* ---------- 手机 560 ---------- */
 @media (max-width: 560px) {
   .pt-veil {
     align-items: end;
@@ -451,15 +446,15 @@ function switchTab(i) {
   .pt-panel {
     width: 100%;
     max-height: 90dvh;
-    padding: 22px 20px calc(18px + env(safe-area-inset-bottom));
+    padding: var(--sp-5) var(--sp-5) calc(var(--sp-4) + env(safe-area-inset-bottom));
     border: none;
-    border-top: 1px solid var(--line, #e4e8ee);
-    border-radius: 14px 14px 0 0;
+    border-top: 1px solid var(--line);
+    border-radius: var(--radius-xl) var(--radius-xl) 0 0;
   }
 
   .pt-join,
   .pt-continue {
-    height: 44px;
+    height: 46px;
   }
 }
 </style>

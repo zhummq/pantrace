@@ -12,8 +12,10 @@ const props = defineProps({
 
 const emit = defineEmits(['feedback', 'open'])
 
+// 平台品牌色：这是数据，不是主题色——每个网盘有固定的识别色，
+// 不参与 tokens 体系（改主题不该让夸克变成别的颜色）。
 // 与后端 PLATFORMS 列表保持一致（main.py）。多一个少一个 key 都会让
-// 对应平台的色条/徽章掉进默认灰色。
+// 对应平台的色条/徽章掉进默认灰。
 const PLATFORM_COLORS = {
   quark: '#2B6CF6',
   baidu: '#3A6BF5',
@@ -31,7 +33,15 @@ const PLATFORM_COLORS = {
   ctfile: '#8C6D31',
 }
 
-const color = computed(() => PLATFORM_COLORS[props.item.platform] || '#96a1ad')
+const color = computed(() => PLATFORM_COLORS[props.item.platform] || 'var(--slate-400)')
+
+// 徽章底色/描边由平台色推导，用 color-mix 而不是拼十六进制——
+// 拼字符串遇到 var(--slate-400) 这种值会直接拼出非法色号。
+const badgeStyle = computed(() => ({
+  color: color.value,
+  background: `color-mix(in srgb, ${color.value} 8%, var(--surface))`,
+  borderColor: `color-mix(in srgb, ${color.value} 24%, var(--surface))`,
+}))
 
 // 站内跳转地址（/go/xxx）与外部链接都放行；伪协议一律挡掉。
 // 上游结果现在给的都是 /go/ 签名地址——真实链接不再下发到浏览器。
@@ -165,7 +175,7 @@ async function onCopyPwd() {
 
       <div class="main">
         <div class="head">
-          <span class="badge" :style="{ color, borderColor: color + '40' }">
+          <span class="badge" :style="badgeStyle">
             {{ item.platformName || '未知平台' }}
           </span>
           <a
@@ -223,8 +233,9 @@ async function onCopyPwd() {
             <i class="dot"></i>
             <span class="pwd">提取码 <b>{{ item.sharePwd }}</b></span>
           </template>
-          <!-- 纠错入口挂在卡片内部：用户判断"这条有问题"的时机只在这一屏，
-               放到页脚或者独立页面就等于没有 -->
+          <!-- 纠错入口挂在卡片内部：用户判断"这条有问题"的时机只在这一屏。
+               位置固定在元信息行末尾（不用 margin-left:auto 顶到右边），
+               否则它会随徽标多少左右漂，看起来像排版错位。 -->
           <button class="flag" @click="emit('feedback', item)">这条有问题</button>
         </div>
       </div>
@@ -266,86 +277,31 @@ async function onCopyPwd() {
   display: flex;
   align-items: center;
   gap: 18px;
-  padding: 15px 16px 15px 20px;
+  padding: 16px 18px 16px 22px;
   background: var(--surface);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  transition: border-color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
+  box-shadow: var(--shadow-xs);
+  transition:
+    border-color var(--dur-2) var(--ease),
+    box-shadow var(--dur-2) var(--ease),
+    transform var(--dur-2) var(--ease);
 }
 
 .card:hover {
   border-color: var(--line-2);
   box-shadow: var(--shadow-md);
-  transform: translateY(-1px);
+  transform: translateY(-2px);
 }
 
-/* 存活检测徽标：失效=红，需提取码=琥珀。只在异常时出现 */
-.state-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  padding: 1px 7px;
-  border-radius: 999px;
-  font-size: 11px;
-  line-height: 1.6;
-  font-weight: 600;
-  cursor: help;
-  user-select: none;
-}
-
-.state-chip svg {
-  flex-shrink: 0;
-  opacity: 0.9;
-}
-
-/* 绿比红要淡：失效得跳出来，正常只是"验过"，不该抢视觉焦点 */
-.state-chip.ok {
-  color: #12805a;
-  background: rgba(18, 128, 90, 0.08);
-}
-
-.state-chip.bad {
-  color: var(--danger);
-  background: rgba(200, 60, 50, 0.08);
-}
-
-.state-chip.locked {
-  color: var(--warn);
-  background: rgba(201, 106, 9, 0.08);
-}
-
-/* 时效徽标：弱化的暖色药丸，悬停出全文提示 */
-.ttl-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 1.5px 8px;
-  border-radius: 999px;
-  background: rgba(201, 106, 9, 0.07);
-  font-size: 11px;
-  line-height: 1.6;
-  color: var(--warn);
-  cursor: help;
-  user-select: none;
-}
-
-.ttl-chip svg {
-  flex-shrink: 0;
-  opacity: 0.85;
-}
-
-.ttl-chip b {
-  font-weight: 600;
-}
-
-/* 平台色只留一条 2px 标记，不做整块染色 */
+/* 平台色只留一条 3px 标记，不做整块染色 */
 .bar {
   position: absolute;
   left: 0;
-  top: 12px;
-  bottom: 12px;
-  width: 2px;
-  border-radius: 0 2px 2px 0;
+  top: 14px;
+  bottom: 14px;
+  width: 3px;
+  border-radius: 0 3px 3px 0;
 }
 
 .main {
@@ -362,15 +318,13 @@ async function onCopyPwd() {
 
 .badge {
   flex-shrink: 0;
-  padding: 1px 6px;
+  padding: 1px 7px;
   border: 1px solid transparent;
-  border-radius: 4px;
+  border-radius: var(--radius-xs);
   background: transparent;
-  font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: var(--text-2xs);
   font-weight: 600;
   letter-spacing: 0.02em;
-  transform: translateY(-1px);
 }
 
 .title {
@@ -378,25 +332,26 @@ async function onCopyPwd() {
   overflow: hidden;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
-  font-size: 15px;
-  font-weight: 550;
-  line-height: 1.55;
+  font-size: 15.5px;
+  font-weight: 600;
+  line-height: 1.5;
   letter-spacing: -0.005em;
   color: var(--ink);
   word-break: break-word;
+  transition: color var(--dur-1) var(--ease);
 }
 
 a.title:hover {
-  color: var(--accent-deep);
+  color: var(--brand-ink);
 }
 
 .meta {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
   flex-wrap: wrap;
   margin-top: 6px;
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--muted);
 }
 
@@ -409,35 +364,93 @@ a.title:hover {
 
 .pwd b {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   font-weight: 600;
   letter-spacing: 0.06em;
   color: var(--ink-2);
 }
 
+/* 存活检测徽标 */
+.state-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  font-weight: 600;
+  cursor: help;
+  user-select: none;
+}
+
+.state-chip svg {
+  flex-shrink: 0;
+  opacity: 0.9;
+}
+
+/* 正常比异常淡：失效得跳出来，正常只是"验过" */
+.state-chip.ok {
+  color: var(--success-ink);
+  background: var(--success-soft);
+}
+
+.state-chip.bad {
+  color: var(--danger-ink);
+  background: var(--danger-soft);
+}
+
+.state-chip.locked {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+/* 时效徽标：建议性提示，不抢主操作 */
+.ttl-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1.5px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--warn-soft);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  color: var(--warn);
+  cursor: help;
+  user-select: none;
+}
+
+.ttl-chip svg {
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+.ttl-chip b {
+  font-weight: 600;
+}
+
 .flag {
-  margin-left: auto;
+  margin-left: 4px;
   padding: 0;
   border: none;
   background: none;
-  font-size: 11.5px;
+  font-size: var(--text-xs);
   color: var(--faint);
   text-decoration: underline;
   text-decoration-color: var(--line-2);
   text-underline-offset: 3px;
-  transition: color 0.15s ease;
 }
 
 .flag:hover {
   color: var(--danger);
-  text-decoration-color: #e6bdb8;
+  text-decoration-color: var(--danger-line);
 }
 
 .actions {
   display: flex;
   flex-shrink: 0;
   align-items: center;
-  gap: 8px;
+  gap: var(--sp-2);
 }
 
 .btn {
@@ -445,80 +458,84 @@ a.title:hover {
   align-items: center;
   justify-content: center;
   gap: 5px;
-  height: 32px;
-  padding: 0 13px;
+  height: 34px;
+  padding: 0 14px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
-  font-size: 12.5px;
+  font-size: var(--text-sm);
   font-weight: 500;
   white-space: nowrap;
-  transition: background 0.16s ease, border-color 0.16s ease, color 0.16s ease;
 }
 
 .btn.ghost {
   background: var(--surface);
   border-color: var(--line-2);
   color: var(--ink-2);
+  box-shadow: var(--shadow-xs);
 }
 
 .btn.ghost:hover {
-  border-color: var(--ink-2);
-  color: var(--ink);
+  border-color: var(--brand-300);
+  background: var(--brand-25);
+  color: var(--brand-ink);
 }
 
 .btn.ghost.done {
-  background: var(--accent-soft);
-  border-color: rgba(0, 169, 157, 0.35);
-  color: var(--accent-deep);
+  background: var(--success-soft);
+  border-color: var(--success);
+  color: var(--success-ink);
 }
 
 .btn.solid {
-  background: var(--ink);
-  color: #fff;
+  background: var(--brand);
+  color: var(--on-brand);
+  box-shadow: var(--shadow-brand);
 }
 
 .btn.solid:hover {
-  background: #1b2430;
+  background: var(--brand-hover);
 }
 
-@media (max-width: 760px) {
+.btn.solid:active {
+  background: var(--brand-active);
+}
+
+/* ---------- 平板 860 ---------- */
+@media (max-width: 860px) {
   .card {
     flex-direction: column;
     align-items: stretch;
-    gap: 12px;
+    gap: var(--sp-3);
     padding: 14px 14px 14px 18px;
   }
 
+  /* 触屏没有 hover，浮起效果没意义，还会糊掉滚动 */
   .card:hover {
     transform: none;
-    box-shadow: none;
+    box-shadow: var(--shadow-xs);
   }
 
   .title {
-    font-size: 14.5px;
+    font-size: 15px;
   }
 
   .meta {
-    font-size: 11.5px;
+    font-size: var(--text-xs);
   }
 
   .ttl-chip {
-    font-size: 10.5px;
+    font-size: var(--text-2xs);
   }
 
   .flag {
     text-decoration: none;
   }
 
-  /* 触控目标 40px，两个按钮等分；只有一个时自动占满整行 */
-  .actions {
-    gap: 8px;
-  }
-
+  /* 触控目标 42px，两个按钮等分；只有一个时自动占满整行 */
   .actions .btn {
     flex: 1;
-    height: 40px;
-    font-size: 13px;
+    height: 42px;
+    font-size: var(--text-base);
   }
 }
 </style>

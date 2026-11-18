@@ -105,7 +105,7 @@ function title(it) {
       <FeedbackDetail :item="selected" @done="emit('done', $event)" />
     </div>
 
-    <div class="grid-half">
+    <div class="grid-main">
       <section class="card">
         <header class="card-head">
           <div class="card-title">用户在要什么<span class="card-tag">该补什么源</span></div>

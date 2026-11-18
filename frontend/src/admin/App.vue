@@ -321,8 +321,8 @@ onUnmounted(() => {
       <div class="rail-brand">
         <div class="rail-logo">
           <svg viewBox="0 0 24 24" fill="none">
-            <path d="M6 15.5 12 7l6 8.5" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
-            <circle cx="12" cy="16.6" r="1.5" fill="#fff" />
+            <path d="M6 15.5 12 7l6 8.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+            <circle cx="12" cy="16.6" r="1.5" fill="currentColor" />
           </svg>
         </div>
         <div>
@@ -374,7 +374,7 @@ onUnmounted(() => {
             >{{ r.label }}</button>
           </div>
           <button class="ghost" @click="loadAll">刷新</button>
-          <button class="ghost plain" @click="logout">改口令</button>
+          <button class="ghost" @click="logout">改口令</button>
         </div>
       </header>
 

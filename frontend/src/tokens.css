@@ -1,0 +1,163 @@
+/* ==========================================================================
+   盘迹 PanTrace — Design Tokens（唯一色板来源）
+   --------------------------------------------------------------------------
+   主站（index.html）与管理端（admin.html）共用这一份变量，任何页面都不许
+   再自己定义一套同名 token。改颜色只改这里。
+
+   规则：
+   1. 只有这一层允许出现十六进制色值，页面样式一律引用变量。
+   2. 颜色按「语义」取名（surface / ink / line / brand），不按外观取名。
+   3. 品牌色是科技蓝，青色只做信号（状态点、检测通过），不做大面积填充。
+   ========================================================================== */
+
+:root {
+  /* ---------- 品牌蓝阶 ---------- */
+  --brand-25: #f7faff;
+  --brand-50: #eef4ff;
+  --brand-100: #dbe7ff;
+  --brand-200: #c2d6ff;
+  --brand-300: #96b6fd;
+  --brand-400: #6b93fb;
+  --brand-500: #3b74f0;
+  --brand-600: #2563eb;
+  --brand-700: #1d4ed8;
+  --brand-800: #1e40af;
+
+  /* ---------- 青：只做信号，不做填充 ---------- */
+  --cyan-400: #22c1dc;
+  --cyan-500: #06a5c0;
+  --cyan-600: #0e8ea6;
+
+  /* ---------- 中性（冷灰，和蓝同色温） ---------- */
+  --slate-25: #fbfcfe;
+  --slate-50: #f5f7fb;
+  --slate-100: #eef2f8;
+  --slate-200: #e2e8f2;
+  --slate-300: #cfd8e6;
+  --slate-400: #9aa7bb;
+  --slate-500: #6b7a90;
+  --slate-600: #4e5c72;
+  --slate-700: #36445a;
+  --slate-800: #1f2b3d;
+  --slate-900: #101a2b;
+
+  /* ---------- 语义：表面 ---------- */
+  --bg: var(--slate-50);
+  --surface: #ffffff;
+  --surface-2: var(--slate-25);
+  --surface-3: var(--slate-100);
+  --surface-hover: var(--slate-50);
+  --veil: rgba(16, 26, 43, 0.42);
+  /* 吸顶栏的玻璃底：半透明白 + 模糊，滚动时透出内容 */
+  --surface-glass: rgba(255, 255, 255, 0.86);
+  /* 首屏顶部光晕：唯一的装饰性渐变，极低透明度 */
+  --hero-glow: rgba(37, 99, 235, 0.1);
+
+  /* ---------- 语义：文字 ---------- */
+  --ink: var(--slate-900);
+  --ink-2: var(--slate-700);
+  --muted: var(--slate-500);
+  --faint: var(--slate-400);
+
+  /* ---------- 语义：描边 ---------- */
+  --line: var(--slate-200);
+  --line-2: var(--slate-300);
+  --line-strong: var(--slate-300);
+
+  /* ---------- 语义：品牌 ---------- */
+  --brand: var(--brand-600);
+  --brand-hover: var(--brand-700);
+  --brand-active: var(--brand-800);
+  /* 品牌底上的前景色：只此一处，避免全站散落 color: #fff */
+  --on-brand: #ffffff;
+  --brand-soft: var(--brand-50);
+  --brand-soft-2: var(--brand-100);
+  --brand-ink: var(--brand-700);
+  --brand-ring: rgba(37, 99, 235, 0.18);
+  /* 青只做信号：状态点的呼吸光圈 */
+  --cyan-ring: rgba(6, 165, 192, 0.14);
+
+  /* ---------- 语义：状态 ---------- */
+  --success: #0f9d76;
+  --success-ink: #0a7c5e;
+  --success-soft: #e6f7f1;
+  --warn: #b45309;
+  --warn-soft: #fef4e6;
+  --danger: #dc2626;
+  --danger-ink: #b42318;
+  --danger-soft: #fdecea;
+  --danger-line: #f4cfca;
+
+  /* ---------- 圆角 ---------- */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-pill: 999px;
+
+  /* ---------- 阴影（蓝调、低透明度，不做大黑边） ---------- */
+  --shadow-xs: 0 1px 2px rgba(16, 26, 43, 0.04);
+  --shadow-sm: 0 1px 2px rgba(16, 26, 43, 0.05), 0 1px 3px rgba(16, 26, 43, 0.04);
+  --shadow: var(--shadow-sm);
+  --shadow-md: 0 8px 20px -8px rgba(16, 26, 43, 0.14), 0 2px 6px -2px rgba(16, 26, 43, 0.06);
+  --shadow-lg: 0 28px 56px -24px rgba(16, 26, 43, 0.24), 0 8px 20px -12px rgba(16, 26, 43, 0.1);
+  --shadow-brand: 0 6px 18px -8px rgba(37, 99, 235, 0.5);
+  --ring: 0 0 0 3px var(--brand-ring);
+
+  /* ---------- 字体与字号层级 ---------- */
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --mono: ui-monospace, 'SFMono-Regular', 'JetBrains Mono', 'Cascadia Mono',
+    'Roboto Mono', Consolas, 'Liberation Mono', monospace;
+
+  --text-2xs: 10.5px;
+  --text-xs: 11.5px;
+  --text-sm: 12.5px;
+  --text-base: 13.5px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 20px;
+  --text-2xl: 26px;
+  --text-3xl: 34px;
+  --text-4xl: 44px;
+
+  /* ---------- 间距（4 的倍数，成体系） ---------- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-7: 32px;
+  --sp-8: 40px;
+  --sp-9: 56px;
+
+  /* ---------- 动效 ---------- */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-1: 120ms;
+  --dur-2: 180ms;
+  --dur-3: 260ms;
+
+  /* ---------- 布局 ---------- */
+  --shell-max: 1040px;
+  --nav-h: 64px;
+
+  /* ==========================================================================
+     兼容别名：老代码里在用的变量名
+     只在这里映射到新语义，页面里不要再新增对别名的依赖。
+     ========================================================================== */
+  --accent: var(--brand);
+  --accent-deep: var(--brand-ink);
+  --accent-soft: var(--brand-soft);
+  --blue: var(--brand);
+  --red: var(--danger);
+  /* admin 里的 --shadow 已在上面映射为 --shadow-sm */
+}
+
+/* 统一断点（媒体查询不支持变量，作为约定写在这里）：
+   1180 —— 宽屏双栏收成单栏
+    860 —— 平板：卡片竖排、侧栏转顶部导航
+    560 —— 手机：单列、弹层转底部抽屉
+   新增断点前先想清楚为什么这三档不够。 */

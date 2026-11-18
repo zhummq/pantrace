@@ -79,7 +79,7 @@ function ttlText(r) {
 
 <style scoped>
 .ck-pan {
-  font-size: 11px;
+  font-size: var(--text-xs);
   padding: 1px 7px;
   border-radius: 5px;
   background: var(--brand-soft);
@@ -88,16 +88,16 @@ function ttlText(r) {
 }
 
 .clk {
-  padding: 9px 0;
-  border-bottom: 1px solid #f2f5f8;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
 }
 .clk.more { border-bottom: 0; }
 .clk:last-child { border-bottom: 0; }
 
 .clk-line {
-  margin-top: 3px;
-  font-size: 11.5px;
-  color: var(--muted);
+  margin-top: 4px;
+  font-size: var(--text-sm);
+  color: var(--ink-2);
   display: flex;
   align-items: baseline;
   gap: 6px;
@@ -105,24 +105,24 @@ function ttlText(r) {
 }
 
 .ck-lbl {
-  min-width: 42px;
-  color: var(--faint);
+  min-width: 48px;
+  color: var(--muted);
   flex-shrink: 0;
 }
 
-.ck-none { color: var(--faint); }
+.ck-none { color: var(--muted); }
 
 .ck-ttl {
-  font-size: 10.5px;
+  font-size: var(--text-xs);
   padding: 0 6px;
   border-radius: 999px;
-  background: #eef2f6;
+  background: var(--surface-3);
   color: var(--muted);
   white-space: nowrap;
 }
 
 .ck-ttl.bad {
-  background: #fdecea;
+  background: var(--danger-soft);
   color: var(--red);
 }
 </style>

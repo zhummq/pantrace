@@ -140,7 +140,7 @@ async function copyAll() {
 
 .zk-row {
   padding: 7px 0;
-  border-bottom: 1px solid #f2f5f8;
+  border-bottom: 1px solid var(--line);
   font-size: 12.5px;
 }
 
@@ -160,7 +160,7 @@ async function copyAll() {
 
 .zk-bar {
   height: 6px;
-  background: #f0f4f8;
+  background: var(--surface-3);
   border-radius: 3px;
   overflow: hidden;
 }
@@ -168,7 +168,7 @@ async function copyAll() {
   display: block;
   height: 100%;
   border-radius: 3px;
-  background: #e08a3c;
+  background: var(--warn);
 }
 
 .zk-n {
@@ -206,7 +206,7 @@ async function copyAll() {
 
 .zk-note { color: var(--faint); font-size: 11.5px; }
 
-@media (max-width: 720px) {
+@media (max-width: 560px) {
   .zk-head, .zk-row { grid-template-columns: minmax(0, 1fr) 56px 56px 62px; }
   .zk-plat { display: none; }
 }

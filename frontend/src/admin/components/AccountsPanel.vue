@@ -442,8 +442,9 @@ defineExpose({ reload, openAdd })
         </div>
       </div>
 
-      <div v-if="items.length" class="quick-bar" style="margin-top: 12px">
-        <button class="grp-btn grp-add" @click="openAdd">添加账号</button>
+      <!-- 添加入口只留下面那个折叠表单的标题，不再重复放一个同名按钮：
+           两个「添加账号」上下相隔 60px，看起来像渲染错了 -->
+      <div v-if="message" class="quick-bar" style="margin-top: 12px">
         <span class="quick-status" :class="{ bad: messageErr }">{{ message }}</span>
       </div>
 
