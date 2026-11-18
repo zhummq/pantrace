@@ -129,8 +129,15 @@ sudo systemctl restart pantrace
 curl -s localhost:8000/api/health | python3 -m json.tool | grep -A6 tgGate
 
 # b. 零成本验一轮：src=tg 只跑 TG，不碰 haisou，一分额度都不花
+# 中文关键词必须让 curl 自己编码（-G --data-urlencode）：请求行里放原始 UTF-8 字节
+# 会被 uvicorn/h11 直接拒掉，只回一句 "Invalid HTTP request received."
 T=$(curl -s localhost:8000/api/ticket | python3 -c 'import sys,json;print(json.load(sys.stdin)["ticket"])')
-curl -s -H "x-ticket: $T" 'localhost:8000/api/search?q=电影&src=tg&platforms=quark&page_size=3' | head -c 600
+curl -sG -H "x-ticket: $T" \
+  --data-urlencode 'q=电影' \
+  --data-urlencode 'src=tg' \
+  --data-urlencode 'platforms=quark' \
+  --data-urlencode 'page_size=3' \
+  localhost:8000/api/search | head -c 600
 ```
 
 `tier` 字段的含义：`tg` = 这一轮没花钱；`plugin` = TG 没给到能用的结果，兜底花了一份额度。如果 b 步返回空且 `tgGate.reachable=true`，是频道里真没这个词，不是通道坏了——换个更泛的词再试。
