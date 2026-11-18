@@ -18,11 +18,9 @@ const lastKeyword = ref('')
 const activePlatform = ref('')
 const platforms = ref([])
 
-// ---- 结果池 ----
-// 一次网络请求拿到的结果存这里，平台筛选只在池内过滤，绝不再打上游。
-// 改之前 pickPlatform 直接 doSearch：用户"只想看夸克"要先付一次全平台查询，
-// 再付一次夸克查询，点五个平台就是五次全价。platforms 留空 = 上游全平台聚合。
-const pool = ref({ items: [], platforms: '', total: 0, totalPages: 0, tookMs: 0 })
+// ---- 平台偏好 ----
+// 只记"用户主动选了哪个平台"，下次进站默认就查它。
+// 没选过（或点回"全部平台"）就是空 = 全平台，新用户完全不受影响。
 const PREF_KEY = 'pt_pref_platform'
 
 const items = ref([])
@@ -246,9 +244,7 @@ async function refreshCheckStates(seq, args) {
     if (!next.length) return
     // 整页替换而不是逐条合并：/go/ 签名里带时间戳，两次请求的链接串不同，
     // 按链接匹配根本对不上；同一次查询的排序是稳定的，替换不会打乱顺序。
-    pool.value = { ...pool.value, items: next }
-    // 补拉回来的可能是全平台结果，用户此刻若停在某个平台上，得重新过滤一遍
-    renderView()
+    items.value = next
   } catch {
     /* 补拉失败不影响主流程，用户手动刷新同样能拿到结论 */
   }
@@ -260,9 +256,6 @@ async function doSearch(targetPage = 1) {
   if (loading.value) return
 
   const seq = ++searchSeq
-  // 发请求这一刻把平台定死。等待期间用户可能改选 chip，
-  // 返回时再读 activePlatform 会把结果记到错的平台名下——池的归属就假了。
-  const reqPlatform = activePlatform.value
   clearCheckRefresh()
   loading.value = true
   error.value = ''
@@ -279,24 +272,14 @@ async function doSearch(targetPage = 1) {
   try {
     const data = await searchResources({
       q,
-      platforms: reqPlatform,
+      platforms: activePlatform.value,
       page: targetPage,
       pageSize: PAGE_SIZE,
     })
-    const next = data.items || []
-    pool.value = {
-      items: next,
-      platforms: reqPlatform,
-      total: data.pagination?.total || 0,
-      totalPages: data.pagination?.totalPages || 0,
-      tookMs: data.tookMs || 0,
-    }
-    items.value = next
-    total.value = pool.value.total
-    totalPages.value = pool.value.totalPages
-    tookMs.value = pool.value.tookMs
-    // 等待期间用户切到别的平台了：立刻按新的选择重算，别把全平台结果摊给他看
-    if (activePlatform.value !== reqPlatform) renderView()
+    items.value = data.items || []
+    total.value = data.pagination?.total || 0
+    totalPages.value = data.pagination?.totalPages || 0
+    tookMs.value = data.tookMs || 0
     syncUrl()
     if (targetPage > 1) window.scrollTo({ top: 0, behavior: 'smooth' })
     // 探活跑在响应之后（后端 BackgroundTasks），这一屏注定还没有角标。
@@ -304,7 +287,7 @@ async function doSearch(targetPage = 1) {
     if (targetPage === 1) {
       scheduleCheckRefresh(seq, {
         q,
-        platforms: reqPlatform,
+        platforms: activePlatform.value,
         page: targetPage,
         pageSize: PAGE_SIZE,
       })
@@ -357,21 +340,8 @@ function writePrefPlatform(key) {
   }
 }
 
-// 按当前选中的平台，从池里重算视图。0 请求、0 延迟。
-function renderView() {
-  const key = activePlatform.value
-  const p = pool.value
-  items.value = key && key !== p.platforms ? p.items.filter((it) => it.platform === key) : p.items
-  total.value = p.total
-  totalPages.value = p.totalPages
-  tookMs.value = p.tookMs
-}
-
-// 用户停在一个"池里没单独查过"的平台上：先给本地结果，不够再让他自己决定要不要深搜
-const localOnly = computed(
-  () => !!activePlatform.value && searched.value && activePlatform.value !== pool.value.platforms
-)
-
+// 按当前选中的平台重新查一次上游：单平台查询拿到的是这个平台自己的完整排序，
+// 比"从混排的 20 条里挑出属于它的几条"准得多，这是用户点 chip 期待的东西。
 const activeName = computed(() => {
   const p = platforms.value.find((x) => x.key === activePlatform.value)
   return p ? shortPlatform(p.name) : ''
@@ -379,6 +349,9 @@ const activeName = computed(() => {
 
 function pickPlatform(key) {
   if (activePlatform.value === key) return
+  // 正在查询时不给切：否则要么结果和选中的 chip 对不上，
+  // 要么并发两个请求互相覆盖。一次查询只有一两秒，等它落地再切。
+  if (loading.value) return
   activePlatform.value = key
   writePrefPlatform(key)
   // 筛选行为本身值得记：哪个平台被偏爱、筛选后还有没有人继续搜
@@ -386,28 +359,13 @@ function pickPlatform(key) {
     query: lastKeyword.value || keyword.value.trim(),
     platform: key,
   })
-  // 关键：这里不再 doSearch。筛选是看池子里已经有的东西，不是重新去上游要一遍。
-  if (!searched.value) return
-  renderView()
-  syncUrl()
+  // 跟以前一样：点平台就是一次真实查询，不是在同一批结果里挑。
+  if (searched.value) doSearch(1)
 }
 
-function deepSearch() {
-  if (!localOnly.value || loading.value) return
-  track('filter', {
-    query: lastKeyword.value,
-    platform: activePlatform.value,
-    meta: { deep: true },
-  })
-  doSearch(1)
-}
-
-// 空结果时点"搜索全部平台"：池本来就是单平台的，就必须真去查一次全平台，
-// 否则只是把视图切回一个空池，用户点了像没反应。
+// 空结果时点"搜索全部平台"：换平台本身就会重新查，不需要再补一次
 function searchAllPlatforms() {
-  const needQuery = pool.value.platforms !== ''
   pickPlatform('')
-  if (needQuery) doSearch(1)
 }
 
 function goPage(p) {
@@ -660,21 +618,6 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- 池里没有这个平台的东西：不是"搜不到"，是"这一页没排到它"。
-           这两件事在用户眼里差别巨大，说清楚，再让他决定要不要花一次查询。 -->
-      <div v-else-if="localOnly && !items.length" class="state">
-        <div class="state-icon empty">∅</div>
-        <p class="state-title">这一页没有{{ activeName }}的结果</p>
-        <p class="state-desc">
-          「{{ lastKeyword }}」的结果由所有平台混排，一页只有 {{ PAGE_SIZE }} 个位置，
-          {{ activeName }}这次没排进来——不等于它没有。单独查一次，能拿到它自己的完整排序。
-        </p>
-        <div class="state-actions">
-          <button class="retry" @click="deepSearch">单独查{{ activeName }}</button>
-          <button class="link" @click="pickPlatform('')">先看全部平台</button>
-        </div>
-      </div>
-
       <div v-else-if="showEmpty" class="state">
         <div class="state-icon empty">∅</div>
         <p class="state-title">没有找到「{{ lastKeyword }}」</p>
@@ -689,18 +632,11 @@ onBeforeUnmount(() => {
       <template v-else-if="items.length">
         <div class="result-head mono">
           <span class="rh-label">RESULT</span>
-          <template v-if="localOnly">
-            <span class="rh-num">{{ items.length }}</span>
-            <span class="rh-sep">/</span>
-            <span>本页内筛选 · {{ activeName }}</span>
-          </template>
-          <template v-else>
-            <span class="rh-num">{{ totalText }}</span>
-            <span class="rh-sep">/</span>
-            <span>{{ tookMs }}ms</span>
-            <span class="rh-sep">/</span>
-            <span>第 {{ page }} 页 · 共 {{ totalPages }} 页</span>
-          </template>
+          <span class="rh-num">{{ totalText }}</span>
+          <span class="rh-sep">/</span>
+          <span>{{ tookMs }}ms</span>
+          <span class="rh-sep">/</span>
+          <span>第 {{ page }} 页 · 共 {{ totalPages }} 页</span>
         </div>
 
         <!-- 时效说明整页只出现一次：贴着结果头，信息完整但不刷屏；
@@ -725,19 +661,7 @@ onBeforeUnmount(() => {
           />
         </div>
 
-        <!-- 本地筛选只覆盖这一页拿到的条目，说清楚，再给一个显式的深搜入口。
-             这里必须由用户点：一次深搜 = 一次上游查询，不能替他自动发。 -->
-        <div v-if="localOnly" class="deep-cta">
-          <p>
-            这一页 {{ pool.items.length }} 条里，有 <b>{{ items.length }}</b> 条来自{{ activeName }}。
-            想让它单独出一份完整结果，就再查一次。
-          </p>
-          <button type="button" class="deep-btn" :disabled="loading" @click="deepSearch">
-            单独查{{ activeName }}
-          </button>
-        </div>
-
-        <div v-if="totalPages > 1 && !localOnly" class="pager">
+        <div v-if="totalPages > 1" class="pager">
           <button class="pg" :disabled="page <= 1" @click="goPage(page - 1)">上一页</button>
           <button
             v-for="p in pageWindow"
@@ -1244,66 +1168,6 @@ onBeforeUnmount(() => {
 .pref-note b {
   color: var(--ink);
   font-weight: 600;
-}
-
-/* 本地筛选的出口：明说只有这么多，再把"要不要花一次查询"交给用户 */
-.deep-cta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  margin-top: 14px;
-  padding: 12px 14px;
-  border: 1px dashed var(--line-2);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-}
-
-.deep-cta p {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
-  color: var(--muted);
-}
-
-.deep-cta b {
-  color: var(--ink);
-  font-weight: 600;
-}
-
-.deep-btn {
-  flex-shrink: 0;
-  height: 30px;
-  padding: 0 12px;
-  border: 1px solid var(--line-2);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--ink);
-  font-size: 12px;
-  white-space: nowrap;
-  transition: border-color 0.16s ease, background 0.16s ease;
-}
-
-.deep-btn:hover:not(:disabled) {
-  border-color: var(--ink);
-}
-
-.deep-btn:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-/* 手机端上下排，按钮占满，别和文字挤在一行 */
-@media (max-width: 640px) {
-  .deep-cta {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 10px;
-  }
-
-  .deep-btn {
-    width: 100%;
-  }
 }
 
 /* 手机端才显示简称，桌面端沿用全名 */
