@@ -30,12 +30,12 @@ const needPlatform = ref(false)
 const PREF_KEY = 'pt_pref_platform'
 
 // ---- 数据来源 ----
-// 只给用户两个明确选项：仅 TG（零额度）/ 仅海搜（计费接口）。
+// 对用户只讲体验差别，不暴露通道名和额度成本：实时（TG 公开频道）/ 全网（海搜接口）。
 // 不再有"TG 优先自动降级"这档——没搜到就是没搜到，用户自己决定换源，
-// 不让后台偷偷换通道。默认仅 TG。
+// 不让后台偷偷换通道。默认实时。
 const SOURCE_OPTIONS = [
-  { key: 'tg', label: '仅 TG', hint: '只查 TG 公开频道，不消耗搜索额度；没有就是没有' },
-  { key: 'plugin', label: '仅海搜', hint: '只查海搜接口，覆盖更全，会消耗搜索额度' },
+  { key: 'tg', label: '实时', hint: '搜最近分享，更新快；没找到可以换全网' },
+  { key: 'plugin', label: '全网', hint: '覆盖更全，冷门资源也容易命中' },
 ]
 const DEFAULT_SOURCE = 'tg'
 const SOURCE_PREF_KEY = 'pt_pref_source'
@@ -264,7 +264,7 @@ function syncUrl() {
   if (keyword.value.trim()) params.set('q', keyword.value.trim())
   if (activePlatform.value) params.set('platform', activePlatform.value)
   // 只有非默认档才写进 URL：分享链接要能还原对方选的来源，
-  // 默认档（仅 TG）留空既缩短链接，接收方也能用自己的偏好。
+  // 默认档（实时）留空既缩短链接，接收方也能用自己的偏好。
   if (activeSource.value !== DEFAULT_SOURCE) params.set('src', activeSource.value)
   if (page.value > 1) params.set('page', String(page.value))
   const qs = params.toString()
@@ -453,7 +453,7 @@ function writePrefPlatform(key) {
   }
 }
 
-// 来源偏好：和平台一样只记用户主动选过的档。没选过 = 默认（仅 TG）。
+// 来源偏好：和平台一样只记用户主动选过的档。没选过 = 默认（实时）。
 // 老用户 localStorage 里可能还留着已废弃的 auto/plugin 之外的旧值，
 // 过一遍白名单；auto 已被移除，读到它一律回退到默认档。
 function readPrefSource() {
@@ -474,7 +474,7 @@ function writePrefSource(key) {
 }
 
 // 切换来源 = 一次真实查询。和切平台同理：不重查的话结果面板还是上一条通道的
-// 数据，用户点了"仅 TG"却看到海搜的结果，等于这个开关是假的。
+// 数据，用户点了"实时"却看到全网的结果，等于这个开关是假的。
 function pickSource(key) {
   if (!validSourceKeys.has(key) || key === activeSource.value || busy.value) return
   activeSource.value = key
@@ -714,7 +714,7 @@ onBeforeUnmount(() => {
              不用先去搜一次才知道能筛什么。**必须选一个**——没选就不发搜索请求，
              因为每个网盘都是一次独立计费上游查询。 -->
         <div class="filter-rows" :class="{ 'need-pick': needPlatform }" role="group" aria-label="选择搜索来源与网盘">
-          <!-- 来源切换：从哪查。两档明确可选——仅 TG / 仅海搜，默认仅 TG；
+          <!-- 来源切换：从哪查。两档明确可选——实时 / 全网，默认实时；
                没有"自动降级"这种偷偷换源。和网盘一样，点一下就是一次真实查询。 -->
           <div class="frow source-row">
             <span class="frow-label">来源</span>
@@ -810,7 +810,7 @@ onBeforeUnmount(() => {
               class="refresh-btn"
               type="button"
               :disabled="busy"
-              title="跳过 5 分钟缓存重新查一次（会消耗搜索额度）"
+              title="跳过 5 分钟缓存，重新查一次"
               @click="forceRefresh"
             >
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
