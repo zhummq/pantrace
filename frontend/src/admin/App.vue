@@ -8,6 +8,7 @@ import FeedbackPanel from './components/FeedbackPanel.vue'
 import AccountsPanel from './components/AccountsPanel.vue'
 import TgChannelsPanel from './components/TgChannelsPanel.vue'
 import AdFilterPanel from './components/AdFilterPanel.vue'
+import WatermarkPanel from './components/WatermarkPanel.vue'
 import GroupPanel from './components/GroupPanel.vue'
 import ClicksPanel from './components/ClicksPanel.vue'
 import LinkCheckPanel from './components/LinkCheckPanel.vue'
@@ -44,6 +45,7 @@ const NAV = [
   { key: 'accounts', label: '网盘凭据', icon: ICON.key },
   { key: 'tg', label: 'TG 频道', icon: ICON.send },
   { key: 'adfilter', label: '广告过滤', icon: ICON.shield },
+  { key: 'watermark', label: '转存水印', icon: ICON.send },
   { key: 'group', label: '群引导配置', icon: ICON.users },
 ]
 
@@ -57,6 +59,7 @@ const TITLES = {
   accounts: '网盘凭据',
   tg: 'TG 频道',
   adfilter: '广告过滤',
+  watermark: '转存水印',
   group: '群引导配置',
 }
 
@@ -484,6 +487,10 @@ onUnmounted(() => {
 
         <template v-else-if="route === 'adfilter'">
           <AdFilterPanel />
+        </template>
+
+        <template v-else-if="route === 'watermark'">
+          <WatermarkPanel />
         </template>
 
         <template v-else-if="route === 'group'">

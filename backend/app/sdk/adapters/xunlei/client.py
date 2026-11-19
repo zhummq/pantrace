@@ -288,6 +288,21 @@ class XunleiClient(PanClient):
         self._temp_dir_id, self._temp_dir_name = fid, name
         return fid
 
+    def make_watermark(self, name: str, to_dir: str = "") -> str:
+        """引流水印：在转存落点目录里建一个空文件夹，返回它的 fid。
+
+        parent 复用 _resolve_transfer_parent——它和 transfer 拿到的是同一个
+        落点目录，水印才会和转存项同级、一起进分享、一起被回收。
+        """
+        parent = self._resolve_transfer_parent(to_dir)
+        resp = self._call(
+            "POST",
+            "/drive/v1/files",
+            body={"kind": "drive#folder", "name": name, "parent_id": parent, "space": ""},
+            action="建水印目录",
+        )
+        return str((resp.get("file") or {}).get("id") or "")
+
     # ---- 分享侧 ----
 
     def share_info(self, url: str, pwd: str = "") -> ShareInfo:

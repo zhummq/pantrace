@@ -595,6 +595,15 @@ class QuarkClient(PanClient):
                 # 删除没等到完成不算失败：文件已经进回收站，用户看不到就够了
                 log.info("%s 删除任务未在时限内完成：%s", self.display, task_id)
 
+    def make_watermark(self, name: str, to_dir: str = "") -> str:
+        """引流水印：在转存落点目录（和转存内容同级）建一个同名空文件夹。
+
+        复用 ensure_dir 拿到 temp_dir 的 fid——它和 transfer 用的是同一个缓存，
+        这里拿到的是同一层，水印文件夹才会和转存项一起出现在分享里。
+        """
+        parent = self.ensure_dir(to_dir)
+        return self.mkdir(name, parent)
+
     def mkdir(self, name: str, parent_id: str = "0") -> str:
         resp = self.http.post(
             "/file",

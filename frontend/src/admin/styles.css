@@ -2194,6 +2194,30 @@ textarea::placeholder {
 }
 
 /* ==========================================================================
+   转存水印面板（WatermarkPanel）
+   ========================================================================== */
+
+.wm-name {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  padding: 9px 11px;
+}
+
+.wm-preview {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.wm-preset {
+  margin-left: 2px;
+}
+
+/* ==========================================================================
    TG 频道面板（TgChannelsPanel）
 
    每个频道一行：输入 + 探测。探测结果就地展开，不弹窗、不跳页——运营要的

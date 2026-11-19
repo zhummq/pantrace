@@ -53,6 +53,9 @@ class PanClient(ABC):
     ad_keywords: list[str] = []
     #: 判定广告的体积上限。超过这个体积的附件一律不判，见 adfilter 的说明
     ad_max_bytes: int = adfilter.DEFAULT_MAX_BYTES
+    #: 转存引流水印文件夹名，业务层在 registry.create 之后盖进来（同
+    #: ad_keywords 的手法，不进各 adapter 的构造签名）。空 = 关闭。
+    watermark_name: str = ""
 
     def __init__(
         self,
@@ -88,6 +91,19 @@ class PanClient(ABC):
         """删除文件（进回收站或直删，看网盘）。"""
 
     # ---- 默认实现 ----
+
+    def make_watermark(self, name: str, to_dir: str = "") -> str:
+        """在转存落点目录里建一个**空文件夹**当引流水印，返回它的 fid。
+
+        默认不支持——返回空串，转存照常进行，只是没有水印。支持建目录的盘
+        （夸克/UC、迅雷、百度；光鸭/139 无现成建目录接口）覆盖这个方法。
+        空文件夹会随 fids 一起进分享、一起
+        被 30 分钟回收删掉，所以它是"用完即弃"的广告位，不占长期空间。
+
+        `name` 由业务层的 watermark_name 配置传入，空串表示功能关闭。
+        这里不判断空串——调用方 mirror() 已经判过；实现方拿到非空名字即可建。
+        """
+        return ""
 
     def create_share(self, fids: list[str], title: str, expire_hours: int = 24) -> ShareLink:
         """建分享。不支持建分享的盘（如迅雷）由上层直接用原链接兜底。
@@ -181,6 +197,10 @@ class PanClient(ABC):
         fids = self.transfer(info, self.account.temp_dir)
         if not fids:
             raise NetdiskError("转存没有返回文件 id")
+        # 引流水印：转存完就地在落点目录建一个空文件夹，fid 并入 fids。
+        # 它必须赶在 create_share 之前——分享要把它一起带出去，回收也靠这
+        # 份 fids 删它。建水印失败只记日志，绝不让一条本已成功的转存变失败。
+        fids = self._with_watermark(fids)
         try:
             link = self.create_share(fids, info.title or title or "资源分享", expire_hours)
         except ViolationError:
@@ -197,6 +217,26 @@ class PanClient(ABC):
         link.fids = list(fids)
         link.size = info.total_size
         return link
+
+    def _with_watermark(self, fids: list[str]) -> list[str]:
+        """把引流水印文件夹的 fid 并进转存 fids。失败/不支持时原样返回。
+
+        这是"锦上添花"，不是主流程：建文件夹要额外请求，而且空目录能不能进
+        分享各盘不一样。所以任何异常都在这里吞掉，只记日志——绝不能让用户
+        因为一个广告文件夹拿不到本来已经转存成功的资源。
+        """
+        name = (self.watermark_name or "").strip()
+        if not name:
+            return fids
+        try:
+            wfid = self.make_watermark(name, self.account.temp_dir)
+        except Exception as exc:  # noqa: BLE001 - 水印失败不影响转存，故兜到最宽
+            log.info("%s 建引流水印文件夹「%s」失败，跳过：%s", self.display, name[:24], exc)
+            return fids
+        if not wfid:
+            return fids
+        log.info("%s 引流水印文件夹「%s」已建（fid=%s）", self.display, name[:24], wfid)
+        return [*fids, wfid]
 
     def _prefilter_ads(self, info: ShareInfo) -> None:
         """转存前把顶层广告附件从待转清单里摘掉。就地改 `info`。

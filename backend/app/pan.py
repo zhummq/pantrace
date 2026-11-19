@@ -72,6 +72,10 @@ _cfg: dict = {
     # 判定广告的体积上限（MB）。附件型后缀 + 命中关键词 + 小于这个体积，
     # 三条全中才动手；0 = 不限体积（但后缀和关键词仍然要过）
     "ad_max_mb": 2.0,
+    # 转存引流水印文件夹名。空 = 关闭。业务层建完 client 后盖到
+    # client.watermark_name，由 base.mirror 在落点目录建空文件夹并并入 fids。
+    # 为空时不产生任何额外请求。
+    "watermark_name": "",
     # 建出去那条分享本身的有效期（小时）。真正让链接失效的是 link_ttl 到点
     # 删源文件，这里只是安全网：回收任务没跑时，分享到期自己断。
     # 各平台档位不同，见各适配器 create_share；0 在这里没有"永久"的含义——
@@ -118,7 +122,10 @@ def configure(**cfg) -> None:
 
 #: 允许在后台维护的配置项。没列在这里的仍只认环境变量（超时、并发这类
 #: 参数改坏了会直接影响可用性，不给运营入口）
-AD_SETTING_KEYS = ("ad_preskip", "ad_filter", "ad_keywords", "ad_depth", "ad_max_mb")
+AD_SETTING_KEYS = (
+    "ad_preskip", "ad_filter", "ad_keywords", "ad_depth", "ad_max_mb",
+    "watermark_name",
+)
 
 
 def _load_settings() -> None:
@@ -224,6 +231,34 @@ def save_ad_settings(
         depth_value, max_mb_value,
     )
     return ad_settings()
+
+
+def watermark_settings() -> dict:
+    """当前**生效**的水印文件夹名（库优先于 .env）。"""
+    return {"name": str(_cfg.get("watermark_name") or "")}
+
+
+def save_watermark_settings(*, name: str) -> dict:
+    """校验 + 落库 + **立即热更**，返回生效后的快照。
+
+    这是要建在用户网盘里的文件夹名，校验比广告词更严：路径分隔符和控制字符
+    一律拒绝，避免拼路径时被当成多级目录。空名字是有效值——表示关闭水印，
+    不产生任何额外请求。
+    """
+    value = str(name or "").strip()
+    if value:
+        if any(ch in value for ch in ("/", "\\")):
+            raise ValueError("文件夹名不能包含路径分隔符（/ 或 \\）")
+        if any(ord(ch) < 32 for ch in value):
+            raise ValueError("文件夹名不能包含控制字符")
+        if value in (".", ".."):
+            raise ValueError("文件夹名不能是 . 或 ..")
+        if len(value) > 60:
+            raise ValueError(f"文件夹名太长（{len(value)} 字，最多 60）")
+    _save_settings({"watermark_name": value})
+    _cfg["watermark_name"] = value
+    log.info("转存水印已更新：%s", value or "(关闭)")
+    return watermark_settings()
 
 
 def _connect() -> sqlite3.Connection:
@@ -543,6 +578,9 @@ def transfer(url: str, pwd: str = "", platform: str = "", title: str = "") -> Sh
             # 关键词置空 = 这一级不工作，这是把 MIRROR_AD_PRESKIP 关掉的方式
             client.ad_keywords = ad_keywords() if _cfg.get("ad_preskip") else []
             client.ad_max_bytes = ad_max_bytes()
+            # 引流水印名盖到 client。和 ad_keywords 同一手法，不进构造签名；
+            # base.mirror 在转存后读它决定建不建、建什么名字的空文件夹。
+            client.watermark_name = str(_cfg.get("watermark_name") or "")
             # 有效期一路传下去：以前这里只传三个参数，各适配器的默认值谁都不管，
             # 百度那边 0 就是永久分享。见 config.mirror_share_hours
             link = client.mirror(url, pwd, title, expire_hours=int(_cfg["share_hours"]))

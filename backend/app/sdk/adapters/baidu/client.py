@@ -361,6 +361,35 @@ class BaiduClient(PanClient):
                 )
         self._ensured_dirs.add(path)
 
+    def make_watermark(self, name: str, to_dir: str = "") -> str:
+        """引流水印：在转存落点目录里建一个空目录，返回它的相对路径。
+
+        三处必须和 transfer 对齐，否则水印要么进不了分享、要么删不掉：
+          1. **落点算法**：和 transfer 用同一份 to_dir/temp_dir 算出同一父目录，
+             水印才会和转存项同级、一起出现在分享里。
+          2. **/api/create 不幂等**：撞名会给新名字（见 _ensure_dir），所以先
+             _dir_exists 查，存在就复用，绝不无条件 create。
+          3. **返回形态**：和 transfer 的 fids 一致——相对根目录、不带前导斜杠
+             的路径。create_share 会把它归进 path_list，delete 会拼成 /路径，
+             两边都认（数字 fs_id 走的另一条分支，这里用不上）。
+        """
+        parent = (to_dir or self.account.temp_dir or "/").strip()
+        if not parent.startswith("/"):
+            parent = "/" + parent
+        parent = parent.rstrip("/") or "/"
+        name = name.strip().strip("/")
+        target = f"{parent}/{name}" if parent != "/" else f"/{name}"
+
+        if not self._dir_exists(target):
+            resp = self.http.post(
+                "/api/create",
+                params={"bdstoken": self.bdstoken(), "clienttype": 0, "web": 1},
+                data={"path": target, "isdir": 1, "block_list": "[]"},
+                action="建水印目录",
+            )
+            self._ok(resp, "建水印目录")
+        return target.lstrip("/")
+
     def transfer(self, info: ShareInfo, to_dir: str = "") -> list[str]:
         path = (to_dir or "/").rstrip("/") or "/"
         if not path.startswith("/"):

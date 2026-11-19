@@ -112,3 +112,8 @@ export const saveAdFilter = (payload) =>
 // 试算走线上同一个判断函数，不是前端复刻的规则
 export const probeAd = (name, size) =>
   api('/api/admin/ad-filter/probe', { method: 'POST', body: { name, size } })
+
+// 转存水印：落点目录里那个引流文件夹的名字，库优先于 .env，保存即热更
+export const watermark = () => api('/api/admin/watermark')
+export const saveWatermark = (name) =>
+  api('/api/admin/watermark', { method: 'POST', body: { name } })

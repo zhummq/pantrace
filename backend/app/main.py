@@ -256,6 +256,7 @@ if MIRROR_ON:
             ad_depth=settings.mirror_ad_depth,
             ad_max_mb=settings.mirror_ad_max_mb,
             share_hours=settings.mirror_share_hours,
+            watermark_name=settings.mirror_watermark_name,
         )
         # 老部署靠 MIRROR_QUARK_COOKIE 一个变量活着。表里没有夸克账号时
         # 把它导进去，避免升级后"转存突然全挂"——这是唯一的兼容路径，别删
@@ -1508,6 +1509,39 @@ async def admin_ad_filter_probe(payload: AdProbeIn, request: Request):
             is_dir=payload.is_dir,
         ),
     }
+
+
+# ---- 转存水印配置 ----
+#
+# 转存时在落点目录建的广告文件夹名。存库覆盖 .env，保存即热更，不用重启。
+# 空名字 = 关闭水印，不产生任何额外请求。
+
+
+class WatermarkIn(BaseModel):
+    name: str = ""
+
+
+@app.get("/api/admin/watermark", include_in_schema=False)
+async def admin_watermark_get(request: Request):
+    if not MIRROR_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "点击转存已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    return {"code": 0, "data": pan.watermark_settings()}
+
+
+@app.post("/api/admin/watermark", include_in_schema=False)
+async def admin_watermark_save(payload: WatermarkIn, request: Request):
+    """保存并热更。下一次点击转存就用新名字。"""
+    if not MIRROR_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "点击转存已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    try:
+        pan.save_watermark_settings(name=payload.name)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+    return {"code": 0, "data": pan.watermark_settings()}
 
 
 # ---- TG 频道配置 ----
