@@ -18,7 +18,9 @@ from __future__ import annotations
 from .types import File
 
 #: 文本/快捷方式类：只要命中关键词就判（这类文件没有"正片"属性）
-TEXT_SUFFIXES = frozenset({".txt", ".url", ".html", ".htm", ".ini"})
+#: .md 是 2026-11 加进来的：源分享里出现「加V群.md」「领取方式.md」这类引流
+#: 说明，和 .txt 同类——正文就是广告本身，不存在"正文是正片"的情况。
+TEXT_SUFFIXES = frozenset({".txt", ".url", ".html", ".htm", ".ini", ".md"})
 
 #: 图片类单独一档，判据更严（见 `_image_is_ad`）。为什么不干脆排除图片：
 #: "更多资源.jpg""扫码关注.png" 是最常见的引流载体，全放过等于不做。

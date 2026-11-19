@@ -29,6 +29,17 @@ class TestTripleCondition(unittest.TestCase):
         self.assertTrue(adfilter.is_ad(f("更多资源.jpg", 300 * 1024), WORDS))
         self.assertTrue(adfilter.is_ad(f("公众号.png", 800 * 1024), WORDS))
 
+    def test_markdown_ad_attachment(self):
+        """.md 是文本类引流附件：命中词就判，干净的说明文件不动。
+
+        2026-11 线上出现"加V群.md"，此前 .md 不在白名单里整个漏掉。
+        """
+        self.assertTrue(adfilter.is_ad(f("加群方式.md"), WORDS))
+        self.assertTrue(adfilter.is_ad(f("更多资源说明.md"), WORDS))
+        # 反例：正经的说明文档不能被牵连
+        self.assertFalse(adfilter.is_ad(f("readme.md"), WORDS))
+        self.assertFalse(adfilter.is_ad(f("项目说明.md"), WORDS))
+
     def test_wechat_default_image_name(self):
         """微信保存的图片默认叫「微信图片_20240101.jpg」，命中"微信"但不是广告。
 
