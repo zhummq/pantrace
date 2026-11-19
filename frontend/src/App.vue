@@ -66,7 +66,8 @@ const resultLabel = computed(() => {
 })
 
 const tierLabel = computed(() => {
-  if (tier.value === 'tg') return 'TG 免费通道'
+  // TG 通道是内部实现细节，不展示给用户——面板头只需要说清数据是实时/
+  // 缓存/合并来的，不必暴露走的是哪条抓取通道。
   if (tier.value === 'plugin') return '已切换备用源'
   return ''
 })
@@ -722,7 +723,10 @@ onBeforeUnmount(() => {
 
       <section v-else-if="items.length" class="panel">
         <header class="panel-head">
-          <span class="panel-title"><i class="panel-dot"></i>搜索结果</span>
+          <span class="panel-title">
+            <i class="panel-dot"></i>搜索结果
+            <b v-if="activePlatform" class="title-pf">{{ activePlatformName }}</b>
+          </span>
           <div class="panel-tools">
             <span class="state-chip" :class="{ saved: cached || shared }">{{ resultLabel }}</span>
             <span v-if="tierLabel" class="state-chip">{{ tierLabel }}</span>
@@ -1222,18 +1226,40 @@ onBeforeUnmount(() => {
   font-size: var(--text-sm);
   /* 平台名用主文字色：chip 里已经有一块彩色方块，文字再压暗就整片发灰 */
   color: var(--ink);
+  transition:
+    background-color var(--dur-2) var(--ease),
+    border-color var(--dur-2) var(--ease),
+    color var(--dur-2) var(--ease),
+    box-shadow var(--dur-2) var(--ease);
 }
 
-.pchip:hover {
+.pchip:hover:not(.on) {
   border-color: var(--line-2);
   background: var(--surface-3);
   color: var(--ink);
 }
 
+/* 选中态必须一眼可辨。早先只是 24% 绿边 + 10% 绿底，在一排高饱和品牌色
+   方块里等于没画——用户看不出这次查的是哪个盘。改成整颗实心填充：
+   十来颗暗 chip 里一颗亮绿，视线自动落上去。 */
 .pchip.on {
-  border-color: var(--brand-ring);
-  background: var(--brand-soft);
-  color: var(--brand-ink);
+  border-color: var(--brand);
+  background: var(--brand);
+  color: var(--on-brand);
+  font-weight: 600;
+  box-shadow: var(--shadow-brand);
+}
+
+.pchip.on:hover {
+  background: var(--brand-hover);
+  border-color: var(--brand-hover);
+}
+
+/* 选中态的方块反相成深底亮字：深绿方块贴在实心绿 chip 上会糊成一片，
+   反相后简称照样认得出，还多一层"按下去了"的层次。 */
+.pchip.on .pchip-ic {
+  background: var(--on-brand);
+  color: var(--brand);
 }
 
 /* 品牌色方块：没有各家真实 logo，用品牌色 + 简称，比清一色灰点好认 */
@@ -1335,6 +1361,12 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   background: var(--brand);
   box-shadow: 0 0 0 3px var(--brand-soft);
+}
+
+/* 结果头点名当前网盘：一眼确认这一屏查的是哪个盘，不用回滚去看 chip */
+.title-pf {
+  font-weight: 600;
+  color: var(--brand-ink);
 }
 
 .panel-meta {
