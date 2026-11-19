@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -57,6 +58,34 @@ SHARE_STATUS_MAP: dict[str, type[NetdiskError]] = {
 _DIR_ID_RE = re.compile(r"V[A-Za-z0-9_-]{20,30}")
 
 
+def _user_id_from_jwt(token: str) -> str:
+    """从 access_token（JWT）的 payload 里读 user_id，不验签。
+
+    为什么不验签：这里只是要一个**标识**，不是用它做鉴权决策。签名校验由
+    上游在每次请求时做，我们解码 payload 纯粹是为了给 captcha 的 meta.user_id
+    填一个真值——读不懂就返回空串，让调用方退回 "0"，绝不让解析失败影响转存。
+
+    user_id 以前只在 token **刷新时**才从 refresh 响应拿，导致新建 client 且
+    token 未过期时它一直是空串，建目录的 captcha 带 "0" 被 upstream 判
+    captcha_invalid。JWT payload 里本来就有，直接读，不用等刷新。
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return ""
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)  # base64url 补 padding
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        if not isinstance(claims, dict):
+            return ""
+        for key in ("user_id", "sub", "uid", "userId"):
+            value = claims.get(key)
+            if value:
+                return str(value)
+    except Exception:  # noqa: BLE001 - 解码失败就当没拿到，绝不影响主流程
+        pass
+    return ""
+
+
 @register
 class XunleiClient(PanClient):
     type = "xunlei"
@@ -68,7 +97,10 @@ class XunleiClient(PanClient):
         self._captchas: dict[str, tuple[str, float]] = {}
         self._temp_dir_id = ""
         self._temp_dir_name = ""
-        self._user_id = ""
+        # 直接从 access_token 解 user_id 作初值：以前这里写死空串，只有 token
+        # 刷新时才会被赋值。新建 client + token 未过期 → 一直空 → captcha 带
+        # "0" → 建目录被拒。水印是新增的建目录动作，把这个坑稳定触发了。
+        self._user_id = _user_id_from_jwt(self._access_token)
         super().__init__(account, timeout=timeout, on_cookie=on_cookie)
 
     def _build_requester(self) -> Requester:
@@ -123,8 +155,12 @@ class XunleiClient(PanClient):
             self._access_token = token
             self._expires_at = now + int(resp.get("expires_in") or 3600) - 60
             # 写操作（如建目录）的 captcha 会校验 meta.user_id，传 "0" 会被
-            # captcha_invalid 拒掉（实测）；读操作不挑。刷新响应里有真实 user_id
-            self._user_id = str(resp.get("user_id") or resp.get("sub") or "")
+            # captcha_invalid 拒掉（实测）；读操作不挑。刷新响应里有真实 user_id。
+            # 只在响应给了值时才覆盖：JWT 里解出来的可能是更全的 user_id，
+            # 别让一个缺字段的 refresh 响应把它清回空串。
+            refreshed_uid = str(resp.get("user_id") or resp.get("sub") or "")
+            if refreshed_uid:
+                self._user_id = refreshed_uid
             self.account.access_token = token
             if refresh_token:
                 self.account.refresh_token = refresh_token
@@ -142,6 +178,10 @@ class XunleiClient(PanClient):
         return self._access_token
 
     def _captcha(self, action: str, renew: bool = False) -> str:
+        # 最后一道兜底：token 在实例生命周期内被换过（构造时还没有、后来刷新
+        # 拿到）而 _user_id 没同步时，现解一次。空着传 "0" 会被写操作拒。
+        if not self._user_id:
+            self._user_id = _user_id_from_jwt(self._access_token)
         cached = self._captchas.get(action)
         if not renew and cached and cached[1] > time.time():
             return cached[0]
@@ -183,6 +223,7 @@ class XunleiClient(PanClient):
         body: dict | None = None,
         action: str = "",
         gone_error: type[NetdiskError] | None = None,
+        captcha_renew: bool = False,
     ) -> dict:
         """带 Authorization + x-captcha-token 的业务请求。
 
@@ -195,7 +236,7 @@ class XunleiClient(PanClient):
         try:
             return self._request_once(
                 method, path, query=query, body=body,
-                action=action, gone_error=gone_error,
+                action=action, gone_error=gone_error, captcha_renew=captcha_renew,
             )
         except (AuthError, UpstreamError) as exc:
             if getattr(exc, "code", None) != 401:
@@ -206,7 +247,7 @@ class XunleiClient(PanClient):
             refresh.forget(int(self.account.id or 0))
             return self._request_once(
                 method, path, query=query, body=body,
-                action=action, gone_error=gone_error,
+                action=action, gone_error=gone_error, captcha_renew=captcha_renew,
             )
 
     def _request_once(
@@ -218,11 +259,12 @@ class XunleiClient(PanClient):
         body: dict | None = None,
         action: str = "",
         gone_error: type[NetdiskError] | None = None,
+        captcha_renew: bool = False,
     ) -> dict:
         action_key = f"{method.upper()}:{path}"
         headers = {
             "Authorization": f"Bearer {self._token()}",
-            "x-captcha-token": self._captcha(action_key),
+            "x-captcha-token": self._captcha(action_key, renew=captcha_renew),
         }
         return self.http.request(
             method,
@@ -295,12 +337,24 @@ class XunleiClient(PanClient):
         落点目录，水印才会和转存项同级、一起进分享、一起被回收。
         """
         parent = self._resolve_transfer_parent(to_dir)
-        resp = self._call(
-            "POST",
-            "/drive/v1/files",
-            body={"kind": "drive#folder", "name": name, "parent_id": parent, "space": ""},
-            action="建水印目录",
-        )
+        try:
+            resp = self._call(
+                "POST",
+                "/drive/v1/files",
+                body={"kind": "drive#folder", "name": name, "parent_id": parent, "space": ""},
+                action="建水印目录",
+                # 强制重新取 captcha：建转存目录和建水印走的是同一个 action key
+                # (POST:/drive/v1/files)，缓存的 token 可能被上游用过一次就失效。
+                captcha_renew=True,
+            )
+        except (AuthError, UpstreamError) as exc:
+            # 排查留痕：captcha 这类 400 以前日志只有一句"验证码无效"，分不清
+            # 是 user_id 没拿到还是 token 复用。带上真实 user_id 一眼就能定位。
+            log.warning(
+                "%s 建水印目录失败 user_id=%s parent=%s action=%s：%s",
+                self.display, self._user_id or "(空)", parent, "POST:/drive/v1/files", exc,
+            )
+            raise
         return str((resp.get("file") or {}).get("id") or "")
 
     # ---- 分享侧 ----
