@@ -33,9 +33,9 @@ from .types import PluginOutcome, SearchResult
 
 log = logging.getLogger("pantrace.search.engine")
 
-# 关键词切词：空白和常见分隔符都当词边界。中文没有空格，"三体全集" 整体是一个词；
-# "三体 全集" 切成两个词后要求标题同时包含——比整串匹配更宽容，也不会把无关的
-# "三体" 结果混进来。
+# 关键词切词：空白和常见分隔符都当词边界。切完的词拼成字符序列做子序列匹配：
+# 字符按 query 顺序出现在标题里即可，不要求连续（"走马上任" 能匹配 "走 马 上 任"），
+# 但顺序必须一致（不匹配 "上任走马"）。分隔符只从 query 里剥离，标题里的间隔照常跳过。
 _KEYWORD_SPLIT_RE = re.compile(r"[\s,，、/|]+")
 
 
@@ -45,11 +45,20 @@ def keyword_tokens(query: str) -> list[str]:
 
 
 def title_matches_keyword(title: str, tokens: list[str]) -> bool:
-    """标题是否命中全部关键词。大小写不敏感，词序无关。"""
+    """标题是否按顺序命中全部关键词字符（子序列匹配，可不连续）。
+
+    大小写不敏感；字符顺序必须与 query 一致。
+
+    "走马上任" → "走 马 上 任"、"走马（上任）" 放行；
+    "上任走马"、"走任马上" 不放行。
+    """
     if not tokens:
         return True
-    text = (title or "").casefold()
-    return all(token in text for token in tokens)
+    pattern = "".join(tokens).casefold()
+    chars = iter((title or "").casefold())
+    # 对 pattern 每个字符，在标题剩余部分里找一次并推进迭代器。
+    # all 短路：任一字符找不到即 False，天然保证顺序、不会重复消耗同一字符。
+    return all(ch in chars for ch in pattern)
 
 
 def filter_by_keyword(

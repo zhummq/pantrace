@@ -66,6 +66,31 @@ class TestKeywordFilter(unittest.TestCase):
         self.assertEqual([r.unique_id for r in kept], ["a", "c"])
         self.assertEqual(dropped, 1)
 
+    def test_subsequence_allowed_when_order_preserved(self):
+        """字符不连续但顺序对 → 放行。这是「走马上任」被过滤光后的修正目标。"""
+        tokens = engine.keyword_tokens("走马上任")
+        self.assertTrue(engine.title_matches_keyword("走马（2026）上任", tokens))
+        self.assertTrue(engine.title_matches_keyword("走 马 上 任", tokens))
+        self.assertTrue(engine.title_matches_keyword("走马上任", tokens))
+
+    def test_order_reversed_is_rejected(self):
+        """同样这些字，顺序反了或乱了 → 必须拒绝。"""
+        tokens = engine.keyword_tokens("走马上任")
+        self.assertFalse(engine.title_matches_keyword("上任走马", tokens))
+        self.assertFalse(engine.title_matches_keyword("走任马上", tokens))
+        self.assertFalse(engine.title_matches_keyword("马走任上", tokens))
+
+    def test_missing_character_is_rejected(self):
+        tokens = engine.keyword_tokens("走马上任")
+        self.assertFalse(engine.title_matches_keyword("走马上", tokens))
+        self.assertFalse(engine.title_matches_keyword("无关标题", tokens))
+
+    def test_multiple_tokens_keep_global_order(self):
+        """多个词的字符拼成一条序列，顺序同样必须一致。"""
+        tokens = engine.keyword_tokens("三体 全集")
+        self.assertTrue(engine.title_matches_keyword("三体电视剧 全集 4K", tokens))
+        self.assertFalse(engine.title_matches_keyword("全集 三体", tokens))
+
 
 class TestSourceMark(unittest.TestCase):
     def test_tg_item_carries_channel_source(self):
