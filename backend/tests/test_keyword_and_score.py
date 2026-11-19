@@ -1,0 +1,185 @@
+"""关键词标题过滤 / 来源标记 / 来源贡献分的离线测试。
+
+跑法：``cd backend && .venv/Scripts/python.exe -m unittest tests.test_keyword_and_score -v``
+"""
+
+from __future__ import annotations
+
+import asyncio
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from app import source_score
+from app.search import adapter, engine
+from app.search.types import Link, PluginOutcome, SearchResult
+
+
+def result(uid: str, title: str, *, channel: str = "", platform: str = "quark") -> SearchResult:
+    return SearchResult(
+        unique_id=uid,
+        channel=channel,
+        title=title,
+        links=[Link(type=platform, url=f"https://pan.example/{uid}", password="")],
+        extras={"platform": platform, "shareUrl": f"https://pan.example/{uid}"},
+    )
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+class FakePlugin:
+    def __init__(self, name: str, results: list[SearchResult], kind: str = "plugin"):
+        self.name = name
+        self.source_kind = kind
+        self._results = results
+        self.seen_ext: dict | None = None
+
+    async def search(self, keyword: str, ext: dict) -> PluginOutcome:
+        self.seen_ext = ext
+        return PluginOutcome(source=self.name, results=self._results, is_final=True)
+
+
+class TestKeywordFilter(unittest.TestCase):
+    def test_single_token_case_insensitive(self):
+        tokens = engine.keyword_tokens("S事 in 全集")
+        self.assertTrue(engine.title_matches_keyword("《s事 IN》全集", tokens))
+
+    def test_all_tokens_required(self):
+        tokens = engine.keyword_tokens("三体 全集")
+        self.assertTrue(engine.title_matches_keyword("三体电视剧 全集 4K", tokens))
+        self.assertFalse(engine.title_matches_keyword("三体电视剧 第一部", tokens))
+
+    def test_whitespace_and_punctuation_split(self):
+        tokens = engine.keyword_tokens("三体，全集/4k")
+        self.assertEqual(tokens, ["三体", "全集", "4k"])
+
+    def test_empty_query_keeps_everything(self):
+        kept, dropped = engine.filter_by_keyword([result("a", "任意标题")], [])
+        self.assertEqual((len(kept), dropped), (1, 0))
+
+    def test_filter_returns_kept_and_count(self):
+        rows = [result("a", "三体 全集"), result("b", "无关资源"), result("c", "三体 剧集")]
+        kept, dropped = engine.filter_by_keyword(rows, ["三体"])
+        self.assertEqual([r.unique_id for r in kept], ["a", "c"])
+        self.assertEqual(dropped, 1)
+
+
+class TestSourceMark(unittest.TestCase):
+    def test_tg_item_carries_channel_source(self):
+        item = adapter.to_item(result("tg-ch1-1", "三体", channel="ch1"))
+        self.assertEqual(item["sourceKey"], "tg:ch1")
+        self.assertEqual(item["sourceKind"], "tg")
+        self.assertEqual(item["sourceName"], "ch1")
+
+    def test_plugin_item_carries_plugin_source(self):
+        item = adapter.to_item(result("haisou-1", "三体"))
+        self.assertEqual(item["sourceKey"], "plugin:haisou")
+        self.assertEqual(item["sourceKind"], "plugin")
+        self.assertEqual(item["sourceName"], "haisou")
+
+
+class EngineKeywordBase(unittest.TestCase):
+    def search(self, plugins, query="三体", platforms=None, source="auto"):
+        with patch.object(engine.registry, "loaded", return_value=plugins):
+            return run(engine.search(
+                query, list(platforms or []), 1, 20, "title", source=source,
+            ))
+
+
+class TestEngineKeyword(EngineKeywordBase):
+    def test_title_filter_applied_before_tier_decision(self):
+        """TG 有结果但标题全不含关键词 -> 过滤空 -> 走 haisou 兜底。"""
+        tg = FakePlugin(
+            "tg_searchers", [result("tg-x", "无关转发", channel="ch1")], kind="tg",
+        )
+        hs = FakePlugin("haisou", [result("haisou-1", "三体 全集")])
+        data = self.search([tg, hs])
+
+        self.assertEqual([i["title"] for i in data["items"]], ["三体 全集"])
+        self.assertEqual(data["_meta"]["tier"], "plugin")
+        self.assertEqual(data["_meta"]["filtered"], 1)
+
+    def test_tg_hit_wins_when_title_matches(self):
+        """标题匹配就不花兜底的额度。"""
+        tg = FakePlugin("tg_searchers", [result("tg-x", "三体 全集", channel="ch1")], kind="tg")
+        hs = FakePlugin("haisou", [result("haisou-1", "三体 另一种")])
+        data = self.search([tg, hs])
+
+        self.assertEqual(data["_meta"]["tier"], "tg")
+        self.assertEqual(len(data["items"]), 1)
+        self.assertEqual(data["items"][0]["sourceKey"], "tg:ch1")
+
+    def test_both_tiers_filtered_returns_empty_with_diagnostic(self):
+        tg = FakePlugin("tg_searchers", [result("tg-x", "无关", channel="ch1")], kind="tg")
+        hs = FakePlugin("haisou", [result("haisou-1", "也不相关")])
+        data = self.search([tg, hs])
+
+        self.assertEqual(data["items"], [])
+        self.assertEqual(data["_meta"]["filtered"], 2)
+        # 没有失败，不能抛 504——这是"没有匹配资源"，不是"源全挂了"。
+        self.assertEqual(data["_meta"]["tier"], "")
+
+    def test_filter_respects_platform_coverage(self):
+        """过滤后剩的平台不对，仍要继续兜底。"""
+        tg = FakePlugin(
+            "tg_searchers", [result("tg-x", "三体 百度", channel="ch1", platform="baidu")],
+            kind="tg",
+        )
+        hs = FakePlugin("haisou", [result("haisou-1", "三体 夸克")])
+        data = self.search([tg, hs], platforms=["quark"])
+
+        self.assertEqual(data["_meta"]["tier"], "plugin")
+        self.assertEqual(data["items"][0]["platform"], "quark")
+
+
+class TestSourceScore(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "score.db")
+        source_score.init(self.db)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_rank_counts_only_recorded_clicks(self):
+        source_score.record("tg:ch1", ip="1.2.3.4")
+        source_score.record("tg:ch1", ip="1.2.3.4")
+        source_score.record("plugin:haisou")
+        rank = source_score.rank()
+
+        self.assertEqual(rank["total"], 3)
+        rows = {r["key"]: r for r in rank["rows"]}
+        self.assertEqual(rows["tg:ch1"]["score"], 2)
+        self.assertEqual(rows["plugin:haisou"]["score"], 1)
+        self.assertGreater(rank["since"], 0)
+
+    def test_bad_key_and_bot_are_ignored(self):
+        self.assertFalse(source_score.record("tg:"))
+        self.assertFalse(source_score.record("random:key"))
+        self.assertFalse(source_score.record("tg:ch1", bot=True))
+        self.assertEqual(source_score.rank()["total"], 0)
+
+    def test_reinit_keeps_original_since(self):
+        first = source_score.rank()["since"]
+        source_score.init(self.db)
+        self.assertEqual(source_score.rank()["since"], first)
+
+    def test_legacy_clicks_are_not_counted(self):
+        """启用前写进 events 的历史点击，永远进不了这张新表。"""
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        conn.execute(
+            "INSERT INTO source_scores(ts, day, source_key, source_kind, source_name) "
+            "VALUES (?,?,?,?,?)",
+            (1.0, "2020-01-01", "tg:old", "tg", "old"),
+        )
+        conn.commit()
+        conn.close()
+        self.assertEqual(source_score.rank()["total"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

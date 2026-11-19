@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, check, feedback, group, guard, pan, resolver
+from . import analytics, check, feedback, group, guard, pan, resolver, source_score
 from .config import get_settings
 from .search import engine as search_engine
 from .search.cache import SearchCache
@@ -112,6 +112,17 @@ if ANALYTICS_ON:
         log.error("埋点初始化失败，已关闭：%s", exc)
 else:
     log.info("埋点已关闭（ANALYTICS_ENABLED=false）")
+
+# ---- 来源贡献分 ----
+# 和埋点同一个 SQLite 文件，但独立建表、独立计时起点：历史点击不参与排行榜。
+# 埋点关掉时计分也关掉（点开来源的埋点本来就不上报），保持一个开关一个语义。
+SOURCE_SCORE_ON = ANALYTICS_ON
+if SOURCE_SCORE_ON:
+    try:
+        source_score.init(settings.analytics_path, tz_offset=settings.analytics_tz_offset)
+    except Exception as exc:  # noqa: BLE001
+        SOURCE_SCORE_ON = False
+        log.error("来源计分初始化失败，已关闭：%s", exc)
 
 # ---- 反馈 / 求资源 ----
 # 和埋点共用同一个 SQLite 文件，但开关独立：埋点是统计，反馈是待办工单，
@@ -385,6 +396,9 @@ class TrackEvent(BaseModel):
     resultCount: int = -1
     isNew: bool = False
     source: str = ""
+    # 这条结果来自哪个频道/插件（`tg:xxx` / `plugin:xxx`）。只在 click 事件里有值，
+    # 和 `source`（转存缓存状态 cached/fresh/fallback）是两件事，别混用。
+    sourceKey: str = ""
     meta: dict = Field(default_factory=dict)
 
 
@@ -426,6 +440,16 @@ async def track(payload: TrackPayload, request: Request, background: BackgroundT
     referer_header = request.headers.get("referer", "")
     visitor, session, is_new = _visitor_of(request)
     for event in payload.events[:20]:  # 单次最多 20 条，防止一次塞爆
+        # 来源加分：只认 click + 合法来源Key，机器人不算。
+        # 走 BackgroundTasks，和埋点一样不让写库挡住响应。
+        if SOURCE_SCORE_ON and event.kind == "click" and event.sourceKey:
+            background.add_task(
+                source_score.record,
+                event.sourceKey,
+                visitor=event.visitor[:64] or visitor,
+                ip=ip,
+                bot=bool(ua and analytics.is_bot(ua)),
+            )
         background.add_task(
             analytics.record,
             event.kind,
@@ -812,6 +836,7 @@ async def search(
                 duration_ms=0,
                 result_count=len(body.get("items") or []),
                 cached=True,
+                filtered=int(body.get("filtered") or 0),
             )
         return _export_search(body, background, page=page)
 
@@ -864,6 +889,9 @@ async def search(
             # 这一轮是哪个通道出的结果：tg = 没花额度，plugin = 兜底花了。
             # 前端可以用它提示"TG 无结果，已切换备用源"，运维也能一眼看出扣费原因。
             "tier": result["_meta"].get("tier", ""),
+            # 标题不含关键词被丢掉的条数。空结果时前端据此提示"换个说法"，
+            # 而不是让用户以为站上根本没有这个资源。
+            "filtered": result["_meta"].get("filtered", 0),
             "tookMs": int((time.perf_counter() - started) * 1000),
             "cached": False,
         }
@@ -923,6 +951,7 @@ async def search(
             result_count=len(body["items"]),
             # 搭车和缓存命中在"没为这个请求打上游"这件事上是一回事
             cached=shared,
+            filtered=int(body.get("filtered") or 0),
         )
 
     log.info(
@@ -1318,6 +1347,20 @@ async def admin_stats(request: Request, days: int = Query(7, ge=1, le=365)):
     except Exception as exc:  # noqa: BLE001
         log.exception("统计查询失败")
         return JSONResponse(status_code=500, content={"code": 500, "msg": f"统计查询失败：{exc}"})
+
+
+@app.get("/api/admin/source-rank", include_in_schema=False)
+async def admin_source_rank(request: Request, limit: int = Query(20, ge=1, le=200)):
+    """来源贡献排行榜：用户点开资源时给对应 TG 频道 / 插件加一分。
+
+    只统计计分功能启用之后的点击——历史数据在另一个表，天然不参与。
+    前端有两个开关：按频道看还是按插件看，传 kind 过滤即可。
+    """
+    if not SOURCE_SCORE_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "来源计分已关闭"})
+    if not _admin_allowed(request):
+        return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+    return {"code": 0, "data": source_score.rank(limit)}
 
 
 @app.get("/api/admin/feedback", include_in_schema=False)

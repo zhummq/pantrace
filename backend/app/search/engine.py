@@ -22,15 +22,49 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 from ..config import get_settings
 from . import adapter, registry
 from .merge import merge_search_results, sort_results_by_time_and_keywords
 from .outcome import BatchOutcome
-from .types import PluginOutcome
+from .types import PluginOutcome, SearchResult
 
 log = logging.getLogger("pantrace.search.engine")
+
+# 关键词切词：空白和常见分隔符都当词边界。中文没有空格，"三体全集" 整体是一个词；
+# "三体 全集" 切成两个词后要求标题同时包含——比整串匹配更宽容，也不会把无关的
+# "三体" 结果混进来。
+_KEYWORD_SPLIT_RE = re.compile(r"[\s,，、/|]+")
+
+
+def keyword_tokens(query: str) -> list[str]:
+    """搜索词切成小写词表。空词表 = 不过滤（防御性，调用方不该传空 query）。"""
+    return [t.casefold() for t in _KEYWORD_SPLIT_RE.split((query or "").strip()) if t]
+
+
+def title_matches_keyword(title: str, tokens: list[str]) -> bool:
+    """标题是否命中全部关键词。大小写不敏感，词序无关。"""
+    if not tokens:
+        return True
+    text = (title or "").casefold()
+    return all(token in text for token in tokens)
+
+
+def filter_by_keyword(
+    results: list[SearchResult], tokens: list[str]
+) -> tuple[list[SearchResult], int]:
+    """按标题过滤一批结果，返回 (保留的, 被过滤掉的条数)。
+
+    放在 engine 而不是插件里做：插件缓存存的是原始结果，换关键词/改过滤规则
+    不该让缓存失效。t.me 的 `?q=` 搜的是整条消息（正文、链接、@用户都算命中），
+    所以"搜出来的"里混着大量标题根本没提关键词的转发——这一步就是清它们的。
+    """
+    if not tokens:
+        return list(results), 0
+    kept = [r for r in results if title_matches_keyword(r.title, tokens)]
+    return kept, len(results) - len(kept)
 
 # 每个源**每种网盘类型**抓几页。与 pansou `haisou.go:23 DefaultPagesPerType` 同值。
 # 实际抓取量 = 平台数 × 页数 × 50 条（haisou 默认 5 平台 × 2 页 = 500 条），
@@ -185,33 +219,51 @@ async def search(
 
     started = time.perf_counter()
     ext = _ext(platforms, scope, force_refresh)
+    tokens = keyword_tokens(query)
 
     batch = BatchOutcome()
     submitted: list[str] = []
     round_info: dict[str, dict] = {}
     results: list = []
     used_tier = ""
+    # 标题不含关键词被丢掉的总数。前端据此区分"真没资源"和"有资源但标题不匹配"，
+    # 也方便排查过滤是不是过严（例如搜"三体全集"、标题写"《三体》全集"）。
+    filtered_total = 0
 
     for kind, plugs in tiers:
         # 各源自己就有窗口和超时，这里只负责并发起跑。BasePlugin.search() 从不外抛：
         # 失败会包进 PluginOutcome.failure，所以不用 return_exceptions。
         outcomes = await asyncio.gather(*(p.search(query, ext) for p in plugs))
         collected: list = []
+        tier_filtered = 0
         for outcome in outcomes:
-            collected.extend(outcome.results)
+            # 健康度按原始产出记：抓到了但标题不匹配 ≠ 源坏了，不能记成 zero_yield。
             batch.observe(
                 outcome.source, len(outcome.results),
                 _as_error(outcome), timed_out=outcome.pending,
             )
+            # ---- 关键词过滤（在降级判定之前）----
+            # t.me 的 ?q= 搜的是整条消息：正文里提到关键词、标题却毫不相干的转发
+            # 占很大比例。必须先过滤再判覆盖，否则"TG 抓到 20 条噪声"会被当成
+            # 命中，挡住本该走的 haisou 兜底。
+            kept, dropped = filter_by_keyword(outcome.results, tokens)
+            tier_filtered += dropped
+            collected.extend(kept)
             submitted.append(outcome.source)
             round_info[outcome.source] = {
                 "count": len(outcome.results),
+                # 原始产出里有多少条因标题不符被丢掉，看板能分辨"没抓到"和"抓到但没用"。
+                "filtered": dropped,
                 # pending = 窗口到点还没抓完，不等于失败；前端拿到的可能是旧缓存。
                 "pending": outcome.pending,
                 "failure": outcome.failure.value if outcome.failure else None,
                 "message": outcome.message[:160] if outcome.message else "",
                 "tier": kind,
             }
+
+        filtered_total += tier_filtered
+        if tier_filtered:
+            log.info("engine q=%s %s 层标题不符过滤 %d 条", query, kind, tier_filtered)
 
         if _covers_platforms(collected, platforms):
             results = collected
@@ -220,8 +272,8 @@ async def search(
         # 没覆盖 → 留给下一层。TG 有结果但盘不对时，宁可花一次额度也不给用户空手。
         if collected:
             log.info(
-                "engine q=%s %s 层有 %d 条但没覆盖平台 %s，继续兜底",
-                query, kind, len(collected), platforms,
+                "engine q=%s %s 层有 %d 条（标题过滤掉 %d）但没覆盖平台 %s，继续兜底",
+                query, kind, len(collected), tier_filtered, platforms,
             )
 
     batch.finalize(submitted)
@@ -261,8 +313,17 @@ async def search(
             # 这一轮最后是哪个层出的结果：tg = 没花额度，plugin = 兜底花了。
             # 排查"为什么这次慢了/扣钱了"先看它。
             "tier": used_tier,
+            # 标题不含关键词被丢掉的总条数。前端空结果页据此提示"换个说法"，
+            # 看板据此统计过滤率——不把"搜到了但标题不匹配"误记成"网上没有"。
+            "filtered": filtered_total,
             "sources": {
-                name: {"count": info["count"], "failure": info["failure"]}
+                name: {
+                    "count": info["count"],
+                    # 只在真的过滤掉东西时才多这个键：正常搜索的响应结构保持不变，
+                    # 老调用方拿到的还是 count + failure 两个字段。
+                    **({"filtered": info["filtered"]} if info.get("filtered") else {}),
+                    "failure": info["failure"],
+                }
                 for name, info in round_info.items()
             },
         },

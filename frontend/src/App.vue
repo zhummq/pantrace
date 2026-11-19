@@ -40,6 +40,9 @@ const tookMs = ref(0)
 const cached = ref(false)
 const shared = ref(false)
 const tier = ref('')
+// 标题不含关键词被过滤掉的条数。空结果时它决定提示语——"没搜到"和
+// "搜到了但标题不提这个词"是两件事，后者的解法是换个说法而不是换网盘。
+const filtered = ref(0)
 
 // 强制刷新不进骨架屏：结果面板原地更新，只把刷新按钮切成「刷新中」。
 // 和 loading 分开是刻意的 —— 刷新失败时 20 条结果必须留在原地，
@@ -339,6 +342,7 @@ async function doSearch(targetPage = 1, opts = {}) {
     cached.value = !!data.cached
     shared.value = !!data.shared
     tier.value = data.tier || ''
+    filtered.value = Number(data.filtered) || 0
     if (force) {
       // 后端自己会记一条 search(cached=0)，但分不出是首搜还是主动刷新。
       // 这条事件只记"用户点了刷新"这个意图，用于判断结果是否不够新。
@@ -374,6 +378,7 @@ async function doSearch(targetPage = 1, opts = {}) {
       cached.value = false
       shared.value = false
       tier.value = ''
+      filtered.value = 0
       error.value = e.message || '搜索失败，请稍后重试'
     }
   } finally {
@@ -704,7 +709,10 @@ onBeforeUnmount(() => {
       <div v-else-if="showEmpty" class="state">
         <div class="state-icon empty">∅</div>
         <p class="state-title">没有找到「{{ lastKeyword }}」</p>
-        <p class="state-desc">换个关键词试试，或者换一个网盘再搜。</p>
+        <p v-if="filtered > 0" class="state-desc">
+          搜到 {{ filtered }} 条，但标题里都没提这个词。换个更短的说法，比如只留片名。
+        </p>
+        <p v-else class="state-desc">换个关键词试试，或者换一个网盘再搜。</p>
         <button class="retry" @click="backToPlatforms">换个网盘</button>
         <p class="state-more">
           都没有？

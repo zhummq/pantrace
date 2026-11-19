@@ -94,6 +94,9 @@ export const linkCheck = (state = '', limit = 30) =>
 export const linkCheckTest = (url, pwd) =>
   api('/api/admin/link-check/test', { method: 'POST', body: { url, pwd: pwd || '' } })
 
+// 来源贡献榜：点开资源时给 TG 频道 / 插件加一分，只算启用后的新点击
+export const sourceRank = (limit = 50) => api(`/api/admin/source-rank?limit=${limit}`)
+
 // TG 频道：库优先于 .env，保存即热更；空列表 = 暂停采集，不是回退到默认
 export const tgChannels = () => api('/api/admin/tg-channels')
 export const saveTgChannels = (payload) =>

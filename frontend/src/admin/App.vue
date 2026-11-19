@@ -11,6 +11,7 @@ import AdFilterPanel from './components/AdFilterPanel.vue'
 import GroupPanel from './components/GroupPanel.vue'
 import ClicksPanel from './components/ClicksPanel.vue'
 import LinkCheckPanel from './components/LinkCheckPanel.vue'
+import SourceRankPanel from './components/SourceRankPanel.vue'
 import * as api from './api'
 import { ms, pct, platformName } from './format'
 
@@ -38,6 +39,7 @@ const NAV = [
   { key: 'search', label: '搜索诊断', icon: ICON.search },
   { key: 'check', label: '资源巡检', icon: ICON.link },
   { key: 'clicks', label: '点击日志', icon: ICON.pulse },
+  { key: 'source', label: '来源贡献榜', icon: ICON.pulse },
   { type: 'group', label: '配置' },
   { key: 'accounts', label: '网盘凭据', icon: ICON.key },
   { key: 'tg', label: 'TG 频道', icon: ICON.send },
@@ -51,6 +53,7 @@ const TITLES = {
   search: '搜索诊断',
   check: '资源巡检',
   clicks: '点击日志',
+  source: '来源贡献榜',
   accounts: '网盘凭据',
   tg: 'TG 频道',
   adfilter: '广告过滤',
@@ -63,6 +66,8 @@ const data = ref({})
 const fb = ref({})
 const acct = ref({})
 const lc = ref({})
+const sourceRankData = ref({})
+const rankLoading = ref(true)
 const ready = ref(false)
 const needToken = ref(false)
 const gateMsg = ref('')
@@ -265,9 +270,18 @@ async function loadHealth() {
   }
 }
 
+async function loadSourceRank() {
+  try {
+    sourceRankData.value = await api.sourceRank(50)
+    rankLoading.value = false
+  } catch (e) {
+    /* 计分关掉时这里 503，按"没有数据"处理，别拖垮整个看板 */
+  }
+}
+
 async function loadAll() {
   await loadStats()
-  await Promise.all([loadFeedback(), loadHealth()])
+  await Promise.all([loadFeedback(), loadHealth(), loadSourceRank()])
 }
 
 async function markDone(id) {
@@ -312,6 +326,7 @@ onMounted(() => {
     if (document.visibilityState !== 'visible' || needToken.value) return
     loadStats(true)
     loadFeedback(true)
+    loadSourceRank()
   }, 60000)
 })
 
@@ -451,6 +466,11 @@ onUnmounted(() => {
         <!-- 点击日志 -->
         <template v-else-if="route === 'clicks'">
           <ClicksPanel :data="data" />
+        </template>
+
+        <!-- 来源贡献榜 -->
+        <template v-else-if="route === 'source'">
+          <SourceRankPanel :data="sourceRankData" :loading="rankLoading" />
         </template>
 
         <!-- 配置 -->

@@ -88,7 +88,10 @@ async function copyAll() {
               :title="`去站内搜一次「${r.q}」`"
             >{{ r.q }}</a>
             <span class="zk-bar"><i :style="{ width: barW(r) }"></i></span>
-            <span class="zk-n"><b>{{ r.n }}</b><em>/{{ r.total || r.n }}</em></span>
+            <span
+              class="zk-n"
+              :title="Number(r.filtered) > 0 ? `${r.filtered} 次搜到了但标题不含关键词，被过滤掉` : ''"
+            ><b>{{ r.n }}</b><em>/{{ r.total || r.n }}</em><i v-if="Number(r.filtered) > 0" class="zk-filtered">滤</i></span>
             <span v-if="limit === 0" class="zk-plat" :title="plat(r.platforms)">{{ plat(r.platforms) }}</span>
             <span class="zk-t">{{ r.last_ts ? shortTime(r.last_ts) : '-' }}</span>
           </div>
@@ -178,6 +181,17 @@ async function copyAll() {
 }
 .zk-n b { color: var(--ink); font-weight: 600; }
 .zk-n em { font-style: normal; color: var(--faint); }
+.zk-filtered {
+  display: inline-block;
+  margin-left: 4px;
+  padding: 0 3px;
+  border-radius: 3px;
+  background: var(--warn-soft);
+  color: var(--warn-ink);
+  font-size: 10px;
+  font-style: normal;
+  cursor: help;
+}
 
 .zk-plat {
   color: var(--ink-2);

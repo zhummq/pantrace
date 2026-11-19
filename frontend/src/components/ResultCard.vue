@@ -118,6 +118,8 @@ function onClick() {
       // shareUrl 是 /go/ 签名串，后端解 token 落库成真实网盘链接
       url: props.item.shareUrl || '',
       query: props.keyword,
+      // 给这条结果的来源（tg:频道 / plugin:插件）加一分，排行榜据此排序
+      sourceKey: props.item.sourceKey || '',
     },
     { beacon: true }
   )

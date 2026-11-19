@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 
 from ..providers import PLATFORM_NAMES
+from .merge import get_result_source
 from .types import SearchResult
 
 # Link.type → 本项目平台 key。只有 aliyun 不一致（pansou 叫 aliyun，前端叫 ali）。
@@ -77,8 +78,17 @@ def to_item(result: SearchResult) -> dict | None:
     if password is None:
         password = link.password if link is not None else ""
 
+    # 来源标记。前端点击时把它原样带回来，后台据此给该频道/插件加分。
+    # 复用排序用的 get_result_source，保证"排序认为的来源"和"计分认为的来源"
+    # 永远是同一个字符串，不会出现两套命名对不上。
+    source_key = get_result_source(result)
+    source_kind, _, source_name = source_key.partition(":")
+
     return {
         "hsid": extras.get("hsid") or "",
+        "sourceKey": source_key,
+        "sourceKind": source_kind if source_kind in ("tg", "plugin") else "unknown",
+        "sourceName": source_name,
         "platform": platform,
         "platformName": (
             extras.get("platformName")

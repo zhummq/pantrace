@@ -139,6 +139,11 @@ def _day_of(ts: float) -> str:
     return datetime.fromtimestamp(ts, _tz).strftime("%Y-%m-%d")
 
 
+def is_bot(ua: str) -> bool:
+    """给调用方（来源计分）复用同一套机器人判定，避免两处正则漂移。"""
+    return bool(ua and _BOT_RE.search(ua))
+
+
 def _clip(value, limit: int) -> str:
     """截断字符串并去掉控制字符。埋点是外部输入，不能原样落库。"""
     if value is None:
@@ -202,7 +207,7 @@ def record(
         1 if cached else 0,
         "mobile" if re.search(r"Mobile|Android|iPhone|iPad", ua or "") else "desktop",
         1 if is_new else 0,
-        1 if (ua and _BOT_RE.search(ua)) else 0,
+        1 if is_bot(ua) else 0,
         _clip(source, 20),
         json.dumps(meta, ensure_ascii=False)[:500] if meta else "",
     )
@@ -244,8 +249,15 @@ def record_search(
     referer: str = "",
     is_new: bool = False,
     error: str = "",
+    filtered: int = 0,
 ) -> None:
     """搜索事件。由 /api/search 调用，服务端记录，比前端上报可靠（不怕广告拦截）。"""
+    meta = {"page": page}
+    if error:
+        meta["error"] = error
+    if filtered:
+        # 标题过滤掉多少条。零结果榜据此分辨"确实没资源"和"有资源但标题不提关键词"。
+        meta["filtered"] = int(filtered)
     record(
         "search",
         visitor=visitor,
@@ -261,7 +273,7 @@ def record_search(
         result_count=result_count,
         cached=cached,
         is_new=is_new,
-        meta={"page": page, "error": error} if error else {"page": page},
+        meta=meta,
     )
 
 
@@ -371,6 +383,22 @@ def summary(days: int = 7) -> dict:
             zero_keywords = conn.execute(
                 _zero_sql.format(page_filter=""), (start,)
             ).fetchall()
+        # 标题过滤数单独查再合并：放进上面那条 SQL 会让 JSON1 缺失时连兜底分支
+        # 一起炸。过滤数是诊断信息，少这一个数字也不能让零结果榜整块空掉。
+        filtered_by_query: dict[str, int] = {}
+        try:
+            for row in conn.execute(
+                """SELECT query AS q,
+                          SUM(CAST(json_extract(meta,'$.filtered') AS INTEGER)) AS n
+                   FROM events
+                   WHERE kind='search' AND ts >= ? AND ok=1 AND result_count=0
+                         AND bot=0 AND query<>''
+                   GROUP BY query""",
+                (start,),
+            ):
+                filtered_by_query[row["q"]] = int(row["n"] or 0)
+        except sqlite3.Error:
+            pass
         platforms = conn.execute(
             """SELECT platform AS key, COUNT(*) AS n
                FROM events
@@ -489,6 +517,8 @@ def summary(days: int = 7) -> dict:
                 "q": r["q"],
                 "n": r["n"],
                 "total": r["total"],
+                # 零结果里有多少其实"搜到了但标题不匹配"，运营据此决定补资源还是改词
+                "filtered": filtered_by_query.get(r["q"], 0),
                 "last_ts": int(r["last_ts"] or 0),
                 "platforms": r["platforms"] or "",
             }

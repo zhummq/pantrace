@@ -148,6 +148,8 @@ export function track(kind, data = {}, opts = {}) {
       target: data.target || '',
       url: data.url || '',
       source: data.source || '',
+      // 结果来自哪个 TG 频道 / 插件，用于来源贡献分（只有 click 事件带）
+      sourceKey: data.sourceKey || '',
       durationMs: Number(data.durationMs) || 0,
       ok: data.ok !== false,
       resultCount: Number.isFinite(data.resultCount) ? data.resultCount : -1,
