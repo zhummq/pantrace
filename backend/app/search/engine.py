@@ -1,8 +1,11 @@
-"""搜索编排：把启用的源并发跑一轮 → 合并去重 → 排序 → 本地分页。
+"""搜索编排：按用户选的通道并发跑一轮 → 合并去重 → 排序 → 本地分页。
 
 这是 `/api/search` 的唯一取数入口，替代原来的 `providers.search()` 同步单通道：
 以前是一条上游、一次调用、结果直接透传；现在是多个插件、各自有 4~6 秒窗口和
 `complete` 语义缓存，出口再统一成前端要的 items 形状。
+
+通道只有 tg / plugin 两档，各跑各的，**不做自动降级**：TG 零结果就是零结果，
+换源是用户自己的决定。原先"TG 搜不到自动走 haisou"的链路已从产品到后端一并移除。
 ## 分页为什么在本地
 
 pansou 的插件 `fetch()` 只返回结果列表，没有 `total` 这类元信息（它整个搜索就是
@@ -136,14 +139,14 @@ def _filter_platforms(items: list[dict], platforms: list[str]) -> list[dict]:
     return [item for item in items if item.get("platform") in wanted]
 
 
-# ---- 通道分层：TG 是基础通道，计费接口只做兜底 ----
+# ---- 通道：两档各跑各的，没有自动降级 ----
 #
-# 这一点和 pansou 的 `sourceType` 语义不同，是**故意的**：
-# pansou 的 all 是 "TG ∥ 插件" 两条分支同时跑；本项目 TG 是主力，haisou 是按量计费
-# 的兜底。所以走串行降级：TG 拿到可用结果就结束，一条额度都不花；TG 空/失败/没覆盖
-# 用户选的网盘，才去调接口。
+# 用户明确选 tg 或 plugin，引擎只跑对应那一档，绝不"搜不到就偷偷换源"。
+# 选 TG 零结果就是零结果，换源由用户自己点——产品上已经砍掉了 auto 档，
+# 后端不再保留 TG→haisou 的串行降级链路。
 TIER_TG = "tg"
 TIER_PLUGIN = "plugin"
+VALID_SOURCES = (TIER_TG, TIER_PLUGIN)
 
 
 class SourceNotEnabledError(SearchEngineError):
@@ -154,31 +157,13 @@ class SourceNotEnabledError(SearchEngineError):
     """
 
 
-def _split_tiers(plugins: list) -> tuple[list, list]:
-    """按 source_kind 拆成 (TG 层, 兜底层)。保持配置里的顺序。"""
-    tg: list = []
-    rest: list = []
-    for plugin in plugins:
-        if getattr(plugin, "source_kind", "plugin") == TIER_TG:
-            tg.append(plugin)
-        else:
-            rest.append(plugin)
-    return tg, rest
-
-
-def _covers_platforms(results: list, platforms: list[str]) -> bool:
-    """这一层的结果里有没有用户要的网盘。
-
-    TG 频道的分享横跨所有网盘，用户选"百度"时它可能只返回夸克——这时候
-    虽然"拿到了结果"，但这个结果对用户没用，仍然得往下兜底。
-    `platforms` 为空是"不限平台"，有任何结果就算覆盖。
-    """
-    if not results:
-        return False
-    if not platforms:
-        return True
-    wanted = set(platforms)
-    return any(adapter.platform_of(r) in wanted for r in results)
+def _pick_plugins(plugins: list, source: str) -> list:
+    """按选择的通道挑插件：tg 只取 TG 层，plugin 只取接口层。保持配置顺序。"""
+    return [
+        p for p in plugins
+        if getattr(p, "source_kind", TIER_PLUGIN)
+        == (TIER_TG if source == TIER_TG else TIER_PLUGIN)
+    ]
 
 
 async def search(
@@ -187,41 +172,33 @@ async def search(
     page: int,
     page_size: int,
     scope: str,
-    source: str = "auto",
+    source: str = TIER_TG,
     force_refresh: bool = False,
 ) -> dict:
     """返回结构与 `providers.search()` 一致：items + pagination + _meta。
 
-    `source` 对齐 pansou 的 `src`，但 **all/auto 的含义是分层降级而非并行**：
+    `source` 只有两档，各跑各的、**没有自动降级**：
 
-    - `auto` / `all`：TG 先跑，拿不到可用结果再跑计费接口（默认）
-    - `tg`：只跑 TG，绝不碰接口（调试用，也保证零成本）
-    - `plugin`：只跑接口，跳过 TG（TG 挂了时手动切）
+    - `tg`（默认）：只跑 TG，零结果就是零结果，绝不碰计费接口
+    - `plugin`：只跑接口，跳过 TG
 
-    `force_refresh` 只影响**插件级缓存**（`ext["refresh"]`）：跳过读、结果照常写回。
-    响应层缓存在 main.py，那边要各自判断，不在这里管。
-
-    缓存在 main.py 里按 source 分了键，`auto` 与 `tg` 不会互相污染。
+    换源是用户自己的决定，引擎不替他偷偷换通道。`force_refresh` 只影响插件级
+    缓存（跳过读、结果照常写回）；响应层缓存在 main.py 按 source 分键，两档不互相污染。
     """
     plugins = registry.loaded()
     if not plugins:
         raise SearchEngineError(
             "没有启用任何搜索源（ENABLED_SOURCES 为空或全部加载失败）"
         )
+    if source not in VALID_SOURCES:
+        raise SourceNotEnabledError(
+            f"未知的来源类型：{source}（可用 tg/plugin）"
+        )
 
-    tg_plugins, fallback_plugins = _split_tiers(plugins)
-
-    # 组装本次要依次尝试的层。空层直接跳过 —— 只启用 haisou 时就是"直接走接口"，
-    # 和改造前行为一致，不会因为多了 TG 这层而报错。
-    if source == TIER_TG:
-        tiers = [(TIER_TG, tg_plugins)]
-    elif source == TIER_PLUGIN:
-        tiers = [(TIER_PLUGIN, fallback_plugins)]
-    else:
-        tiers = [(TIER_TG, tg_plugins), (TIER_PLUGIN, fallback_plugins)]
-
-    tiers = [(kind, plugs) for kind, plugs in tiers if plugs]
-    if not tiers:
+    # 只挑用户选的那一档。空档 = 配置没开这个源，报 400 让运维去查配置，
+    # 绝不退到另一档——那等于又变回了自动降级。
+    plugs = _pick_plugins(plugins, source)
+    if not plugs:
         raise SourceNotEnabledError(
             f"{source} 通道没有启用任何源（当前已启用：{', '.join(p.name for p in plugins)}）"
         )
@@ -234,56 +211,37 @@ async def search(
     submitted: list[str] = []
     round_info: dict[str, dict] = {}
     results: list = []
-    used_tier = ""
     # 标题不含关键词被丢掉的总数。前端据此区分"真没资源"和"有资源但标题不匹配"，
     # 也方便排查过滤是不是过严（例如搜"三体全集"、标题写"《三体》全集"）。
     filtered_total = 0
 
-    for kind, plugs in tiers:
-        # 各源自己就有窗口和超时，这里只负责并发起跑。BasePlugin.search() 从不外抛：
-        # 失败会包进 PluginOutcome.failure，所以不用 return_exceptions。
-        outcomes = await asyncio.gather(*(p.search(query, ext) for p in plugs))
-        collected: list = []
-        tier_filtered = 0
-        for outcome in outcomes:
-            # 健康度按原始产出记：抓到了但标题不匹配 ≠ 源坏了，不能记成 zero_yield。
-            batch.observe(
-                outcome.source, len(outcome.results),
-                _as_error(outcome), timed_out=outcome.pending,
-            )
-            # ---- 关键词过滤（在降级判定之前）----
-            # t.me 的 ?q= 搜的是整条消息：正文里提到关键词、标题却毫不相干的转发
-            # 占很大比例。必须先过滤再判覆盖，否则"TG 抓到 20 条噪声"会被当成
-            # 命中，挡住本该走的 haisou 兜底。
-            kept, dropped = filter_by_keyword(outcome.results, tokens)
-            tier_filtered += dropped
-            collected.extend(kept)
-            submitted.append(outcome.source)
-            round_info[outcome.source] = {
-                "count": len(outcome.results),
-                # 原始产出里有多少条因标题不符被丢掉，看板能分辨"没抓到"和"抓到但没用"。
-                "filtered": dropped,
-                # pending = 窗口到点还没抓完，不等于失败；前端拿到的可能是旧缓存。
-                "pending": outcome.pending,
-                "failure": outcome.failure.value if outcome.failure else None,
-                "message": outcome.message[:160] if outcome.message else "",
-                "tier": kind,
-            }
-
-        filtered_total += tier_filtered
-        if tier_filtered:
-            log.info("engine q=%s %s 层标题不符过滤 %d 条", query, kind, tier_filtered)
-
-        if _covers_platforms(collected, platforms):
-            results = collected
-            used_tier = kind
-            break
-        # 没覆盖 → 留给下一层。TG 有结果但盘不对时，宁可花一次额度也不给用户空手。
-        if collected:
-            log.info(
-                "engine q=%s %s 层有 %d 条（标题过滤掉 %d）但没覆盖平台 %s，继续兜底",
-                query, kind, len(collected), tier_filtered, platforms,
-            )
+    # 各源自己就有窗口和超时，这里只负责并发起跑。BasePlugin.search() 从不外抛：
+    # 失败会包进 PluginOutcome.failure，所以不用 return_exceptions。
+    outcomes = await asyncio.gather(*(p.search(query, ext) for p in plugs))
+    for outcome in outcomes:
+        # 健康度按原始产出记：抓到了但标题不匹配 ≠ 源坏了，不能记成 zero_yield。
+        batch.observe(
+            outcome.source, len(outcome.results),
+            _as_error(outcome), timed_out=outcome.pending,
+        )
+        # t.me 的 ?q= 搜的是整条消息：正文里提到关键词、标题却毫不相干的转发
+        # 占很大比例。标题不符的一律丢掉——现在没有下一档兜底，这一步就是出口。
+        kept, dropped = filter_by_keyword(outcome.results, tokens)
+        filtered_total += dropped
+        results.extend(kept)
+        submitted.append(outcome.source)
+        round_info[outcome.source] = {
+            "count": len(outcome.results),
+            # 原始产出里有多少条因标题不符被丢掉，看板能分辨"没抓到"和"抓到但没用"。
+            "filtered": dropped,
+            # pending = 窗口到点还没抓完，不等于失败；前端拿到的可能是旧缓存。
+            "pending": outcome.pending,
+            "failure": outcome.failure.value if outcome.failure else None,
+            "message": outcome.message[:160] if outcome.message else "",
+            "tier": source,
+        }
+    if filtered_total:
+        log.info("engine q=%s %s 通道标题不符过滤 %d 条", query, source, filtered_total)
 
     batch.finalize(submitted)
 
@@ -306,8 +264,8 @@ async def search(
 
     took_ms = int((time.perf_counter() - started) * 1000)
     log.info(
-        "engine q=%s page=%s 层=%s 源=%s 合并=%s 返回=%s %sms",
-        query, page, used_tier or "-", len(submitted), len(merged), len(page_items), took_ms,
+        "engine q=%s page=%s 通道=%s 源=%s 合并=%s 返回=%s %sms",
+        query, page, source, len(submitted), len(merged), len(page_items), took_ms,
     )
     if batch.failed:
         log.warning("本轮有 %d 个源失败：%s", batch.failed, batch.last_errors)
@@ -319,9 +277,8 @@ async def search(
             # 上游计费字段在插件层没保留（pansou 的 fetch 不返回元信息），
             # 保留这个键只是不让 main.py 和前端拿不到字段。
             "credits": 0,
-            # 这一轮最后是哪个层出的结果：tg = 没花额度，plugin = 兜底花了。
-            # 排查"为什么这次慢了/扣钱了"先看它。
-            "tier": used_tier,
+            # 本次跑的通道（= 用户所选）。没有降级，这一字段恒等于入参 source。
+            "tier": source,
             # 标题不含关键词被丢掉的总条数。前端空结果页据此提示"换个说法"，
             # 看板据此统计过滤率——不把"搜到了但标题不匹配"误记成"网上没有"。
             "filtered": filtered_total,

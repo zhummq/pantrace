@@ -748,7 +748,7 @@ async def search(
     page: int = Query(1, ge=1, le=100),
     page_size: int = Query(20, ge=1, le=settings.max_page_size),
     search_in: str = Query("title", description="title 或 all"),
-    src: str = Query("auto", description="auto/tg/plugin：auto = TG 优先、拿不到才走计费接口"),
+    src: str = Query("tg", description="tg/plugin：tg = 只用 TG（默认）；plugin = 只用海搜接口，不自动降级"),
     refresh: bool = Query(
         False,
         description="跳过响应缓存强制回源。**会真实消耗上游额度**，普通查询不要带",
@@ -793,18 +793,18 @@ async def search(
 
     scope = search_in if search_in in ("title", "all") else "title"
 
-    # 来源通道：TG 是基础通道，拿不到结果才走计费接口（见 engine 分层说明）。
-    # `all` 是 pansou 的叫法，等价于 auto。不认识的值得回 400 —— 静默当 auto
-    # 会让调用方以为筛了通道，其实没筛。
-    source = "auto" if src == "all" else src
-    if source not in ("auto", "tg", "plugin"):
+    # 来源通道：只有 tg / plugin 两档，各跑各的，没有"搜不到自动换源"。
+    # 旧的 auto/all 已随降级链路一起移除，传进来回 400 —— 静默当某档处理
+    # 会让调用方以为筛了通道，其实没筛，也掩盖了还在用旧参数的客户端。
+    source = src
+    if source not in ("tg", "plugin"):
         return JSONResponse(
             status_code=400,
-            content={"code": 400, "msg": f"未知的来源类型：{src}（可用 auto/tg/plugin）"},
+            content={"code": 400, "msg": f"未知的来源类型：{src}（可用 tg/plugin）"},
         )
 
-    # 缓存键必须带通道：不带的话 src=tg 的空结果会顶掉 auto 的真实结果，
-    # 反过来 auto 的兜底结果也会被当成"TG 搜到的"返回。
+    # 缓存键必须带通道：两档各查各的，不带的话 src=tg 的结果会顶掉
+    # src=plugin 的结果，反过来也一样——用户切了来源却拿到另一档的数据。
     cache_key = f"{query}|{','.join(platform_list)}|{page}|{page_size}|{scope}|{source}"
     now = time.time()
 
@@ -868,7 +868,7 @@ async def search(
         要改它必须先 `dict()` 复制。异常原样往外抛：失败也要广播给搭车的请求，
         否则它们各自重试，等于这把锁白加。
         """
-        # 分层降级在 engine 里：先 TG，拿不到可用结果才走计费接口。
+        # engine 只跑用户选的那一档，不做自动降级。
         # 每个源自己的窗口负责"别让用户干等"，超时未跑完的源会在后台继续抓并写缓存。
         result = await search_engine.search(
             query,
@@ -886,8 +886,8 @@ async def search(
             "items": result["items"],
             "pagination": result["pagination"],
             "credits": result["_meta"].get("credits", 0),
-            # 这一轮是哪个通道出的结果：tg = 没花额度，plugin = 兜底花了。
-            # 前端可以用它提示"TG 无结果，已切换备用源"，运维也能一眼看出扣费原因。
+            # 这次跑的通道（= 用户所选），恒为 tg / plugin。前端已不展示它，
+            # 保留在响应里是为了运维和老调用方能一眼看出这次查的是哪一档。
             "tier": result["_meta"].get("tier", ""),
             # 标题不含关键词被丢掉的条数。空结果时前端据此提示"换个说法"，
             # 而不是让用户以为站上根本没有这个资源。

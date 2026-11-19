@@ -46,13 +46,16 @@ async function request(path, params = {}, extraHeaders = {}) {
   return checked(out)
 }
 
-export function searchResources({ q, platforms, page, pageSize, searchIn = 'title', refresh = false }) {
+// source 对齐后端 src：tg = 只用 TG（默认）；plugin = 只用海搜接口（计费）。
+// 前端只暴露这两个明确档，不再用 auto（TG 优先自动降级）。
+export function searchResources({ q, platforms, page, pageSize, searchIn = 'title', source = 'tg', refresh = false }) {
   return request('/api/search', {
     q,
     platforms,
     page,
     page_size: pageSize,
     search_in: searchIn,
+    src: source,
     // 强制回源会真实消耗上游额度（后端按 3 份配额计），只有用户主动点
     // 「强制刷新」才带。翻页 / 换平台 / 检测结论补拉一律走缓存。
     // 传 undefined 时 rawRequest 会跳过，不会给普通请求拼上 refresh=0。

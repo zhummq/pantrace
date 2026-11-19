@@ -29,6 +29,19 @@ const needPlatform = ref(false)
 // 2 个请求。所以这里再没有"全部"这个选项，空值只表示"还没选"。
 const PREF_KEY = 'pt_pref_platform'
 
+// ---- 数据来源 ----
+// 只给用户两个明确选项：仅 TG（零额度）/ 仅海搜（计费接口）。
+// 不再有"TG 优先自动降级"这档——没搜到就是没搜到，用户自己决定换源，
+// 不让后台偷偷换通道。默认仅 TG。
+const SOURCE_OPTIONS = [
+  { key: 'tg', label: '仅 TG', hint: '只查 TG 公开频道，不消耗搜索额度；没有就是没有' },
+  { key: 'plugin', label: '仅海搜', hint: '只查海搜接口，覆盖更全，会消耗搜索额度' },
+]
+const DEFAULT_SOURCE = 'tg'
+const SOURCE_PREF_KEY = 'pt_pref_source'
+const activeSource = ref(DEFAULT_SOURCE)
+const validSourceKeys = new Set(SOURCE_OPTIONS.map((s) => s.key))
+
 const items = ref([])
 const page = ref(1)
 const totalPages = ref(0)
@@ -65,12 +78,7 @@ const resultLabel = computed(() => {
   return '实时结果'
 })
 
-const tierLabel = computed(() => {
-  // TG 通道是内部实现细节，不展示给用户——面板头只需要说清数据是实时/
-  // 缓存/合并来的，不必暴露走的是哪条抓取通道。
-  if (tier.value === 'plugin') return '已切换备用源'
-  return ''
-})
+const sourceMeta = computed(() => SOURCE_OPTIONS.find((s) => s.key === activeSource.value) || SOURCE_OPTIONS[0])
 
 // 序号用于丢弃过期请求：用户连搜两次时，先发那次的后台补拉不能覆盖新结果
 let searchSeq = 0
@@ -255,6 +263,9 @@ function syncUrl() {
   const params = new URLSearchParams()
   if (keyword.value.trim()) params.set('q', keyword.value.trim())
   if (activePlatform.value) params.set('platform', activePlatform.value)
+  // 只有非默认档才写进 URL：分享链接要能还原对方选的来源，
+  // 默认档（仅 TG）留空既缩短链接，接收方也能用自己的偏好。
+  if (activeSource.value !== DEFAULT_SOURCE) params.set('src', activeSource.value)
   if (page.value > 1) params.set('page', String(page.value))
   const qs = params.toString()
   history.replaceState(null, '', qs ? `?${qs}` : location.pathname)
@@ -334,6 +345,7 @@ async function doSearch(targetPage = 1, opts = {}) {
       platforms: activePlatform.value,
       page: targetPage,
       pageSize: PAGE_SIZE,
+      source: activeSource.value,
       refresh: force,
     })
     items.value = data.items || []
@@ -351,7 +363,7 @@ async function doSearch(targetPage = 1, opts = {}) {
         query: q,
         platform: activePlatform.value,
         resultCount: items.value.length,
-        meta: { tier: tier.value, page: targetPage },
+        meta: { tier: tier.value, page: targetPage, source: activeSource.value },
       })
     }
     syncUrl()
@@ -365,6 +377,7 @@ async function doSearch(targetPage = 1, opts = {}) {
         platforms: activePlatform.value,
         page: targetPage,
         pageSize: PAGE_SIZE,
+        source: activeSource.value,
       })
     }
   } catch (e) {
@@ -438,6 +451,41 @@ function writePrefPlatform(key) {
   } catch {
     /* 隐私模式下写不进去，不影响这一次筛选 */
   }
+}
+
+// 来源偏好：和平台一样只记用户主动选过的档。没选过 = 默认（仅 TG）。
+// 老用户 localStorage 里可能还留着已废弃的 auto/plugin 之外的旧值，
+// 过一遍白名单；auto 已被移除，读到它一律回退到默认档。
+function readPrefSource() {
+  try {
+    const v = localStorage.getItem(SOURCE_PREF_KEY) || ''
+    return validSourceKeys.has(v) ? v : DEFAULT_SOURCE
+  } catch {
+    return DEFAULT_SOURCE
+  }
+}
+
+function writePrefSource(key) {
+  try {
+    localStorage.setItem(SOURCE_PREF_KEY, key)
+  } catch {
+    /* 隐私模式下写不进去，不影响这一次切换 */
+  }
+}
+
+// 切换来源 = 一次真实查询。和切平台同理：不重查的话结果面板还是上一条通道的
+// 数据，用户点了"仅 TG"却看到海搜的结果，等于这个开关是假的。
+function pickSource(key) {
+  if (!validSourceKeys.has(key) || key === activeSource.value || busy.value) return
+  activeSource.value = key
+  writePrefSource(key)
+  track('source', {
+    query: lastKeyword.value || keyword.value.trim(),
+    platform: activePlatform.value,
+    meta: { source: key },
+  })
+  // 尚未搜过就不发空查询，只把选择记下来留给下一次搜索。
+  if (searched.value) doSearch(1)
 }
 
 // 按选中的网盘查上游：单平台查询拿到的是这个平台自己的完整排序，
@@ -523,6 +571,15 @@ onMounted(async () => {
   } else {
     const pref = readPrefPlatform()
     activePlatform.value = pref && validKeys.has(pref) ? pref : ''
+  }
+
+  // 来源：分享链接里的 src 优先（还原对方选的通道），否则用上次主动选的档。
+  // 两处都过白名单：URL 是用户可改的，塞个 plugin 之外的乱值不能污染状态。
+  const urlSource = params.get('src') || ''
+  if (urlSource && validSourceKeys.has(urlSource)) {
+    activeSource.value = urlSource
+  } else {
+    activeSource.value = readPrefSource()
   }
 
   // 群配置：拉不到就当没有，不影响主流程
@@ -656,9 +713,29 @@ onBeforeUnmount(() => {
         <!-- 平台筛选放在搜索框正下方：这一行本身就是"收录了哪些网盘"的说明书，
              不用先去搜一次才知道能筛什么。**必须选一个**——没选就不发搜索请求，
              因为每个网盘都是一次独立计费上游查询。 -->
-        <div class="filter-rows" :class="{ 'need-pick': needPlatform }" role="group" aria-label="选择网盘">
+        <div class="filter-rows" :class="{ 'need-pick': needPlatform }" role="group" aria-label="选择搜索来源与网盘">
+          <!-- 来源切换：从哪查。两档明确可选——仅 TG / 仅海搜，默认仅 TG；
+               没有"自动降级"这种偷偷换源。和网盘一样，点一下就是一次真实查询。 -->
+          <div class="frow source-row">
+            <span class="frow-label">来源</span>
+            <div class="frow-body">
+              <button
+                v-for="s in SOURCE_OPTIONS"
+                :key="s.key"
+                type="button"
+                class="schip"
+                :class="{ on: activeSource === s.key }"
+                :title="s.hint"
+                :disabled="busy"
+                @click="pickSource(s.key)"
+              >
+                {{ s.label }}
+              </button>
+            </div>
+            <span class="source-hint mono">{{ sourceMeta.hint }}</span>
+          </div>
           <div class="frow">
-            <span class="frow-label">{{ needPlatform ? '先选一个' : '云盘' }}</span>
+            <span class="frow-label platform-label">{{ needPlatform ? '先选一个' : '云盘' }}</span>
             <div class="frow-body">
               <button
                 v-for="p in platforms"
@@ -729,7 +806,6 @@ onBeforeUnmount(() => {
           </span>
           <div class="panel-tools">
             <span class="state-chip" :class="{ saved: cached || shared }">{{ resultLabel }}</span>
-            <span v-if="tierLabel" class="state-chip">{{ tierLabel }}</span>
             <button
               class="refresh-btn"
               type="button"
@@ -1195,9 +1271,52 @@ onBeforeUnmount(() => {
   color: var(--brand-400);
 }
 
-/* 缺的就是这一步：把标签点亮点，视线自然会落到该点的地方 */
-.filter-rows.need-pick .frow-label {
+/* 缺的就是这一步：只点亮云盘标签——来源是次要筛选，不该跟着一起变红 */
+.filter-rows.need-pick .frow-label.platform-label {
   color: var(--brand-400);
+}
+
+/* ---- 来源切换 ---- */
+/* 比云盘 chip 轻一档：静止态只有淡描边、选中态青绿软底（非实心），
+   和云盘的实心亮绿拉开层级——来源是"从哪查"，云盘是"查哪个"，主次分明。 */
+.schip {
+  height: 28px;
+  padding: 0 13px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  font-size: var(--text-sm);
+  color: var(--muted);
+  transition:
+    background-color var(--dur-2) var(--ease),
+    border-color var(--dur-2) var(--ease),
+    color var(--dur-2) var(--ease);
+}
+
+.schip:hover:not(.on):not(:disabled) {
+  border-color: var(--brand-ring);
+  color: var(--ink-2);
+}
+
+.schip.on {
+  border-color: var(--brand-ring);
+  background: var(--brand-soft);
+  color: var(--brand-ink);
+  font-weight: 600;
+}
+
+.schip:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* 说明文字跟在 chip 下方、对齐内容列（grid 第 2 列），独占一行。
+   三个档各一句话，用户切换时不用猜 auto/plugin 是什么意思。 */
+.source-hint {
+  grid-column: 2;
+  margin-top: calc(-1 * var(--sp-1));
+  font-size: var(--text-xs);
+  color: var(--faint);
 }
 
 .frow-label {
@@ -1923,6 +2042,12 @@ onBeforeUnmount(() => {
   .frow-label {
     padding-top: 0;
     text-align: left;
+  }
+
+  /* 单列时说明文字回到第 1 列，别在 2 列位置撑出一条空白 */
+  .source-hint {
+    grid-column: 1;
+    margin-top: 0;
   }
 
   /* 手机上十几个平台自然排成四行。不做限高滚动：

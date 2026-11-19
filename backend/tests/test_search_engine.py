@@ -162,7 +162,7 @@ class FakePlugin:
 
 
 class EngineBase(unittest.TestCase):
-    def search(self, plugins, platforms=None, page=1, page_size=20, source="auto",
+    def search(self, plugins, platforms=None, page=1, page_size=20, source="plugin",
                force_refresh=False):
         with patch.object(engine.registry, "loaded", return_value=plugins):
             return run(engine.search(
@@ -274,8 +274,8 @@ class TestEngine(EngineBase):
         plugin = FakePlugin("a", rows)
 
         with patch.object(engine.registry, "loaded", return_value=[plugin]):
-            first = run(engine.search("三体", [], 1, 10, "title"))
-            second = run(engine.search("三体", [], 2, 10, "title"))
+            first = run(engine.search("三体", [], 1, 10, "title", source="plugin"))
+            second = run(engine.search("三体", [], 2, 10, "title", source="plugin"))
 
         self.assertEqual(len(first["items"]), 10)
         self.assertEqual(len(second["items"]), 10)
@@ -285,11 +285,10 @@ class TestEngine(EngineBase):
         self.assertEqual(first["pagination"]["totalPages"], 3)
 
 
-class TestTierFallback(EngineBase):
-    """TG 是基础通道，计费接口是兜底。这组测的是"该不该花那份钱"。
+class TestSourceChannels(EngineBase):
+    """两档各跑各的：选 tg 只跑 TG、选 plugin 只跑接口，没有自动降级。
 
-    和 pansou 的差异也在这：它 all 是两条分支并行跑，我们串行降级，
-    所以"TG 命中时 haisou 一次请求都没发"是一条必须成立的断言。
+    "TG 零结果不许偷偷换源"是这组的核心断言——换源是用户自己的决定。
     """
 
     def tg(self, **kw):
@@ -298,65 +297,46 @@ class TestTierFallback(EngineBase):
     def api(self, **kw):
         return FakePlugin("haisou", kind="plugin", **kw)
 
-    def test_tg_hit_skips_paid_source(self):
-        tg = self.tg(results=[result("tg-1")])
-        api = self.api(results=[result("haisou-1")])
-
-        data = self.search([tg, api])
-
-        self.assertEqual(data["_meta"]["tier"], "tg")
-        self.assertIsNone(api.seen_ext)          # 一次请求都没发
-        self.assertEqual([i["hsid"] for i in data["items"]], ["h-tg-1"])
-
-    def test_tg_empty_falls_back(self):
-        tg = self.tg(results=[])
-        api = self.api(results=[result("haisou-1")])
-
-        data = self.search([tg, api])
-
-        self.assertEqual(data["_meta"]["tier"], "plugin")
-        self.assertIsNotNone(api.seen_ext)
-        self.assertEqual(len(data["items"]), 1)
-
-    def test_tg_failure_falls_back(self):
-        tg = self.tg(failure=FailureClass.NETWORK)
-        api = self.api(results=[result("haisou-1")])
-
-        data = self.search([tg, api])
-
-        self.assertEqual(data["_meta"]["tier"], "plugin")
-        self.assertEqual(len(data["items"]), 1)
-
-    def test_tg_pending_without_results_falls_back(self):
-        """窗口到点没抓完、手上又没旧缓存：不能接着等第二个窗口。"""
-        tg = self.tg(results=[], pending=True)
-        api = self.api(results=[result("haisou-1")])
-
-        data = self.search([tg, api])
-
-        self.assertEqual(data["_meta"]["tier"], "plugin")
-        self.assertEqual(len(data["items"]), 1)
-
-    def test_tg_results_without_wanted_platform_falls_back(self):
-        """TG 有结果但全是夸克、用户要百度：仍要兜底，否则用户拿到空。"""
-        tg = self.tg(results=[result("tg-1", platform="quark")])
-        api = self.api(results=[result("haisou-1", platform="baidu")])
-
-        data = self.search([tg, api], platforms=["baidu"])
-
-        self.assertEqual(data["_meta"]["tier"], "plugin")
-        self.assertEqual({i["platform"] for i in data["items"]}, {"baidu"})
-
-    def test_src_tg_never_touches_paid_source(self):
-        """src=tg 是零成本通道：就算 TG 一条都没有，也不许调接口。"""
+    def test_src_tg_empty_never_touches_paid_source(self):
+        """TG 零结果是正常零结果，绝不因为"没搜到"就去调计费接口。"""
         tg = self.tg(results=[])
         api = self.api(results=[result("haisou-1")])
 
         data = self.search([tg, api], source="tg")
 
+        self.assertIsNone(api.seen_ext)          # 一次请求都没发
+        self.assertEqual(data["items"], [])
+        self.assertEqual(data["_meta"]["tier"], "tg")
+
+    def test_src_tg_failure_never_touches_paid_source(self):
+        """TG 挂了也不降级：报错走 504，而不是花钱换海搜的结果。"""
+        tg = self.tg(failure=FailureClass.NETWORK)
+        api = self.api(results=[result("haisou-1")])
+
+        with self.assertRaises(engine.SearchEngineError):
+            self.search([tg, api], source="tg")
+        self.assertIsNone(api.seen_ext)
+
+    def test_src_tg_platform_mismatch_is_not_filled_by_paid_source(self):
+        """TG 只返回夸克、用户要百度：过滤后为空也不许拿海搜来填。"""
+        tg = self.tg(results=[result("tg-1", platform="quark")])
+        api = self.api(results=[result("haisou-1", platform="baidu")])
+
+        data = self.search([tg, api], platforms=["baidu"], source="tg")
+
         self.assertIsNone(api.seen_ext)
         self.assertEqual(data["items"], [])
-        self.assertEqual(data["_meta"]["tier"], "")
+        self.assertEqual(data["_meta"]["tier"], "tg")
+
+    def test_src_tg_hit(self):
+        tg = self.tg(results=[result("tg-1")])
+        api = self.api(results=[result("haisou-1")])
+
+        data = self.search([tg, api], source="tg")
+
+        self.assertEqual(data["_meta"]["tier"], "tg")
+        self.assertIsNone(api.seen_ext)
+        self.assertEqual([i["hsid"] for i in data["items"]], ["h-tg-1"])
 
     def test_src_plugin_skips_tg(self):
         tg = self.tg(results=[result("tg-1")])
@@ -366,39 +346,32 @@ class TestTierFallback(EngineBase):
 
         self.assertIsNone(tg.seen_ext)
         self.assertEqual(data["_meta"]["tier"], "plugin")
+        self.assertEqual(len(data["items"]), 1)
 
     def test_src_tg_without_tg_source_is_config_error(self):
         with self.assertRaises(engine.SourceNotEnabledError):
             self.search([self.api(results=[result("haisou-1")])], source="tg")
 
-    def test_only_paid_source_means_no_tier_switch(self):
-        """只启用 haisou（线上当前配置）：auto 直接走它，不报错、不多等一轮。"""
+    def test_src_plugin_without_paid_source_is_config_error(self):
+        with self.assertRaises(engine.SourceNotEnabledError):
+            self.search([self.tg(results=[result("tg-1")])], source="plugin")
+
+    def test_unknown_source_is_rejected(self):
+        """auto/all 已随降级链路移除，不能静默当某档处理。"""
         api = self.api(results=[result("haisou-1")])
+        for bad in ("auto", "all", "haisou", ""):
+            with self.assertRaises(engine.SourceNotEnabledError):
+                self.search([api], source=bad)
 
-        data = self.search([api])
-
-        self.assertEqual(data["_meta"]["tier"], "plugin")
-        self.assertEqual(len(data["items"]), 1)
-
-    def test_both_tiers_failing_raises(self):
+    def test_last_round_records_selected_channel(self):
         tg = self.tg(failure=FailureClass.NETWORK)
-        api = self.api(failure=FailureClass.SERVER_ERROR)
 
         with self.assertRaises(engine.SearchEngineError):
-            self.search([tg, api])
+            self.search([tg], source="tg")
 
-    def test_tg_failure_is_recorded_even_when_fallback_succeeds(self):
-        """兜底成功也要留下 TG 的失败痕迹，否则查不出"主力通道已经挂了"。"""
-        tg = self.tg(failure=FailureClass.NETWORK)
-        api = self.api(results=[result("haisou-1")])
-
-        data = self.search([tg, api])
-
-        self.assertEqual(len(data["items"]), 1)
         rounds = engine.last_round()
         self.assertEqual(rounds["tg_searchers"]["failure"], "network")
         self.assertEqual(rounds["tg_searchers"]["tier"], "tg")
-        self.assertEqual(rounds["haisou"]["tier"], "plugin")
 
 
 class TestForceRefresh(EngineBase):

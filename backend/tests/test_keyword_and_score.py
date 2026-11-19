@@ -107,7 +107,7 @@ class TestSourceMark(unittest.TestCase):
 
 
 class EngineKeywordBase(unittest.TestCase):
-    def search(self, plugins, query="三体", platforms=None, source="auto"):
+    def search(self, plugins, query="三体", platforms=None, source="plugin"):
         with patch.object(engine.registry, "loaded", return_value=plugins):
             return run(engine.search(
                 query, list(platforms or []), 1, 20, "title", source=source,
@@ -115,49 +115,48 @@ class EngineKeywordBase(unittest.TestCase):
 
 
 class TestEngineKeyword(EngineKeywordBase):
-    def test_title_filter_applied_before_tier_decision(self):
-        """TG 有结果但标题全不含关键词 -> 过滤空 -> 走 haisou 兜底。"""
-        tg = FakePlugin(
-            "tg_searchers", [result("tg-x", "无关转发", channel="ch1")], kind="tg",
-        )
-        hs = FakePlugin("haisou", [result("haisou-1", "三体 全集")])
-        data = self.search([tg, hs])
+    """关键词过滤在各档内部生效；过滤空了就是空，不再跨档兜底。"""
+
+    def test_title_filter_keeps_matching_drops_noise(self):
+        hs = FakePlugin("haisou", [
+            result("haisou-1", "三体 全集"),
+            result("haisou-2", "完全无关的转发"),
+        ])
+        data = self.search([hs], source="plugin")
 
         self.assertEqual([i["title"] for i in data["items"]], ["三体 全集"])
-        self.assertEqual(data["_meta"]["tier"], "plugin")
         self.assertEqual(data["_meta"]["filtered"], 1)
+        self.assertEqual(data["_meta"]["tier"], "plugin")
 
-    def test_tg_hit_wins_when_title_matches(self):
-        """标题匹配就不花兜底的额度。"""
+    def test_tg_title_matching_carries_channel_source(self):
         tg = FakePlugin("tg_searchers", [result("tg-x", "三体 全集", channel="ch1")], kind="tg")
-        hs = FakePlugin("haisou", [result("haisou-1", "三体 另一种")])
-        data = self.search([tg, hs])
+        data = self.search([tg], source="tg")
 
         self.assertEqual(data["_meta"]["tier"], "tg")
         self.assertEqual(len(data["items"]), 1)
         self.assertEqual(data["items"][0]["sourceKey"], "tg:ch1")
 
-    def test_both_tiers_filtered_returns_empty_with_diagnostic(self):
-        tg = FakePlugin("tg_searchers", [result("tg-x", "无关", channel="ch1")], kind="tg")
-        hs = FakePlugin("haisou", [result("haisou-1", "也不相关")])
-        data = self.search([tg, hs])
+    def test_all_titles_filtered_returns_empty_with_diagnostic(self):
+        """标题全不含关键词 = 正常零结果，不抛 504，也不去另一档捞。"""
+        hs = FakePlugin("haisou", [
+            result("haisou-1", "无关"),
+            result("haisou-2", "也不相关"),
+        ])
+        data = self.search([hs], source="plugin")
 
         self.assertEqual(data["items"], [])
         self.assertEqual(data["_meta"]["filtered"], 2)
-        # 没有失败，不能抛 504——这是"没有匹配资源"，不是"源全挂了"。
-        self.assertEqual(data["_meta"]["tier"], "")
-
-    def test_filter_respects_platform_coverage(self):
-        """过滤后剩的平台不对，仍要继续兜底。"""
-        tg = FakePlugin(
-            "tg_searchers", [result("tg-x", "三体 百度", channel="ch1", platform="baidu")],
-            kind="tg",
-        )
-        hs = FakePlugin("haisou", [result("haisou-1", "三体 夸克")])
-        data = self.search([tg, hs], platforms=["quark"])
-
         self.assertEqual(data["_meta"]["tier"], "plugin")
-        self.assertEqual(data["items"][0]["platform"], "quark")
+
+    def test_filter_then_platform_filter(self):
+        """标题匹配但平台不符 → 出口被平台过滤掉，不跨档兜底。"""
+        tg = FakePlugin(
+            "tg_searchers", [result("tg-x", "三体 百度", platform="baidu")], kind="tg",
+        )
+        data = self.search([tg], platforms=["quark"], source="tg")
+
+        self.assertEqual(data["items"], [])
+        self.assertEqual(data["_meta"]["tier"], "tg")
 
 
 class TestSourceScore(unittest.TestCase):
