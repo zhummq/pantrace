@@ -17,7 +17,12 @@ import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlparse
 
-# 允许转存的分享域名白名单。不在名单里的链接不进 SDK，直接给原链接
+# 可识别的分享域名白名单。不在名单里的链接识别成 unknown，不进展示链路。
+#
+# 早期这份名单等于"我们能转存的盘"，123 / 天翼被排除在外——后果是它们
+# `parse().ok` 为 False，被 `store._prepare` 静默丢掉，一条都进不了库。
+# 2026-11 放开：**能识别的盘都要能入库**，转存不了只是 `/go` 回退原链接，
+# 那是响应时的事，不该在写入前就判死。
 ALLOWED_HOSTS = frozenset({
     "pan.quark.cn",
     "pan.baidu.com",
@@ -30,6 +35,21 @@ ALLOWED_HOSTS = frozenset({
     "caiyun.139.com",
     "www.alipan.com",
     "www.aliyundrive.com",
+    # 123 云盘：主域名之外还有一批短域名在轮换，同一个分享会在不同域名下出现
+    "www.123pan.com",
+    "123pan.com",
+    "www.123pan.cn",
+    "123pan.cn",
+    "www.123684.com",
+    "123684.com",
+    "www.123865.com",
+    "123865.com",
+    "www.123912.com",
+    "123912.com",
+    "www.123592.com",
+    "123592.com",
+    # 天翼云盘
+    "cloud.189.cn",
 })
 
 PASSCODE_RE = re.compile(
@@ -55,6 +75,10 @@ class _Rule:
     platform: str
     pattern: re.Pattern[str]
     fid_prefix: str = ""
+    # 是否用 PASSCODE_RE 从整条 URL 里抠提取码。
+    # 天翼新版 `/web/share?code=xxx` 必须关掉：`code=` 是分享 id 不是提取码，
+    # `PASSCODE_RE` 里正好也有 `code=`，开着会把 `Qn2mYv` 截成 `Qn2m` 当密码。
+    scan_passcode: bool = True
 
 
 _RULES: tuple[_Rule, ...] = (
@@ -65,6 +89,22 @@ _RULES: tuple[_Rule, ...] = (
     _Rule("baidu", re.compile(r"pan\.baidu\.com/share/init\?surl=([a-zA-Z0-9_-]+)", re.I), "1"),
     _Rule("xunlei", re.compile(r"pan\.xunlei\.com/s/([a-zA-Z0-9_-]+)", re.I)),
     _Rule("ali", re.compile(r"(?:alipan|aliyundrive)\.com/s/([a-zA-Z0-9_-]+)", re.I)),
+    # 123：多个短域名轮换，分享页有时带 .html 尾巴，共享 id 本身允许连字符
+    _Rule(
+        "123",
+        re.compile(
+            r"123(?:pan|684|865|912|592)\.(?:com|cn)/s/([a-zA-Z0-9_-]+?)(?:\.html)?(?=[?#]|$)",
+            re.I,
+        ),
+    ),
+    # 天翼两种形态：老的 /t/<id>，新的 /web/share?code=<id>。
+    # 老的 /t/ 后面常直接粘中文"（访问码：xxxx）"，字符集收到中文之前就停。
+    _Rule("tianyi", re.compile(r"cloud\.189\.cn/t/([a-zA-Z0-9_-]+)", re.I)),
+    _Rule(
+        "tianyi",
+        re.compile(r"cloud\.189\.cn/web/share\?(?:[^#]*?[&?])?code=([a-zA-Z0-9_-]+)", re.I),
+        scan_passcode=False,
+    ),
 )
 
 # 光鸭的分享 id 常在 query 里，大小写还不统一，单独处理
@@ -85,6 +125,46 @@ def normalize(raw_url: str) -> str:
 def extract_passcode(text: str) -> str:
     match = PASSCODE_RE.search(text or "")
     return match.group(1) if match else ""
+
+
+_QUERY_PWD_KEYS = ("pwd", "passcode", "accessCode", "password")
+
+# 粘在链接尾巴上的括号段。微信里复制出来的分享文案长这样：
+#   https://cloud.189.cn/t/AbCdEfGh（访问码：3f2a）
+# clean.py 的正则是**故意**把括号段一起提出来让 `extract_passcode` 能取到码的，
+# 所以走到这一步 url 一定带着它。原样存库，`/go` 回跳过去的 path 就是个 404。
+_GLUED_TAILS = ("（", "(", "%EF%BC%88", "%E3%80%90", "%5B")
+
+
+def _strip_glued_tail(url: str) -> str:
+    cut = len(url)
+    for marker in _GLUED_TAILS:
+        pos = url.find(marker)
+        if pos != -1:
+            cut = min(cut, pos)
+    if cut == len(url):
+        return url
+    # 截断点之前可能留了空格或多余标点，一起收掉
+    return url[:cut].strip(" \t）)")
+
+
+def _query_passcode(url: str) -> str:
+    """只看 query 里的显式密码字段。
+
+    给"query 本身就含 code= 分享 id"的平台用（天翼 /web/share）。这类链接上
+    没有提取码语义，宁可留空——留空最多是多问一次，猜错是直接把用户送进
+    "提取码错误"页面。
+    """
+    try:
+        query = parse_qs(urlparse(url).query)
+    except ValueError:
+        return ""
+    lowered = {k.lower(): v for k, v in query.items()}
+    for key in _QUERY_PWD_KEYS:
+        values = query.get(key) or lowered.get(key.lower()) or []
+        if values and values[0].strip():
+            return values[0].strip()[:8]
+    return ""
 
 
 def _host_ok(url: str) -> bool:
@@ -160,11 +240,13 @@ def parse(raw_url: str) -> ParsedShare:
     for rule in _RULES:
         match = rule.pattern.search(url)
         if match and match.group(1):
+            code = extract_passcode(url) if rule.scan_passcode else _query_passcode(url)
             return ParsedShare(
                 rule.platform,
                 rule.fid_prefix + match.group(1),
-                extract_passcode(url),
-                url,
+                code,
+                # 取码用原文，落库用去尾的：顺序不能反，反了就把码一起截掉了
+                _strip_glued_tail(url),
             )
 
     for parser in (_guangya, _c139):

@@ -117,16 +117,27 @@ class GateTest(unittest.TestCase):
         self.assertEqual(result.resources, 0)
         self.assertTrue(result.skipped)
 
-    def test_extracted_but_not_transferable(self):
-        """能提取但不在转存白名单的盘（123/天翼）也挡住。
+    def test_123_and_tianyi_are_kept(self):
+        """123 / 天翼没有转存适配器，但必须入库。
 
-        这不是 bug，是口径：库里的链接最终要走 `/go` 转存，没有适配器的平台
-        存进去也点不开。挡在这里，比让用户点了报错好。
+        口径 2026-11 改过。原来挡在这里的理由是"没有 adapter，存进去也点不开"，
+        但 `/go` 本来就有回退原链接这条路（带提取码一起回退），用户照样能拿到
+        文件；挡在入口的代价是库里这几类永远是 0，搜索永远缺一大块，而且
+        123 恰恰是短剧/合集类资源发布最集中的地方。
         """
-        rows = [["标题", "链接"], ["三体", "https://www.123pan.com/s/abcd-efgh"]]
+        rows = [
+            ["标题", "链接"],
+            ["三体", "https://www.123pan.com/s/abcd-efgh"],
+            ["繁花", "https://cloud.189.cn/t/AbCdEfGh（访问码：3f2a）"],
+        ]
         result = intake.parse_rows(rows)
-        self.assertEqual(result.resources, 0)
-        self.assertTrue(any("识别不出" in reason for _, reason in result.skipped))
+        self.assertEqual(result.resources, 2)
+        by_title = {it["title"]: it for it in result.items}
+        self.assertEqual(by_title["三体"]["platform"], "123")
+        self.assertEqual(by_title["繁花"]["platform"], "tianyi")
+        # 码要留下，链接尾巴要干净——两个都得对，否则回退过去是 404
+        self.assertEqual(by_title["繁花"]["sharePwd"], "3f2a")
+        self.assertEqual(by_title["繁花"]["shareUrl"], "https://cloud.189.cn/t/AbCdEfGh")
 
     def test_row_without_link_skipped(self):
         rows = [["标题", "链接"], ["三体", ""], ["繁花", "https://pan.quark.cn/s/b1"]]

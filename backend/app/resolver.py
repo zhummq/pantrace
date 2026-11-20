@@ -68,7 +68,7 @@ _ALLOWED_HOST_RE = re.compile(
     r"(^|\.)("
     r"pan\.quark\.cn|drive\.uc\.cn|pan\.baidu\.com|"
     r"(alipan|aliyundrive)\.com|pan\.xunlei\.com|cloud\.189\.cn|"
-    r"115\.com|(123pan|123684|123865)\.(com|cn)|(caiyun|yun)\.139\.com|"
+    r"115\.com|(123pan|123684|123865|123912|123592)\.(com|cn)|(caiyun|yun)\.139\.com|"
     r"lanzou[a-z]*\.com|ilanzou\.com|share\.weiyun\.com|guangyapan\.com|"
     r"ctfile\.com|pan\.wo\.cn"
     r")$",
@@ -239,7 +239,8 @@ _PWD_PARAM: tuple[tuple[str, str], ...] = (
     (r"(^|\.)lanzou[a-z]*\.com$", "pwd"),
     (r"(^|\.)ilanzou\.com$", "pwd"),
     (r"(^|\.)ctfile\.com$", "pwd"),
-    (r"(^|\.)(123pan|123684|123865)\.(com|cn)$", "pwd"),
+    # 123 的短域名在轮换，少写一个就等于那批链接回退时丢码
+    (r"(^|\.)(123pan|123684|123865|123912|123592)\.(com|cn)$", "pwd"),
     (r"(^|\.)pan\.wo\.cn$", "pwd"),
 )
 

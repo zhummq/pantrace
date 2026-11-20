@@ -59,22 +59,22 @@ ALL_PAN_LINKS = re.compile(
 )
 
 BAIDU_PAN = re.compile(r"https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(?:\?pwd=[a-zA-Z0-9]{4})?", _AI)
-QUARK_PAN = re.compile(r"https?://pan\.quark\.cn/s/[a-zA-Z0-9]+", _AI)
-XUNLEI_PAN = re.compile(r"https?://pan\.xunlei\.com/s/[a-zA-Z0-9]+(?:\?pwd=[a-zA-Z0-9]{4})?(?:#)?", _AI)
+QUARK_PAN = re.compile(r"https?://pan\.quark\.cn/s/[a-zA-Z0-9_-]+", _AI)
+XUNLEI_PAN = re.compile(r"https?://pan\.xunlei\.com/s/[a-zA-Z0-9_-]+(?:\?pwd=[a-zA-Z0-9]{4})?(?:#)?", _AI)
 TIANYI_PAN = re.compile(
-    r"https?://cloud\.189\.cn/t/[a-zA-Z0-9]+(?:%[0-9A-Fa-f]{2})*(?:（[^）]*）)?", _AI
+    r"https?://cloud\.189\.cn/t/[a-zA-Z0-9_-]+(?:%[0-9A-Fa-f]{2})*(?:（[^）]*）)?", _AI
 )
-UC_PAN = re.compile(r"https?://drive\.uc\.cn/s/[a-zA-Z0-9]+(?:\?public=\d)?", _AI)
+UC_PAN = re.compile(r"https?://drive\.uc\.cn/s/[a-zA-Z0-9_-]+(?:\?public=\d)?", _AI)
 PAN123 = re.compile(
     r"https?://(?:www\.)?123(?:684|865|685|912|pan|592)\.(?:com|cn)/s/[a-zA-Z0-9_-]+"
     r"(?:\?(?:%E6%8F%90%E5%8F%96%E7%A0%81|提取码)[:：][a-zA-Z0-9]+)?",
     _AI,
 )
 PAN115 = re.compile(
-    r"https?://(?:115\.com|115cdn\.com|anxia\.com)/s/[a-zA-Z0-9]+(?:\?password=[a-zA-Z0-9]{4})?(?:#)?",
+    r"https?://(?:115\.com|115cdn\.com|anxia\.com)/s/[a-zA-Z0-9_-]+(?:\?password=[a-zA-Z0-9]{4})?(?:#)?",
     _AI,
 )
-ALIYUN_PAN = re.compile(r"https?://(?:www\.)?(?:alipan|aliyundrive)\.com/s/[a-zA-Z0-9]+", _AI)
+ALIYUN_PAN = re.compile(r"https?://(?:www\.)?(?:alipan|aliyundrive)\.com/s/[a-zA-Z0-9_-]+", _AI)
 GUANGYA_PAN = re.compile(r"https?://(?:www\.)?guangyapan\.com/s/[a-zA-Z0-9_-]+", _AI)
 MOBILE_PAN = re.compile(
     r"https?://(?:(?:www\.)?yun\.139\.com/shareweb/#/w/i/[a-zA-Z0-9]+"
