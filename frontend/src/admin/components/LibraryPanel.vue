@@ -81,6 +81,27 @@ const dailyLast = computed(() => {
   return `${fmtStamp(last.at)} ${parts.join('，')}`
 })
 
+// 库每天长了多少。数据来自 store.daily_growth()，口径是 first_seen_at——
+// 搜索顺带入库的和文档订阅进来的都算在内，这里回答的是"库整体在不在长"。
+const spark = computed(() => stats.value.daily || [])
+const newToday = computed(() => Number(stats.value.new_today) || 0)
+const growth14 = computed(() =>
+  spark.value.reduce((sum, d) => sum + (Number(d.added) || 0), 0)
+)
+const sparkMax = computed(() =>
+  Math.max(1, ...spark.value.map((d) => Number(d.added) || 0))
+)
+function barHeight(n) {
+  const h = Math.round(((Number(n) || 0) / sparkMax.value) * 16)
+  // 最少给 2px：0 也留一条底线，否则"那天没长"和"那天没有柱"分不出来
+  return `${Math.max(2, h)}px`
+}
+const sparkTitle = computed(() =>
+  spark.value
+    .map((d) => `${d.day}  +${Number(d.added || 0).toLocaleString('zh-CN')}`)
+    .join('\n')
+)
+
 function kindLabel(kind) {
   return KIND[kind] || kind
 }
@@ -363,6 +384,14 @@ onUnmounted(stopPolling)
         <span v-else-if="daily.enabled === false" class="lib-muted">自动同步未启用</span>
         <span v-if="dailyNext" class="lib-muted">· 下次 {{ dailyNext }}</span>
         <span v-if="dailyLast" class="lib-muted">· 上次 {{ dailyLast }}</span>
+        <span class="lib-spacer" />
+        <span class="lib-growth">
+          今日 <b>+{{ newToday.toLocaleString('zh-CN') }}</b>
+          <span class="lib-muted">· 近 14 天 +{{ growth14.toLocaleString('zh-CN') }}</span>
+        </span>
+        <span v-if="spark.length" class="lib-spark" :title="sparkTitle">
+          <i v-for="d in spark" :key="d.day" :style="{ height: barHeight(d.added) }" />
+        </span>
       </div>
     </div>
 

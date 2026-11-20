@@ -2510,11 +2510,46 @@ textarea::placeholder {
   flex: 1 0 100%;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   padding-top: 10px;
   border-top: 1px solid var(--line);
   font-size: var(--text-xs);
   color: var(--ink-2);
+}
+
+/* 14 天新增的迷你柱。用标题属性的原生 tooltip 报每天数字——为了看一眼趋势
+   去接一个图表库、多画一层坐标轴，不值。 */
+.lib-spark {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 16px;
+  padding-left: 2px;
+}
+
+.lib-spark i {
+  width: 4px;
+  background: var(--brand-400);
+  opacity: 0.4;
+  border-radius: 1px 1px 0 0;
+}
+
+.lib-spark i:last-child {
+  opacity: 1;
+}
+
+.lib-growth {
+  font-size: var(--text-xs);
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.lib-growth b {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--brand-ink);
+  font-variant-numeric: tabular-nums;
 }
 
 .lib-auto-dot {

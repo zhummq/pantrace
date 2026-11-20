@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -500,3 +501,47 @@ class TestMigration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDailyGrowth(StoreTestBase):
+    """按天统计新增。
+
+    这里最容易错的是"归到哪一天"——差八小时会把前一天的新增算到今天，
+    数字看着合理，趋势却是错的，而且没人会去核对。
+    """
+
+    def _set_first_seen(self, ts: int) -> None:
+        con = sqlite3.connect(self.db_path)
+        con.execute("UPDATE resources SET first_seen_at=?", (ts,))
+        con.commit()
+        con.close()
+
+    def test_empty_library_fills_every_day(self):
+        got = store.daily_growth(7)
+        self.assertEqual(len(got), 7)
+        self.assertEqual([g["added"] for g in got], [0] * 7)
+        self.assertEqual(got[-1]["day"], time.strftime("%Y-%m-%d"))
+
+    def test_counts_land_on_the_right_day(self):
+        base = int(time.mktime((2026, 11, 20, 12, 0, 0, 0, 0, -1)))
+        store.ingest([{"shareUrl": "https://pan.quark.cn/s/day1", "title": "甲"}], "t")
+        self._set_first_seen(base - 2 * 86400)
+        got = store.daily_growth(3, base)
+        self.assertEqual([g["day"] for g in got], ["2026-11-18", "2026-11-19", "2026-11-20"])
+        self.assertEqual([g["added"] for g in got], [1, 0, 0])
+
+    def test_today_lands_on_last_bucket(self):
+        store.ingest([{"shareUrl": "https://pan.quark.cn/s/day2", "title": "乙"}], "t")
+        got = store.daily_growth(3)
+        self.assertEqual(got[-1]["added"], 1)
+        self.assertEqual(sum(g["added"] for g in got), 1)
+
+    def test_stats_exposes_daily_and_today(self):
+        store.ingest([{"shareUrl": "https://pan.quark.cn/s/day3", "title": "丙"}], "t")
+        s = store.stats()
+        self.assertEqual(s["new_today"], 1)
+        self.assertEqual(s["daily"][-1]["added"], 1)
+
+    def test_days_is_clamped(self):
+        self.assertEqual(len(store.daily_growth(0)), 1)
+        self.assertEqual(len(store.daily_growth(999)), 90)
