@@ -154,6 +154,25 @@ CREATE TABLE IF NOT EXISTS resource_hits (
     PRIMARY KEY (resource_id, query, day, channel)
 );
 CREATE INDEX IF NOT EXISTS idx_hits_query ON resource_hits(query, day DESC);
+
+-- 内部收集表的订阅：记录每份文档读到哪一行，增量靠它。
+-- 单独一张表而不是塞进 resources：它是"采集配置"，和"资源条目"生命周期不同，
+-- 哪天文档撤了要能一键停订阅而不动已有的资源。
+CREATE TABLE IF NOT EXISTS doc_sources (
+    id          INTEGER PRIMARY KEY,
+    url         TEXT    NOT NULL DEFAULT '',
+    pad_id      TEXT    NOT NULL,
+    tab_id      TEXT    NOT NULL DEFAULT '',
+    title       TEXT    NOT NULL DEFAULT '',
+    last_row    INTEGER NOT NULL DEFAULT 0,
+    last_rev    TEXT    NOT NULL DEFAULT '',
+    last_run_at INTEGER NOT NULL DEFAULT 0,
+    last_ok_at  INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT    NOT NULL DEFAULT '',
+    added_at    INTEGER NOT NULL,
+    enabled     INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_doc_sources ON doc_sources(pad_id, tab_id);
 """
 
 
@@ -722,6 +741,88 @@ def ingest(
     except Exception as exc:  # noqa: BLE001
         log.error("影子回填失败（不影响搜索）：%s", exc, exc_info=True)
         return {"added": 0, "touched": 0}
+
+
+# ---------------------------------------------------------------- 文档订阅
+
+
+def add_doc_source(
+    *,
+    pad_id: str,
+    tab_id: str = "",
+    title: str = "",
+    url: str = "",
+    now: int | None = None,
+) -> dict:
+    """登记一份要长期跟的文档。已有的只补标题和链接，**不动进度**。
+
+    进度不动是刻意的：同一份文档重复登记（换了个带 `?tab=` 的链接、或者
+    手工重跑一次导入）不该把 `last_row` 清零，否则第二天会把 38 万行重拉一遍。
+    """
+    stamp = int(now if now is not None else time.time())
+    with _session() as conn:
+        row = conn.execute(
+            "SELECT id, last_row FROM doc_sources WHERE pad_id=? AND tab_id=?",
+            (pad_id, tab_id),
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE doc_sources SET title=?, url=? WHERE id=?",
+                (title or "", url or "", row["id"]),
+            )
+            return {"id": int(row["id"]), "created": False, "last_row": int(row["last_row"])}
+        cur = conn.execute(
+            "INSERT INTO doc_sources (url, pad_id, tab_id, title, added_at)"
+            " VALUES (?,?,?,?,?)",
+            (url or "", pad_id, tab_id, title or "", stamp),
+        )
+        return {"id": int(cur.lastrowid), "created": True, "last_row": 0}
+
+
+def list_doc_sources(*, enabled_only: bool = False) -> list[dict]:
+    sql = "SELECT * FROM doc_sources"
+    if enabled_only:
+        sql += " WHERE enabled=1"
+    sql += " ORDER BY id"
+    with _session() as conn:
+        return [dict(row) for row in conn.execute(sql)]
+
+
+def save_doc_progress(
+    source_id: int,
+    *,
+    last_row: int | None = None,
+    last_rev: str | None = None,
+    error: str = "",
+    now: int | None = None,
+) -> None:
+    """记一次抓取结果。
+
+    失败也要记（`last_row` 传 None 就不动它）：只更新 `last_run_at` 和
+    `last_error`。这样"连续三天没成功"能从表里直接看出来，
+    而不是等某个没人看的日志。
+    """
+    stamp = int(now if now is not None else time.time())
+    sets = ["last_run_at=?", "last_error=?"]
+    args: list = [stamp, error]
+    if last_row is not None:
+        sets.append("last_row=?")
+        args.append(int(last_row))
+    if last_rev is not None:
+        sets.append("last_rev=?")
+        args.append(last_rev)
+    if not error:
+        sets.append("last_ok_at=?")
+        args.append(stamp)
+    args.append(source_id)
+    with _session() as conn:
+        conn.execute(f"UPDATE doc_sources SET {', '.join(sets)} WHERE id=?", args)
+
+
+def drop_doc_source(source_id: int) -> bool:
+    with _session() as conn:
+        cur = conn.execute("DELETE FROM doc_sources WHERE id=?", (source_id,))
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------- 观测
