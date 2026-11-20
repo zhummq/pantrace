@@ -82,6 +82,12 @@ class Settings(BaseSettings):
     analytics_retain_days: int = 180  # 保留天数，超期自动删
     analytics_rate_per_minute: int = 120  # 单 IP 每分钟上报事件上限，防刷
 
+    # ---- 资源库（本地索引） ----
+    # 影子回填：每次搜索已经拿到的结果顺手落库，**不额外打上游**。为的是把
+    # "每次现抓、抓完就扔"变成"越用越厚"。关掉它搜索行为完全不变，只是库不再增长。
+    library_enabled: bool = True
+    library_db: str = ""              # 留空 = backend/data/library.db
+
     # ---- 反馈 / 求资源 ----
     # 和埋点共用 backend/data/analytics.db，同一个文件备份一次就够。
     # 关掉埋点不影响反馈：一个是统计，一个是工单，别互相绑死。
@@ -267,6 +273,13 @@ class Settings(BaseSettings):
         if self.analytics_db:
             return self.analytics_db
         return str(BACKEND_DIR / "data" / "analytics.db")
+
+    @property
+    def library_path(self) -> str:
+        """资源库路径。和埋点、搜索缓存同目录，备份一次全带走。"""
+        if self.library_db:
+            return self.library_db
+        return str(BACKEND_DIR / "data" / "library.db")
 
     @property
     def search_cache_path(self) -> str:

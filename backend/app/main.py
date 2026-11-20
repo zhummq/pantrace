@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, check, feedback, group, guard, pan, resolver, source_score
+from . import analytics, check, feedback, group, guard, pan, resolver, source_score, store
 from .config import get_settings
 from .search import engine as search_engine
 from .search.cache import SearchCache
@@ -112,6 +112,20 @@ if ANALYTICS_ON:
         log.error("埋点初始化失败，已关闭：%s", exc)
 else:
     log.info("埋点已关闭（ANALYTICS_ENABLED=false）")
+
+# ---- 资源库（本地索引） ----
+# 影子回填：搜索已经拿到的结果顺手落库，不额外打上游、不改任何现有行为。
+# 初始化失败就关闭，搜索照旧——这条链路是纯旁路，任何时候都不许拖垮主流程。
+LIBRARY_ON = settings.library_enabled
+if LIBRARY_ON:
+    try:
+        store.init(settings.library_path)
+        log.info("资源库已启用：%s", settings.library_path)
+    except Exception as exc:  # noqa: BLE001
+        LIBRARY_ON = False
+        log.error("资源库初始化失败，已关闭：%s", exc)
+else:
+    log.info("资源库已关闭（LIBRARY_ENABLED=false）")
 
 # ---- 来源贡献分 ----
 # 和埋点同一个 SQLite 文件，但独立建表、独立计时起点：历史点击不参与排行榜。
@@ -603,6 +617,17 @@ def _export_search(body: dict, background: BackgroundTasks, *, page: int) -> dic
     - 探活只在第一页做。深处页面几乎没人翻，检了纯浪费上游请求。
     """
     body = _apply_hidden(body)
+
+    # 影子回填：位置不能挪，两个原因。
+    # 1) 此刻 `shareUrl` 还是原始网盘链接，`_public_body` 一执行就换成 /go/<token>，
+    #    那之后落库的全是解不开的签名串；
+    # 2) `_apply_hidden` 已经剔掉被多人举报的条目，进库的都是干净的。
+    # 缓存命中也会走到这里——热度要的是"真实搜了多少次"，不是"上游抓了多少次"。
+    if LIBRARY_ON:
+        items = body.get("items") or []
+        if items:
+            background.add_task(store.ingest, items, body.get("query") or "")
+
     if not CHECK_ON:
         return _public_body(body)
 
@@ -683,6 +708,16 @@ def _has_mirror_account() -> bool:
 
 
 @app.get("/api/health")
+def _library_stats() -> dict:
+    """库的体检数据。/api/health 常被监控轮询，库出问题不许把健康检查带挂。"""
+    if not LIBRARY_ON:
+        return {"enabled": False}
+    try:
+        return {"enabled": True, **store.stats()}
+    except Exception as exc:  # noqa: BLE001
+        return {"enabled": True, "error": str(exc)}
+
+
 async def health():
     return {
         "status": "ok",
@@ -720,6 +755,7 @@ async def health():
         "mirror": MIRROR_ON,
         "mirrorAccount": _has_mirror_account(),
         "linkCheck": check.summary() if CHECK_ON else {"enabled": False},
+        "library": _library_stats(),
     }
 
 
