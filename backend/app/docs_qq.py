@@ -21,6 +21,10 @@
    在两边都不占格子，所以这个条件比"等于行数"更宽松、也更对）；不成立就把窗口
    二分继续缩，缩到一行时格子的顺序就是列的先后（`_align_rows`）。
 
+   **但数量相等只是必要条件。** 一行多一个文字格、另一行多一个链接格，总数
+   刚好持平，判据就被骗过去，整块从第一行起错位一行。所以数量相等时还要拿
+   块首行（读空就往后挪一行）做锚点复核（`_anchor_ok`），对不上照样二分。
+
    这条是 2026-11-20 用作者自己的 Excel 截图核对出来的：表里「踢毽子视频教学」右边
    是 `…dQwA1`，而我们配成了 `…DxRA1`（错两行）。之前那句"field N 就是第 N-1 列"
    是错的，别按它改代码。
@@ -661,6 +665,25 @@ def _naive_rows(
     ]
 
 
+def _anchor_ok(
+    pad_id: str, tab_id: str, row: int, text: str, has_link: bool, budget: list[int]
+) -> bool:
+    """拿某一行当锚点，核"按下标配对"是否成立。
+
+    真实单行窗口里，格子的顺序就是列的顺序，所以这一行是可信的。把它和
+    "配出来的第 0 行"对一下：文字对不对得上、该不该有链接。
+    """
+    if budget[0] <= 0:
+        return False
+    budget[0] -= 1
+    cells = _window_cells(pad_id, tab_id, row, row)
+    if not cells:
+        return False
+    real_text = next((t for t, u in cells if t.strip() and not u), "")
+    real_has_link = any(u for _t, u in cells)
+    return real_text.strip() == text.strip() and real_has_link == has_link
+
+
 def _align_rows(
     pad_id: str,
     tab_id: str,
@@ -678,6 +701,12 @@ def _align_rows(
 
     数量对不上就把窗口二分继续缩，缩到只剩一行时，格子顺序就是列顺序，不用再猜。
     正常块仍然是 1 次请求，只有出问题的块才付这个代价。
+
+    **但"数量相等"不等于"一一对应"。** 一行多一个文字格（广告行）、另一行多
+    一个链接格（一格写了两个链接），两堆总数刚好持平，判据就被骗过去了，
+    整块从第一行起错位一行。2026-11-20「热门综艺电势剧哏漫」那张表就是这么错的：
+    B1 的「找资源+v」被当成第二行标题，抢走了 B3 的链接。
+    所以数量相等时还要拿块首行做锚点复核（`_anchor_ok`，1 次请求）。
     """
     n = end_row - start_row + 1
     if cells is None:
@@ -692,14 +721,28 @@ def _align_rows(
     texts = [c for c in cells if not c[1] and c[0].strip()]
     links = [c for c in cells if c[1]]
 
+    if not texts and not links:
+        return []
+    # 只剩一行时不用猜：格子顺序就是列顺序，直接还原
+    if n <= 1:
+        return [_cells_to_row(cells)]
+
     # 判据是**两堆数量相等**，不是"等于行数"。整行空白在表里很常见（这一段
     # 256 行里有 128 行是空的），空白行两边都不贡献格子，所以两堆一起变短
     # 并不影响一一对应；只有一边短了才说明从某处起错位了。
-    if len(texts) == len(links):
-        return [[texts[i][0], " ".join(links[i][1])] for i in range(len(texts))]
-
-    if n <= 1:
-        return [_cells_to_row(cells)]
+    if len(texts) == len(links) and texts:
+        # 锚点从首行开始试，第一行读空（整行空白）就往后挪一行再看一次——
+        # 空白行本来就不占位，跳过它配对仍然成立；空着就放弃会白烧一整块二分。
+        for delta in (0, 1):
+            row = start_row + delta
+            if row > end_row or budget[0] <= 0:
+                break
+            if _anchor_ok(
+                pad_id, tab_id, row, texts[0][0], bool(links[0][1]), budget
+            ):
+                return [
+                    [texts[i][0], " ".join(links[i][1])] for i in range(len(texts))
+                ]
 
     if budget[0] <= 0:
         log.warning(

@@ -233,8 +233,12 @@ class TestRowAlignment(unittest.TestCase):
         return fake
 
     def test_plain_block_pairs_by_index(self) -> None:
+        from unittest import mock
+
         rows = [["甲", "https://pan.quark.cn/s/a"], ["乙", "https://pan.quark.cn/s/b"]]
-        got = dq._align_rows("P", "T", 0, 1, [dq.MAX_ALIGN_REQUESTS], self._sheet(rows)("P", "T", 0, 1))
+        # 锚点那一发也要落到 mock 上，否则会去请求真接口
+        with mock.patch.object(dq, "_window_cells", self._sheet(rows)):
+            got = dq._align_rows("P", "T", 0, 1, [dq.MAX_ALIGN_REQUESTS])
         self.assertEqual(got, rows)
 
     def test_extra_text_cell_does_not_shift_rows(self) -> None:
@@ -387,6 +391,66 @@ class TestThrottle(unittest.TestCase):
     def test_rate_constant_is_conservative(self) -> None:
         """这个数被谁改大都会重演 2026-11-20 那次 WAF 封禁，钉死上限。"""
         self.assertLessEqual(dq.REQ_PER_SEC, 1.5)
+
+
+class TestAlignmentAnchor(unittest.TestCase):
+    """数量相等不等于一一对应。
+
+    一行多一个文字格（广告行）、另一行多一个链接格，两堆总数刚好持平，旧判据
+    就被骗过去，整块从第一行起错位——B1 的「找资源+v」被当成第二行标题，抢走
+    了第三行的链接。2026-11-20「热门综艺电势剧哏漫」就是这么错的。
+    """
+
+    def test_equal_counts_are_verified_by_anchor(self) -> None:
+        from unittest import mock
+
+        real = [
+            ["最新日期资源在下方【最新资源2】可见", "找资源+v zzgshr123"],
+            ["甲", "https://pan.quark.cn/s/a"],
+            ["乙", "https://pan.quark.cn/s/b"],
+        ]
+        # 整块：4 个文字格 + 4 个链接格，数量持平但内容错位
+        block = [
+            ("最新日期资源在下方【最新资源2】可见", []),
+            ("找资源+v zzgshr123", []),
+            ("甲", []),
+            ("乙", []),
+            ("", ["https://pan.quark.cn/s/a"]),
+            ("", ["https://pan.quark.cn/s/b"]),
+            ("", ["https://pan.quark.cn/s/c"]),
+            ("", ["https://pan.quark.cn/s/d"]),
+        ]
+
+        def fake(_pad, _tab, start, end):
+            if end > start:                     # 整块
+                return block
+            return [                          # 单行：格子顺序即列序
+                ("", [c]) if c.startswith("http") else (c, []) for c in real[start]
+            ]
+
+        with mock.patch.object(dq, "_window_cells", fake):
+            got = dq._align_rows("P", "T", 0, 2, [dq.MAX_ALIGN_REQUESTS])
+
+        self.assertEqual(got, real)
+
+    def test_normal_block_keeps_single_request(self) -> None:
+        """正常块只多花 1 次锚点请求，不能退化成整块二分。"""
+        from unittest import mock
+
+        rows = [["甲", "https://pan.quark.cn/s/a"], ["乙", "https://pan.quark.cn/s/b"]]
+        calls = {"n": 0}
+
+        def fake(_pad, _tab, start, end):
+            calls["n"] += 1
+            texts = [(r[0], []) for r in rows[start:end + 1]]
+            links = [("", [r[1]]) for r in rows[start:end + 1]]
+            return texts + links
+
+        with mock.patch.object(dq, "_window_cells", fake):
+            got = dq._align_rows("P", "T", 0, 1, [dq.MAX_ALIGN_REQUESTS])
+
+        self.assertEqual(got, rows)
+        self.assertEqual(calls["n"], 2)         # 整块 1 次 + 锚点 1 次
 
 
 if __name__ == "__main__":
