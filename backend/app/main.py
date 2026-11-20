@@ -618,12 +618,16 @@ def _export_search(body: dict, background: BackgroundTasks, *, page: int) -> dic
     """
     body = _apply_hidden(body)
 
-    # 影子回填：位置不能挪，两个原因。
+    # 影子回填：位置不能挪，三个原因。
     # 1) 此刻 `shareUrl` 还是原始网盘链接，`_public_body` 一执行就换成 /go/<token>，
     #    那之后落库的全是解不开的签名串；
-    # 2) `_apply_hidden` 已经剔掉被多人举报的条目，进库的都是干净的。
-    # 缓存命中也会走到这里——热度要的是"真实搜了多少次"，不是"上游抓了多少次"。
-    if LIBRARY_ON:
+    # 2) `_apply_hidden` 已经剔掉被多人举报的条目，进库的都是干净的；
+    # 3) **搭车（shared=True）不许回填**。leader 已经记过这一批，follower 既没打
+    #    上游、也没拿到不同结果，再记一次就是把同一份需求数了 N 遍。而搭车恰好
+    #    集中在热门词并发上——偏差不是均匀噪声，是系统性地往热榜头部堆：一个词
+    #    越热、并发越高，放大倍数越大。单飞防住了钱，不能漏了账。
+    # 缓存命中则照旧记（body 里没有 shared）——那是用户真的又搜了一次，热度要认。
+    if LIBRARY_ON and not body.get("shared"):
         items = body.get("items") or []
         if items:
             background.add_task(store.ingest, items, body.get("query") or "")
