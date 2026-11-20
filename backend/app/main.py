@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, check, feedback, group, guard, pan, resolver, source_score, store
+from . import analytics, check, feedback, group, guard, library_sync, pan, resolver, source_score, store
 from .config import get_settings
 from .search import engine as search_engine
 from .search.cache import SearchCache
@@ -1901,6 +1901,217 @@ async def admin_link_check_test(payload: LinkCheckIn, request: Request):
         log.exception("手工检测失败")
         return JSONResponse(status_code=500, content={"code": 500, "msg": f"检测失败：{exc}"})
     return {"code": 0, "data": result}
+
+
+# ---------------------------------------------------------------- 资源库：文档导入
+#
+# 看板「添加数据」面板的全部后端。流程本体在 `library_sync.py`（命令行脚本用的
+# 也是同一份），这里只做鉴权、参数校验和"别把事件循环堵住"。
+#
+# 三个必须异步的地方：探测要读腾讯文档（几秒）、登记要校验链接列（又一次读）、
+# 抓取要几分钟。前两个走 `asyncio.to_thread`，最后一个交给 library_sync 的
+# 后台线程——HTTP 请求只负责"起个头"，进度靠轮询。
+
+
+class DocProbeIn(BaseModel):
+    url: str
+    tab_id: str = ""
+
+
+class DocSourceIn(BaseModel):
+    url: str
+    tab_id: str = ""
+    title: str = ""
+    title_col: int = 0
+    link_col: int = 0
+    code_col: int = 0
+
+
+class DocSourcePatch(BaseModel):
+    # 全部 Optional：PATCH 只改传来的字段。用 0 当"清空"是合法的（回到自动识别），
+    # 所以不能用默认值 0 判断"没传"——那会把"想清空"和"没提到"混为一谈。
+    title_col: int | None = None
+    link_col: int | None = None
+    code_col: int | None = None
+    enabled: bool | None = None
+
+
+def _library_off() -> JSONResponse:
+    return JSONResponse(status_code=503, content={"code": 503, "msg": "资源库已关闭"})
+
+
+def _need_token() -> JSONResponse:
+    return JSONResponse(status_code=401, content={"code": 401, "msg": "需要口令"})
+
+
+@app.get("/api/admin/library/sources", include_in_schema=False)
+async def admin_library_sources(request: Request):
+    """订阅列表 + 库总量 + 每份表正在跑的作业。一次拿全，面板不用请求两遍。"""
+    if not LIBRARY_ON:
+        return _library_off()
+    if not _admin_allowed(request):
+        return _need_token()
+    jobs = library_sync.status()
+    items = []
+    for src in store.list_doc_sources():
+        row = dict(src)
+        row["job"] = jobs.get(str(src["id"])) or {}
+        items.append(row)
+    return {
+        "code": 0,
+        "data": {
+            "sources": items,
+            "stats": _library_stats(),
+            "concurrency": {"running": len(library_sync._running), "max": library_sync.MAX_CONCURRENT},
+        },
+    }
+
+
+@app.post("/api/admin/library/probe", include_in_schema=False)
+async def admin_library_probe(payload: DocProbeIn, request: Request):
+    """读一份腾讯文档的前几十行，报出每个工作表的结构。
+
+    这是面板第一屏：先看清表长什么样，再决定点哪个工作表、要不要锁列号。
+    错误文案原样透出（"要 docs.qq.com/sheet/… 那种"），前端不用自己翻译。
+    """
+    if not LIBRARY_ON:
+        return _library_off()
+    if not _admin_allowed(request):
+        return _need_token()
+    url = (payload.url or "").strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "链接不能为空"})
+    try:
+        data = await asyncio.to_thread(library_sync.probe, url, payload.tab_id or "")
+    except Exception as exc:  # noqa: BLE001
+        # 这里绝大多数是"文档没开任何人可查看""不是表格链接"，属于用户输入问题，
+        # 不是服务端故障。给 400 + 原文，比 500 更有用。
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+    return {"code": 0, "data": data}
+
+
+@app.post("/api/admin/library/sources", include_in_schema=False)
+async def admin_library_add(payload: DocSourceIn, request: Request):
+    """登记一份表。已经存在的只补标题/列配置，不动进度。"""
+    if not LIBRARY_ON:
+        return _library_off()
+    if not _admin_allowed(request):
+        return _need_token()
+    url = (payload.url or "").strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"code": 400, "msg": "链接不能为空"})
+    cols = {"title_col": payload.title_col, "link_col": payload.link_col, "code_col": payload.code_col}
+
+    try:
+        pad_id, tab_id = await asyncio.to_thread(_pad_and_tab, url, payload.tab_id)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+
+    # 列号指错了不拦，但要说出来：拦死的代价是"前 40 行刚好没链接的表
+    # 永远加不进来"，而放过的代价只是标题可能是备注——后者能看出来，前者不能。
+    warn = ""
+    if cols["link_col"]:
+        try:
+            warn = await asyncio.to_thread(
+                library_sync.check_link_column, url, tab_id, cols["link_col"]
+            )
+        except Exception:  # noqa: BLE001
+            warn = ""
+    got = store.add_doc_source(
+        pad_id=pad_id, tab_id=tab_id, title=payload.title, url=url.split("?")[0], **cols
+    )
+    return {"code": 0, "data": {**got, "warning": warn}}
+
+
+def _pad_and_tab(url: str, tab_id: str) -> tuple[str, str]:
+    """链接 → (pad_id, tab_id)。显式传的 tab 优先于链接里 `?tab=` 带的。"""
+    from . import docs_qq
+
+    pad_id, from_url = docs_qq.pad_id_of(url)
+    return pad_id, tab_id or from_url
+
+
+@app.patch("/api/admin/library/sources/{sid}", include_in_schema=False)
+async def admin_library_patch(sid: int, payload: DocSourcePatch, request: Request):
+    """改列配置 / 启停。改列配置要校验，指错了直接拒——这是唯一能在写入前拦住的机会。"""
+    if not LIBRARY_ON:
+        return _library_off()
+    if not _admin_allowed(request):
+        return _need_token()
+    src = next((s for s in store.list_doc_sources() if int(s["id"]) == sid), None)
+    if not src:
+        return JSONResponse(status_code=404, content={"code": 404, "msg": f"没有 id={sid} 的订阅"})
+
+    if payload.enabled is not None:
+        store.set_doc_enabled(sid, payload.enabled)
+
+    if payload.title_col is not None or payload.link_col is not None or payload.code_col is not None:
+        cols = {
+            "title_col": payload.title_col if payload.title_col is not None else int(src["title_col"]),
+            "link_col": payload.link_col if payload.link_col is not None else int(src["link_col"]),
+            "code_col": payload.code_col if payload.code_col is not None else int(src["code_col"]),
+        }
+        if cols["link_col"]:
+            try:
+                warn = await asyncio.to_thread(
+                    library_sync.check_link_column, src["url"], src["tab_id"], cols["link_col"]
+                )
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
+            if warn:
+                return JSONResponse(status_code=400, content={"code": 400, "msg": warn})
+        store.set_doc_columns(
+            sid,
+            title_col=cols["title_col"],
+            link_col=cols["link_col"],
+            code_col=cols["code_col"],
+        )
+    return {"code": 0, "data": {"id": sid}}
+
+
+@app.delete("/api/admin/library/sources/{sid}", include_in_schema=False)
+async def admin_library_drop(sid: int, request: Request):
+    """删订阅。**不动已入库的资源**——那些已经是库里的真实数据了。"""
+    if not LIBRARY_ON:
+        return _library_off()
+    if not _admin_allowed(request):
+        return _need_token()
+    if library_sync.is_running(sid):
+        return JSONResponse(status_code=409, content={"code": 409, "msg": "这份表正在抓取，等它跑完再删"})
+    ok = store.drop_doc_source(sid)
+    if not ok:
+        return JSONResponse(status_code=404, content={"code": 404, "msg": f"没有 id={sid} 的订阅"})
+    return {"code": 0, "data": {"id": sid}}
+
+
+@app.post("/api/admin/library/sources/{sid}/sync", include_in_schema=False)
+async def admin_library_sync(sid: int, request: Request):
+    """起一轮抓取。立即返回，进度靠 `jobs` 轮询。
+
+    38 万行的表要三分钟。同步等的话，任何一个反代都会在 60 秒断掉连接，
+    而抓取其实还在后台跑——用户看到报错，重试又起一份，两份同时写同一个库。
+    """
+    if not LIBRARY_ON:
+        return _library_off()
+    if not _admin_allowed(request):
+        return _need_token()
+    src = next((s for s in store.list_doc_sources() if int(s["id"]) == sid), None)
+    if not src:
+        return JSONResponse(status_code=404, content={"code": 404, "msg": f"没有 id={sid} 的订阅"})
+    job = library_sync.start(sid)
+    if job.get("state") == "busy":
+        return JSONResponse(status_code=429, content={"code": 429, "msg": job["msg"]})
+    return {"code": 0, "data": job}
+
+
+@app.get("/api/admin/library/jobs", include_in_schema=False)
+async def admin_library_jobs(request: Request):
+    """所有作业状态。前端 3 秒轮询一次，只看 running 的那几条。"""
+    if not LIBRARY_ON:
+        return _library_off()
+    if not _admin_allowed(request):
+        return _need_token()
+    return {"code": 0, "data": library_sync.status()}
 
 
 @app.get("/api/group", include_in_schema=False)

@@ -2370,3 +2370,588 @@ textarea::placeholder {
     grid-column: 1 / -1;
   }
 }
+
+/* ==================================================================
+   资源库：添加数据
+   --------------------------------------------------------------------------
+   三段的编号（1/2/3）不是装饰：这个面板要做的事有先后 —— 先读表看结构、
+   再确认列、最后才是已登记的文档。不编号会变成"一堆框"，人不知道该先动哪个。
+   ================================================================== */
+
+.lib-stat {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-4);
+  padding: 12px 16px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.lib-stat-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.lib-stat-n {
+  font-family: var(--mono);
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--brand-ink);
+  font-variant-numeric: tabular-nums;
+}
+
+.lib-stat-k {
+  font-size: var(--text-sm);
+  color: var(--muted);
+}
+
+.lib-stat-plats {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.lib-plat {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  font-size: var(--text-xs);
+  color: var(--ink-2);
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+}
+
+.lib-plat b {
+  font-family: var(--mono);
+  font-weight: 600;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 步骤 ---------- */
+
+.lib-step {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  gap: 12px;
+  padding: 16px 0;
+  border-top: 1px solid var(--line);
+}
+
+.lib-step-last {
+  border-bottom: 1px solid var(--line);
+}
+
+.lib-step-n {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--brand-ink);
+  background: var(--brand-soft);
+  border: 1px solid var(--brand-ring);
+  border-radius: 50%;
+}
+
+.lib-step-body {
+  min-width: 0;
+}
+
+.lib-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.lib-input-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+}
+
+.lib-hint {
+  margin: 8px 0 0;
+  font-size: var(--text-xs);
+  color: var(--faint);
+  line-height: 1.6;
+}
+
+.lib-hint code {
+  padding: 1px 5px;
+  font-family: var(--mono);
+  font-size: 0.94em;
+  color: var(--ink-2);
+  background: var(--surface-3);
+  border-radius: var(--radius-xs);
+}
+
+.lib-inline {
+  margin: 0;
+  align-self: center;
+}
+
+.lib-muted {
+  font-size: var(--text-xs);
+  color: var(--faint);
+}
+
+.lib-spacer {
+  flex: 1 1 auto;
+}
+
+.lib-mini {
+  padding: 4px 10px;
+  font-size: var(--text-xs);
+}
+
+.lib-danger {
+  color: var(--danger-ink);
+  border-color: var(--danger-line);
+}
+
+.lib-danger:hover {
+  background: var(--danger-soft);
+}
+
+/* ---------- 工作表与列探测 ---------- */
+
+.lib-doc-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  font-size: var(--text-sm);
+}
+
+.lib-doc-head b {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.lib-tab {
+  margin-bottom: 10px;
+  padding: 12px 14px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  transition: border-color 0.16s ease, background 0.16s ease;
+}
+
+.lib-tab.on {
+  background: var(--surface-3);
+  border-color: var(--brand-ring);
+}
+
+.lib-tab-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.lib-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: var(--text-sm);
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.lib-check input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--brand);
+}
+
+.lib-guess {
+  font-size: var(--text-xs);
+  color: var(--brand-ink);
+}
+
+.lib-tab-err {
+  margin-top: 8px;
+}
+
+.lib-cols {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.lib-cols label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+
+.lib-cols input[type='number'] {
+  width: 64px;
+  padding: 4px 6px;
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+.lib-cols-edit {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+
+.lib-probe {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.lib-col-row {
+  display: grid;
+  grid-template-columns: 62px 44px 1fr;
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 0;
+  font-size: var(--text-xs);
+}
+
+.lib-col-n {
+  font-family: var(--mono);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.lib-col-kind {
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  text-align: center;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.lib-col-kind.k-title {
+  color: var(--brand-ink);
+  background: var(--brand-soft);
+}
+
+.lib-col-kind.k-link {
+  color: var(--cyan-300);
+  background: var(--cyan-ring);
+}
+
+.lib-col-kind.k-code {
+  color: var(--warn-ink);
+  background: var(--warn-soft);
+}
+
+.lib-col-kind.k-mixed {
+  color: var(--warn-ink);
+  background: transparent;
+  border: 1px dashed var(--warn);
+}
+
+.lib-col-kind.k-other {
+  color: var(--faint);
+  background: var(--surface-3);
+}
+
+.lib-col-sample {
+  font-family: var(--mono);
+  color: var(--ink-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lib-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.lib-msg {
+  margin-top: 10px;
+  padding: 8px 12px;
+  font-size: var(--text-xs);
+  color: var(--ink-2);
+  background: var(--brand-soft);
+  border-left: 2px solid var(--brand);
+  border-radius: var(--radius-xs);
+  line-height: 1.6;
+}
+
+.lib-msg-solo {
+  margin-bottom: var(--sp-4);
+}
+
+/* ---------- 已登记的订阅 ---------- */
+
+.lib-running {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs);
+  color: var(--brand-ink);
+}
+
+.lib-spin {
+  width: 8px;
+  height: 8px;
+  border: 2px solid var(--brand-ring);
+  border-top-color: var(--brand);
+  border-radius: 50%;
+  animation: lib-spin 0.8s linear infinite;
+}
+
+@keyframes lib-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.lib-empty {
+  padding: 20px 0;
+  font-size: var(--text-sm);
+  color: var(--faint);
+}
+
+.lib-src {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.lib-src:last-of-type {
+  border-bottom: 0;
+}
+
+.lib-src.off {
+  opacity: 0.55;
+}
+
+.lib-src-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.lib-src-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--ink);
+}
+
+.lib-tag {
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  background: var(--surface-3);
+  border-radius: var(--radius-pill);
+}
+
+.lib-src-meta {
+  margin-top: 3px;
+  font-size: var(--text-xs);
+  color: var(--faint);
+}
+
+.lib-err-text {
+  color: var(--danger-ink);
+}
+
+.lib-src-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 300px;
+}
+
+.lib-job {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: var(--text-xs);
+  color: var(--muted);
+}
+
+.lib-bar {
+  flex: 0 0 160px;
+  height: 4px;
+  background: var(--surface-3);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+}
+
+.lib-bar i {
+  display: block;
+  height: 100%;
+  background: var(--brand);
+  border-radius: inherit;
+  transition: width 0.4s ease;
+}
+
+.lib-done {
+  color: var(--brand-ink);
+}
+
+.lib-job.error {
+  color: var(--danger-ink);
+}
+
+.lib-foot {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+/* 断点：860 以下步骤编号让出空间，操作按钮换行到标题下面 */
+@media (max-width: 860px) {
+  .lib-src {
+    flex-direction: column;
+  }
+
+  .lib-src-actions {
+    max-width: none;
+    justify-content: flex-start;
+  }
+
+  .lib-input-row {
+    flex-wrap: wrap;
+  }
+
+  .lib-input-row input {
+    flex: 1 1 100%;
+  }
+
+  .lib-col-row {
+    grid-template-columns: 58px 42px 1fr;
+  }
+
+  .lib-bar {
+    flex: 1 1 auto;
+  }
+}
+
+/* 只有到手机宽度才把编号折到标题上方。820px 时内容区还有 700 多，
+   编号独占一行反而让它看起来像漏了内容。 */
+@media (max-width: 560px) {
+  .lib-step {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .lib-step-n {
+    width: 22px;
+    height: 22px;
+  }
+
+  .lib-col-row {
+    grid-template-columns: 1fr;
+    gap: 2px;
+    padding: 6px 0;
+    border-bottom: 1px dashed var(--line);
+  }
+}
+
+/* 步骤 2 的占位态：还没读表。编号要留着，否则界面上一眼看到"1 → 3"，
+   人会以为漏了一步或者页面坏了。 */
+.lib-step-n-idle {
+  color: var(--faint);
+  background: var(--surface-3);
+  border-color: var(--line);
+}
+
+.lib-step-idle {
+  align-self: center;
+  font-size: var(--text-xs);
+  color: var(--faint);
+  line-height: 1.6;
+}
+
+/* 操作按钮：btn-ghost 的默认高度 34px 在这排小按钮里显得笨重，
+   而且 6px 间距会让四个按钮连成一句话，看着像文字而不是可点的东西。 */
+.lib-src-actions {
+  gap: 8px;
+}
+
+.lib-mini {
+  height: 28px;
+  padding: 0 10px;
+}
+
+/* 未选中的工作表只留一行：表名 + 行数 + 猜测的列。
+   七张表全展开是七张长卡片，滚两屏还到不了"确认导入"——而这时候人其实只需要
+   判断"哪几张要"。列探测是"确认"用的，选上了再看。 */
+.lib-tab:not(.on) .lib-cols,
+.lib-tab:not(.on) .lib-probe {
+  display: none;
+}
+
+.lib-tab:not(.on) {
+  padding: 8px 14px;
+}
+
+.lib-tab:not(.on):hover {
+  border-color: var(--line-2);
+  background: var(--surface-3);
+}
+
+.lib-tab-head {
+  min-height: 24px;
+}
+
+/* 改列号的内联表单：要有自己的底，否则跟"下一条订阅"分不开 */
+.lib-edit {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-sm);
+}
+
+.lib-edit .lib-cols {
+  margin-top: 0;
+}
+
+.lib-edit .lib-cols input[type='number'] {
+  width: 52px;
+}
+
+.lib-edit .lib-hint {
+  margin-top: 8px;
+}
+
+.lib-row-err {
+  margin-top: 8px;
+  font-size: var(--text-xs);
+  color: var(--danger-ink);
+  line-height: 1.6;
+}
+
+.lib-confirm {
+  align-items: center;
+  flex-wrap: nowrap;
+}

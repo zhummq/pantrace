@@ -855,6 +855,15 @@ def add_doc_source(
         return {"id": int(cur.lastrowid), "created": True, "last_row": 0}
 
 
+def set_doc_enabled(source_id: int, enabled: bool) -> bool:
+    """暂停 / 恢复一份订阅的每日抓取。已入库的资源不受影响。"""
+    with _session() as conn:
+        cur = conn.execute(
+            "UPDATE doc_sources SET enabled=? WHERE id=?", (1 if enabled else 0, source_id)
+        )
+        return cur.rowcount > 0
+
+
 def set_doc_columns(
     source_id: int, *, title_col: int = 0, link_col: int = 0, code_col: int = 0
 ) -> bool:

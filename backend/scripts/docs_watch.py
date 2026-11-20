@@ -2,13 +2,16 @@
 
 用法
 ----
-    # 登记一份文档（登记后会记住读到第几行）
+    # 登记一份文档（会先打印每列长什么样，确认后再跑 --run）
     .venv/Scripts/python.exe scripts/docs_watch.py --add "https://docs.qq.com/sheet/XXX?tab=BB08J2"
 
-    # 登记整个文档的所有工作表
-    .venv/Scripts/python.exe scripts/docs_watch.py --add "https://docs.qq.com/sheet/XXX" --all-tabs
+    # 表结构不常规：直接锁列号，之后每天照这个配置跑
+    .venv/Scripts/python.exe scripts/docs_watch.py --add "<链接>" --title-col 3 --link-col 5
 
-    # 看登记了什么、上次跑到哪、有没有出错
+    # 改已有订阅的列配置（表格被作者插了列时用）；不带列号 = 全清回自动
+    .venv/Scripts/python.exe scripts/docs_watch.py --set-cols 2 --title-col 1 --link-col 2
+
+    # 看登记了什么、跑到哪、是自动还是锁了列
     .venv/Scripts/python.exe scripts/docs_watch.py --list
 
     # 跑一轮增量（cron 每天调这个）
@@ -31,6 +34,11 @@
 `新增 312 / 更新 2570` 说明表里加了 312 条新的。
 更新数远大于新增数是正常的：每次会回看一段重叠区，靠去重键合并，
 作用是把"表中间被插了一行"这种情况也捞回来。
+
+流程本体不在这里
+----------------
+取数、切批、解析、落库、记进度全在 `app/library_sync.py` —— 这个脚本和
+看板的「添加数据」面板是两个入口，逻辑必须共用一份。这里只负责参数和打印。
 """
 
 from __future__ import annotations
@@ -43,28 +51,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app import docs_qq, intake, store  # noqa: E402
-from app.search import clean  # noqa: E402
+from app import docs_qq, library_sync, store  # noqa: E402
 from app.config import get_settings  # noqa: E402
 
-# 每次往回多看这么多行。表格中间插入新行时，纯按 last_row 往前读会漏，
-# 重叠一段靠 dedup_key 合并就能补上；512 行的代价约两次请求，很值。
-LOOKBACK = 512
-# 一批落库多少行。38 万行一次性 ingest 会把内存顶到几百兆，
-# 而且中途失败就全丢，分批的话前面已入库的不受影响。
-BATCH = 5000
+_KIND_LABEL = {
+    "title": "标题",
+    "link": "链接",
+    "code": "提取码",
+    "mixed": "链接混在别的内容里",
+    "other": "其他",
+}
 
 
 def _open_library() -> None:
     store.init(Path(get_settings().library_path))
 
 
-def _cols_of(src: dict) -> dict:
-    """订阅上的列配置 → parse_rows 的参数。全 0 时等于没配置。"""
+def _cols_from_args(args) -> dict:
     return {
-        "title_col": int(src.get("title_col") or 0),
-        "link_col": int(src.get("link_col") or 0),
-        "code_col": int(src.get("code_col") or 0),
+        "title_col": args.title_col or 0,
+        "link_col": args.link_col or 0,
+        "code_col": args.code_col or 0,
     }
 
 
@@ -79,12 +86,8 @@ def _report_skips(
     """
     if not skipped:
         return
-    counts: dict[str, int] = {}
-    for _, why in skipped:
-        key = why.split("：")[0].split("（")[0]
-        counts[key] = counts.get(key, 0) + 1
-    top = sorted(counts.items(), key=lambda kv: -kv[1])[:5]
-    print(f"    跳过 {len(skipped)} 条：" + "，".join(f"{k} {v}" for k, v in top))
+    counts = {item["reason"]: item["count"] for item in library_sync.skip_summary(skipped)}
+    print(f"    跳过 {len(skipped)} 条：" + "，".join(f"{k} {v}" for k, v in counts.items()))
     for line_no, why in skipped[:limit]:
         print(f"      第 {line_no} 行 {why}")
 
@@ -103,201 +106,93 @@ def _report_skips(
 def _ingest_rows(
     rows: list[list[str]], source_name: str, *, dry_run: bool, cols: dict | None = None
 ) -> dict:
-    """二维表 → 库。分批走，返回累计的 {added, touched, skipped}。"""
-    added = touched = 0
-    skipped: list[tuple[int, str]] = []
-    opts = dict(cols or {})
-    # 表头只让第一批猜。每批各自猜的话，某批首行标题叫《资源链接大全》
-    # 就会被当表头吃掉，38 万行切成 76 批能吃几十条。
-    offset = 0
-    for first, chunk in intake.iter_row_batches(rows, BATCH):
-        result = intake.parse_rows(
-            chunk,
-            has_header=None if first else False,
-            source_name=source_name,
-            **opts,
-        )
-        # 批内行号是相对的，报告里要能对上原表，否则"第 3 行有问题"根本没法找
-        skipped.extend((n + offset, why) for n, why in result.skipped)
-        offset += len(chunk)
-        if not result.items:
+    got = library_sync.ingest_rows(rows, source_name, dry_run=dry_run, cols=cols)
+    _report_skips(got["skipped"], cols=cols)
+    return got
+
+
+def _print_probe(tabs: list[dict], cols: dict | None = None) -> None:
+    """打印列探测结果。带样本值——人靠样本核对，不靠列号数字。"""
+    picked = cols or {}
+    for tab in tabs:
+        print(f"\n  [{tab['title'] or tab['tab_id']}] {tab['max_row']} 行")
+        if tab["error"]:
+            print(f"    ⚠ {tab['error']}")
             continue
-        if dry_run:
-            added += len(result.items)
+        report = tab["columns"]
+        if not report:
+            print("    （前几十行是空的，没法探测列）")
             continue
-        got = store.ingest(result.items)
-        added += got["added"]
-        touched += got["touched"]
-    return {"added": added, "touched": touched, "skipped": skipped}
+        print("    列探测（1 起算，跟表格里看到的列号一致）：")
+        guess = {}
+        for item in report:
+            label = _KIND_LABEL.get(item["kind"], item["kind"])
+            sample = " / ".join(s[:28] for s in item["samples"][:2])
+            mark = "←" if item["kind"] in ("title", "link", "code") else " "
+            if item["kind"] in ("title", "link", "code"):
+                guess.setdefault(item["kind"], item["col"])
+            print(f"      {mark} 第 {item['col']} 列  {label:<16} {sample}")
+        if picked.get("link_col"):
+            print(f"    已按人工指定：标题第 {picked.get('title_col') or '-'} 列，"
+                  f"链接第 {picked['link_col']} 列，码第 {picked.get('code_col') or '-'} 列")
+        else:
+            auto = [f"{_KIND_LABEL[k]}第 {v} 列" for k, v in guess.items()]
+            print("    自动识别：" + ("，".join(auto) if auto else "认不出来"))
+            print("    不对就加 --title-col N --link-col N 重新登记。")
 
 
 def _sync_one(src: dict, *, dry_run: bool, limit: int | None, workers: int) -> dict:
-    """跑一份订阅的增量。返回一行报告用数据。"""
-    label = f"{src['title'] or src['tab_id'] or '默认表'}"
+    """跑一份订阅的增量，并打印过程。"""
+    label = src["title"] or src["tab_id"] or "默认表"
 
     def progress(offset: int, total: int) -> None:
         # 小表刷进度只是噪声，大表（几万行起步）不刷的话像卡死了
         if total > 20000:
             print(f"    {label} {offset}/{total}", end="\r", flush=True)
 
-    start = max(0, int(src["last_row"]) - LOOKBACK) if src["last_row"] else 0
-    end_row = None if limit is None else start + limit
-    rows, meta = docs_qq.read_tab(
-        src["url"],
-        tab_id=src["tab_id"],
-        start_row=start,
-        end_row=end_row,
-        workers=workers,
-        on_progress=progress,
+    report = library_sync.sync_one(
+        src, dry_run=dry_run, limit=limit, workers=workers, on_progress=progress
     )
-    tab = meta.tab(src["tab_id"])
-    if tab and tab.max_row > 20000:
+    if report.max_row > 20000:
         print()  # 进度行是 \r 覆盖的，收尾补个换行
-
-    source_name = f"doc:{(tab.title or meta.title or label)[:40]}"
-    got = _ingest_rows(rows, source_name, dry_run=dry_run, cols=_cols_of(src))
-    _report_skips(got["skipped"], cols=_cols_of(src))
-
-    # 进度只写到表长为止。`--limit` 是调试参数，不该把进度顶到表外面去
-    ceiling = tab.max_row if tab else src["last_row"]
-    new_row = min(end_row, ceiling) if end_row is not None else ceiling
-    if not dry_run:
-        store.save_doc_progress(
-            src["id"], last_row=new_row, last_rev=meta.rev
-        )
-    return {
-        "tab": label,
-        "rows": len(rows),
-        "max_row": tab.max_row if tab else 0,
-        "last_row": new_row,
-        **got,
-    }
-
-
-_KIND_LABEL = {
-    "title": "标题",
-    "link": "链接",
-    "code": "提取码",
-    "mixed": "链接混在别的内容里",
-    "other": "其他",
-}
-
-
-def _probe_tab(url: str, tab_id: str, sample_rows: int = 40) -> list[dict]:
-    """读前几十行，猜每列是干什么的。给人核对列号用，不写库。"""
-    rows, _ = docs_qq.read_tab(url, tab_id=tab_id, end_row=sample_rows)
-    return intake.probe_columns(rows)
-
-
-def _print_probe(report: list[dict], cols: dict | None = None) -> None:
-    """打印列探测结果。带样本值——人靠样本核对，不靠列号数字。"""
-    if not report:
-        print("    （前几十行是空的，没法探测列）")
-        return
-    guess = {item["kind"]: item["col"] for item in report if item["kind"] in _KIND_LABEL}
-    picked = cols or {}
-    print("    列探测（1 起算，跟表格里看到的列号一致）：")
-    for item in report:
-        mark = guess.get(item["kind"]) == item["col"]
-        flag = "←" if mark else " "
-        sample = " / ".join(s[:28] for s in item["samples"][:2])
-        print(f"      {flag} 第 {item['col']} 列  {_KIND_LABEL[item['kind']]:<16} {sample}")
-    if picked.get("link_col"):
-        print(f"    已按人工指定：标题第 {picked.get('title_col') or '-'} 列，"
-              f"链接第 {picked['link_col']} 列，"
-              f"码第 {picked.get('code_col') or '-'} 列")
-    else:
-        auto = [f"{_KIND_LABEL[k]}第 {v} 列" for k, v in guess.items() if k in ("title", "link", "code")]
-        print("    自动识别：" + ("，".join(auto) if auto else "认不出来"))
-        print("    不对就加 --title-col N --link-col N 重登记一次。")
-
-
-def _cols_from_args(args) -> dict:
-    return {
-        "title_col": args.title_col or 0,
-        "link_col": args.link_col or 0,
-        "code_col": args.code_col or 0,
-    }
-
-
-def _check_cols(url: str, tab_id: str, cols: dict) -> str:
-    """人工指定的列号是不是指对了地方。返回警告文案，空串表示没问题。
-
-    取数在这里，判断在 `intake.check_link_column`（那是纯逻辑，可以离线测）。
-    """
-    link_col = cols.get("link_col") or 0
-    if not link_col:
-        return ""
-    rows, _ = docs_qq.read_tab(url, tab_id=tab_id, end_row=40)
-    return intake.check_link_column(rows, link_col)
+    _report_skips(report.skipped, cols=library_sync.cols_of(src))
+    return report.as_dict()
 
 
 def cmd_add(args) -> int:
     pad_id, tab_id = docs_qq.pad_id_of(args.add)
-    meta = docs_qq.fetch_meta(args.add)
-    print(f"文档：{meta.title}（{len(meta.tabs)} 个工作表）")
-
-    targets = meta.tabs if (args.all_tabs or not tab_id) else [meta.tab(tab_id)]
+    cols = _cols_from_args(args)
+    got = library_sync.probe(args.add, "" if args.all_tabs else tab_id)
+    print(f"文档：{got['title']}（{len(got['tabs'])} 个工作表）")
+    targets = [t for t in got["tabs"] if args.all_tabs or not tab_id or t["tab_id"] == tab_id]
     if not targets:
         print("没有可登记的工作表。")
         return 1
 
-    cols = _cols_from_args(args)
     _open_library()
-    for tab in targets:
-        if tab is None:
-            continue
-        print(f"\n  [{tab.title or tab.tab_id}] {tab.max_row} 行")
-        _print_probe(_probe_tab(args.add.split("?")[0], tab.tab_id), cols)
+    _print_probe(targets, cols)
+    print()
 
+    for tab in targets:
+        if tab["error"]:
+            print(f"  [跳过] {tab['title'] or tab['tab_id']}：{tab['error']}")
+            continue
         if cols["link_col"]:
-            warn = _check_cols(args.add.split("?")[0], tab.tab_id, cols)
+            warn = library_sync.check_link_column(args.add, tab["tab_id"], cols["link_col"])
             if warn:
                 # 只警告不拦：有可能这份表前 40 行刚好都是没链接的表头区
-                print(f"    ⚠ {warn}（先不登记，确认后再跑一次）")
+                print(f"  ⚠ {warn}（先不登记，确认后再跑一次）")
                 continue
-
-        got = store.add_doc_source(
+        res = store.add_doc_source(
             pad_id=pad_id,
-            tab_id=tab.tab_id,
-            title=tab.title,
+            tab_id=tab["tab_id"],
+            title=tab["title"],
             url=args.add.split("?")[0],
             **cols,
         )
-        flag = "新增" if got["created"] else "已存在"
-        print(f"    [{flag}] 起点 {got['last_row']}")
+        flag = "新增" if res["created"] else "已存在"
+        print(f"  [{flag}] {tab['title'] or tab['tab_id']}  起点 {res['last_row']}")
     print("\n登记完成。跑 --run 开始第一次抓取。")
-    return 0
-
-
-def cmd_set_cols(args) -> int:
-    """改已有订阅的列配置。表格改结构了用这个。"""
-    _open_library()
-    sources = {src["id"]: src for src in store.list_doc_sources()}
-    src = sources.get(args.set_cols)
-    if not src:
-        print(f"没有 id={args.set_cols} 的订阅。用 --list 看有哪些。")
-        return 1
-
-    cols = _cols_from_args(args)
-    print(f"[{src['id']}] {src['title'] or src['tab_id']}  当前："
-          f"标题 {src['title_col'] or '自动'}，链接 {src['link_col'] or '自动'}，"
-          f"码 {src['code_col'] or '自动'}")
-    _print_probe(_probe_tab(src["url"], src["tab_id"]), cols)
-
-    if cols["link_col"]:
-        warn = _check_cols(src["url"], src["tab_id"], cols)
-        if warn:
-            print(f"⚠ {warn}")
-            return 1
-
-    store.set_doc_columns(
-        src["id"],
-        title_col=cols["title_col"],
-        link_col=cols["link_col"],
-        code_col=cols["code_col"],
-    )
-    print("已更新。下次 --run 生效；进度不受影响，不会重拉整表。")
     return 0
 
 
@@ -308,17 +203,16 @@ def cmd_list(args) -> int:
         print("还没有登记任何文档。用 --add <链接> 加一个。")
         return 0
     now = int(time.time())
-    print(f"{'ID':>3}  {'工作表':<14} {'进度':>9}  {'列配置':<14} {'上次跑':<12} 状态")
+    print(f"{'ID':>3}  {'工作表':<14} {'进度':>9}  {'列配置':<12} {'上次跑':<12} 状态")
     for src in items:
         ran = src["last_run_at"]
         ago = f"{int((now - ran) / 3600)}小时前" if ran else "从未"
         state = "正常" if src["enabled"] else "已停用"
         if src["last_error"]:
             state = f"失败：{src['last_error'][:40]}"
-        cols = _cols_desc(src)
         print(
             f"{src['id']:>3}  {(src['title'] or src['tab_id'] or '默认'):<14}"
-            f" {src['last_row']:>9}  {cols:<14} {ago:<12} {state}"
+            f" {src['last_row']:>9}  {_cols_desc(src):<12} {ago:<12} {state}"
         )
     return 0
 
@@ -340,8 +234,40 @@ def cmd_drop(args) -> int:
     return 0 if ok else 1
 
 
+def cmd_set_cols(args) -> int:
+    """改已有订阅的列配置。表格改结构了用这个。"""
+    _open_library()
+    sources = {int(src["id"]): src for src in store.list_doc_sources()}
+    src = sources.get(args.set_cols)
+    if not src:
+        print(f"没有 id={args.set_cols} 的订阅。用 --list 看有哪些。")
+        return 1
+
+    cols = _cols_from_args(args)
+    print(f"[{src['id']}] {src['title'] or src['tab_id']}  当前："
+          f"标题 {src['title_col'] or '自动'}，链接 {src['link_col'] or '自动'}，"
+          f"码 {src['code_col'] or '自动'}")
+    _print_probe(library_sync.probe(src["url"], src["tab_id"])["tabs"], cols)
+
+    if cols["link_col"]:
+        warn = library_sync.check_link_column(src["url"], src["tab_id"], cols["link_col"])
+        if warn:
+            print(f"⚠ {warn}")
+            return 1
+
+    store.set_doc_columns(
+        src["id"],
+        title_col=cols["title_col"],
+        link_col=cols["link_col"],
+        code_col=cols["code_col"],
+    )
+    print("已更新。下次 --run 生效；进度不受影响，不会重拉整表。")
+    return 0
+
+
 def cmd_once(args) -> int:
     """不登记，直接导一次。临时表、别人发来的表用这个。"""
+    _open_library()
     pad_id, tab_id = docs_qq.pad_id_of(args.once)
     meta = docs_qq.fetch_meta(args.once)
     tabs = meta.tabs if (args.all_tabs or not tab_id) else [meta.tab(tab_id)]
@@ -350,22 +276,16 @@ def cmd_once(args) -> int:
         print("没有可读的工作表。")
         return 1
 
-    if not args.dry_run:
-        _open_library()
+    cols = _cols_from_args(args)
     total = {"added": 0, "touched": 0}
     for tab in tabs:
-        end = None if args.limit is None else args.limit
         rows, _ = docs_qq.read_tab(
-            args.once, tab_id=tab.tab_id, end_row=end, workers=args.workers
+            args.once, tab_id=tab.tab_id, end_row=args.limit, workers=args.workers
         )
         got = _ingest_rows(
-            rows,
-            f"doc:{(tab.title or meta.title)[:40]}",
-            dry_run=args.dry_run,
-            cols=_cols_from_args(args),
+            rows, f"doc:{(tab.title or meta.title)[:40]}", dry_run=args.dry_run, cols=cols
         )
         print(f"  {tab.title or tab.tab_id}: {len(rows)} 行 → 新增 {got['added']}，更新 {got['touched']}")
-        _report_skips(got["skipped"], cols=_cols_from_args(args))
         for k in total:
             total[k] += got[k]
     if args.dry_run:

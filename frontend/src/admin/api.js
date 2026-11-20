@@ -117,3 +117,18 @@ export const probeAd = (name, size) =>
 export const watermark = () => api('/api/admin/watermark')
 export const saveWatermark = (name) =>
   api('/api/admin/watermark', { method: 'POST', body: { name } })
+
+// 资源库：腾讯文档收集表 → 库。抓一份表要几分钟，所以 sync 只负责"起个头"，
+// 进度靠 libraryJobs 轮询——同步等会被反代在 60 秒掐断。
+export const librarySources = () => api('/api/admin/library/sources')
+export const libraryProbe = (url, tabId = '') =>
+  api('/api/admin/library/probe', { method: 'POST', body: { url, tab_id: tabId } })
+export const libraryAdd = (payload) =>
+  api('/api/admin/library/sources', { method: 'POST', body: payload })
+export const libraryPatch = (id, payload) =>
+  api(`/api/admin/library/sources/${id}`, { method: 'PATCH', body: payload })
+export const libraryDrop = (id) =>
+  api(`/api/admin/library/sources/${id}`, { method: 'DELETE' })
+export const librarySync = (id) =>
+  api(`/api/admin/library/sources/${id}/sync`, { method: 'POST' })
+export const libraryJobs = () => api('/api/admin/library/jobs')

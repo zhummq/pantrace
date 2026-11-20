@@ -12,6 +12,7 @@ import WatermarkPanel from './components/WatermarkPanel.vue'
 import GroupPanel from './components/GroupPanel.vue'
 import ClicksPanel from './components/ClicksPanel.vue'
 import LinkCheckPanel from './components/LinkCheckPanel.vue'
+import LibraryPanel from './components/LibraryPanel.vue'
 import SourceRankPanel from './components/SourceRankPanel.vue'
 import * as api from './api'
 import { ms, pct, platformName } from './format'
@@ -31,12 +32,14 @@ const ICON = {
   key: '<svg viewBox="0 0 24 24" fill="none"><circle cx="8.2" cy="8.2" r="4.2" stroke="currentColor" stroke-width="1.8"/><path d="M11.2 11.2 19.6 19.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16.6 16.6 18.6 14.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
   users: '<svg viewBox="0 0 24 24" fill="none"><circle cx="9.2" cy="8.8" r="3.2" stroke="currentColor" stroke-width="1.8"/><path d="M3.6 19.2c0-3 2.5-5 5.6-5s5.6 2 5.6 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M15.8 6.2a3.2 3.2 0 0 1 0 5.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M17.2 14.6c1.9.7 3.2 2.3 3.2 4.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
   shield: '<svg viewBox="0 0 24 24" fill="none"><path d="M12 3.4 19 6v6c0 4.2-2.9 7.5-7 8.6C7.9 19.5 5 16.2 5 12V6l7-2.6z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9.2 12.1 11 13.9l3.9-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  upload: '<svg viewBox="0 0 24 24" fill="none"><path d="M12 16.2V5.8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M7.8 10 12 5.8 16.2 10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M4.6 15.4v2a2 2 0 0 0 2 2h10.8a2 2 0 0 0 2-2v-2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
   send: '<svg viewBox="0 0 24 24" fill="none"><path d="M20.5 3.5 3.8 10.2c-.7.3-.7 1.3 0 1.6l6.5 2.6 2.6 6.5c.3.7 1.3.7 1.6 0l6.7-16.7c.2-.6-.4-1.2-1-1z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="m10.3 14.4 4.6-4.6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>',
 }
 
 const NAV = [
   { key: 'overview', label: '概览', icon: ICON.grid },
   { key: 'feedback', label: '待办与反馈', icon: ICON.inbox, badge: true },
+  { key: 'library', label: '添加数据', icon: ICON.upload },
   { key: 'search', label: '搜索诊断', icon: ICON.search },
   { key: 'check', label: '资源巡检', icon: ICON.link },
   { key: 'clicks', label: '点击日志', icon: ICON.pulse },
@@ -52,6 +55,7 @@ const NAV = [
 const TITLES = {
   overview: '概览',
   feedback: '待办与反馈',
+  library: '添加数据',
   search: '搜索诊断',
   check: '资源巡检',
   clicks: '点击日志',
@@ -386,12 +390,17 @@ onUnmounted(() => {
         <div class="tb-title">
           <div class="tb-name">{{ TITLES[route] }}</div>
           <div class="tb-sub">
-            {{ rangeText }}<template v-if="lastLoaded"> · 更新于 {{ lastLoaded }}</template>
-            · 自动刷新 60 秒 · 机器人流量已剔除
+            <template v-if="route === 'library'">
+              腾讯文档收集表 → 资源库 · 每天 4:20 自动增量
+            </template>
+            <template v-else>
+              {{ rangeText }}<template v-if="lastLoaded"> · 更新于 {{ lastLoaded }}</template>
+              · 自动刷新 60 秒 · 机器人流量已剔除
+            </template>
           </div>
         </div>
         <div class="tb-actions">
-          <div class="seg">
+          <div v-if="route !== 'library'" class="seg">
             <button
               v-for="r in RANGES"
               :key="r.days"
@@ -405,9 +414,9 @@ onUnmounted(() => {
       </header>
 
       <div v-if="errorMsg" class="err" style="padding: 10px 24px 0">{{ errorMsg }}</div>
-      <div v-if="!ready" class="empty">载入中…</div>
+      <div v-if="!ready && route !== 'library'" class="empty">载入中…</div>
 
-      <div v-if="ready" class="page">
+      <div v-if="ready || route === 'library'" class="page">
         <!-- 概览 -->
         <template v-if="route === 'overview'">
           <div class="health">
@@ -446,6 +455,11 @@ onUnmounted(() => {
         <!-- 待办与反馈 -->
         <template v-else-if="route === 'feedback'">
           <FeedbackPanel :data="fb" @done="markDone" />
+        </template>
+
+        <!-- 添加数据 -->
+        <template v-else-if="route === 'library'">
+          <LibraryPanel />
         </template>
 
         <!-- 搜索诊断 -->
