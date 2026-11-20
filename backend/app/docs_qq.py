@@ -43,9 +43,9 @@
    这比限流码危险得多——空块长得跟"这一段没数据"一模一样，上层当成功处理，
    还把 `last_row` 推到表尾，35 万行就这么静默没了；而下一轮增量只回看 512 行，
    永远补不回来。
-   现在的处理：请求走全局节流（`_throttle`，2.5 次/秒）；空响应重试三次；
-   仍然空就抛 `DocError` 让整次同步失败，宁可这一轮不更新，也不写错进度。
-   单行窗口例外（空行本来就没有格子）。
+   现在的处理：请求走全局节流（`_throttle`，1 次/秒，带随机抖动）；
+   空响应重试三次；仍然空就抛 `DocError` 让整次同步失败，宁可这一轮不更新，
+   也不写错进度。单行窗口例外（空行本来就没有格子）。
 
    压太狠还会升级成 WAF 人机验证：返回 501 + 一个跳
    `waf-captcha.cloud.tencent.com` 的 HTML 页，封十几分钟。这种情况**不要重试**，
@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import random
 import re
 import threading
 import time
@@ -83,10 +84,16 @@ BLOCK_ROWS = 256
 # 块内单元格数量对不齐时，最多再花多少次请求去逐层二分。正常块一次都不用；
 # 一块里十几个空标题也就是几十次。设上限是防病态数据把一次同步拖成几小时。
 MAX_ALIGN_REQUESTS = 256
-# 全局请求速率（次/秒）。上限不是带宽而是"会不会被判成爬虫"：实测 3.5 次/秒
-# 连续压满整张 38 万行的表也不掉块；但一天里反复全量跑仍会撞上 WAF 的
-# 人机验证（501 验证码页），所以再降一档留余量。全量 38 万行约 10 分钟。
-REQ_PER_SEC = 2.5
+# 全局请求速率（次/秒）。上限不是带宽而是"会不会被判成爬虫"。
+# 这台机器实测的边界：3.5 次/秒能一口气跑完 38 万行不掉块，但同一天再压一轮
+# 就撞上 WAF 的 501 人机验证页，封十几分钟。抓取作业最怕的不是慢，是被封之后
+# 那一轮静默失败，所以这里按"慢得多但绝不被拦"取值：1 次/秒起步，
+# 单块 256 行 → 整张 38 万行约 25 分钟。日常增量只有 2~10 次请求，多花的
+# 那几秒看不出来。
+REQ_PER_SEC = 1.0
+# 在固定间隔上再抖 0~0.4 秒。严格等间隔的请求序列本身就是机器特征，
+# 抖动之后平均仍是 1 次/秒，但看起来不像定时器。
+REQ_JITTER = 0.4
 # 空响应的重试节奏。第一轮先短等（大概率是瞬时抖动），后面成倍拉长。
 EMPTY_RETRIES = 3
 EMPTY_BACKOFF = (0.4, 1.2, 3.0)
@@ -446,7 +453,7 @@ def _throttle() -> None:
         if _next_slot > now:
             time.sleep(_next_slot - now)
             now = _next_slot
-        _next_slot = now + 1.0 / REQ_PER_SEC
+        _next_slot = now + 1.0 / REQ_PER_SEC + random.uniform(0, REQ_JITTER)
         _req_total += 1
 
 
@@ -744,13 +751,16 @@ def read_tab(
     tab_id: str = "",
     start_row: int = 0,
     end_row: int | None = None,
-    workers: int = 6,
+    workers: int = 3,
     on_progress=None,
 ) -> tuple[list[list[str]], DocMeta]:
     """把一个工作表读成二维表。
 
     `start_row` 给增量用：只拉这之后的行。`end_row` 默认按元信息里的 max_row。
-    并发开到 6：38 万行串行要七分钟，6 路压到一分半，再高容易被限流。
+
+    **瓶颈是节流，不是并发。** `_throttle` 把总速率钉在 1 次/秒，`workers`
+    再大也只是让几个线程排队领号，不会真的同时压出去。默认 3 是够用的：
+    同一时刻最多 3 个请求在飞，剩下的排队。
     """
     meta = fetch_meta(url)
     tab = meta.tab(tab_id)

@@ -135,7 +135,7 @@ def sync_one(
     *,
     dry_run: bool = False,
     limit: int | None = None,
-    workers: int = 6,
+    workers: int = 3,
     on_progress=None,
 ) -> SyncReport:
     """跑一份订阅的一轮增量。异常不吞，抛给调用方决定怎么记。"""
@@ -300,7 +300,7 @@ def _run(source_id: int, kwargs: dict) -> None:
         )
         if not src:
             raise RuntimeError(f"没有 id={source_id} 的订阅")
-        report = sync_one(src, workers=kwargs.get("workers", 6), on_progress=on_progress)
+        report = sync_one(src, workers=kwargs.get("workers", 3), on_progress=on_progress)
         with _lock:
             _jobs[source_id] = {
                 "state": "done",
@@ -386,9 +386,9 @@ def _needs_catch_up(now: float) -> bool:
 def run_all(*, wait_max: float = 3600.0, poll: float = 2.0) -> dict:
     """把启用的订阅挨个跑一遍，返回汇总。
 
-    串行而不是并发：一份表内部已经把块级并发开到 6，两份表再叠上去，腾讯文档
-    那边会开始限流，总耗时反而变长，还把 MAX_CONCURRENT 的名额占满——用户
-    在面板上点什么都是 busy。
+    串行而不是并发：`docs_qq` 那边有全局限速（1 次/秒），两份表一起跑并不能
+    变快，只会让各自的进度条都慢得看不清；而且它们抢的是同一份额度。
+    另外并发还会把 MAX_CONCURRENT 的名额占满——用户在面板上点什么都是 busy。
 
     每份表走 `start()` 而不是直接调 `sync_one()`：这样面板能看到"正在抓"、
     能看到进度条，而且同一份表重复触发会被 start() 自己挡掉。

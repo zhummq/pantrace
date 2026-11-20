@@ -369,5 +369,25 @@ class TestEmptyBlockIsNotData(unittest.TestCase):
         dq._header_cache.clear()
 
 
+class TestThrottle(unittest.TestCase):
+    """全局节流：宁可慢，也不能把腾讯文档压到回空块 / 弹人机验证。"""
+
+    def tearDown(self) -> None:
+        dq._next_slot = 0.0
+
+    def test_two_requests_are_at_least_one_second_apart(self) -> None:
+        import time as _time
+
+        dq._next_slot = 0.0
+        t0 = _time.monotonic()
+        dq._throttle()
+        dq._throttle()
+        self.assertGreaterEqual(_time.monotonic() - t0, 0.95)
+
+    def test_rate_constant_is_conservative(self) -> None:
+        """这个数被谁改大都会重演 2026-11-20 那次 WAF 封禁，钉死上限。"""
+        self.assertLessEqual(dq.REQ_PER_SEC, 1.5)
+
+
 if __name__ == "__main__":
     unittest.main()

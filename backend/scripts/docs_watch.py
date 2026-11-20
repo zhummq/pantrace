@@ -359,7 +359,7 @@ def main() -> int:
     ap.add_argument("--code-col", type=int, default=0, metavar="N", help="提取码在第几列（1 起）")
     ap.add_argument("--dry-run", action="store_true", help="只解析，不写库、不更新进度")
     ap.add_argument("--limit", type=int, default=None, help="最多读 N 行（调试用）")
-    ap.add_argument("--workers", type=int, default=6, help="并发块数，默认 6")
+    ap.add_argument("--workers", type=int, default=3, help="并发块数，默认 3")
     ap.add_argument("--loop", metavar="小时", default=None, help="常驻模式，每 N 小时跑一轮")
     args = ap.parse_args()
 
