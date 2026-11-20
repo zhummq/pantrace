@@ -707,9 +707,11 @@ def _has_mirror_account() -> bool:
         return False
 
 
-@app.get("/api/health")
 def _library_stats() -> dict:
-    """库的体检数据。/api/health 常被监控轮询，库出问题不许把健康检查带挂。"""
+    """库的体检数据。挂在 health 的 library 字段里，不是独立路由。
+
+    库出问题不许把健康检查带挂，所以整个函数体包在 try 里。
+    """
     if not LIBRARY_ON:
         return {"enabled": False}
     try:
@@ -718,6 +720,7 @@ def _library_stats() -> dict:
         return {"enabled": True, "error": str(exc)}
 
 
+@app.get("/api/health")
 async def health():
     return {
         "status": "ok",
