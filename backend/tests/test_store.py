@@ -338,6 +338,101 @@ class TestDropStats(StoreTestBase):
         self.assertEqual(store.stats()["by_platform"], {"115": 1})
 
 
+class TestDocSources(StoreTestBase):
+    """文档订阅上的列配置。
+
+    列号存库是为了 cron：每天自动跑的时候没法在命令行里重填一遍。
+    存错的后果是"每天稳定入库一批错位数据"，比一次报错难查得多。
+    """
+
+    def test_columns_persisted(self):
+        got = store.add_doc_source(
+            pad_id="DWabc", tab_id="t1", title="资源表",
+            title_col=3, link_col=5, code_col=6,
+        )
+        src = next(s for s in store.list_doc_sources() if s["id"] == got["id"])
+        self.assertEqual((src["title_col"], src["link_col"], src["code_col"]), (3, 5, 6))
+
+    def test_readd_keeps_progress_but_updates_columns(self):
+        """重复登记：进度不许清零，但列配置要能改。
+
+        进度清零会让第二天把 38 万行重拉一遍；列配置不改则改错了撤不回来。
+        """
+        first = store.add_doc_source(pad_id="DWabc", tab_id="t1", title="资源表")
+        store.save_doc_progress(first["id"], last_row=12345)
+
+        again = store.add_doc_source(
+            pad_id="DWabc", tab_id="t1", title="资源表", link_col=4
+        )
+        self.assertEqual(again["id"], first["id"])
+        src = next(s for s in store.list_doc_sources() if s["id"] == first["id"])
+        self.assertEqual(src["last_row"], 12345)
+        self.assertEqual(src["link_col"], 4)
+
+    def test_readd_with_zero_leaves_columns_alone(self):
+        """不传列号（0）是"不改"，不是"清空"。"""
+        got = store.add_doc_source(pad_id="DWabc", tab_id="t1", link_col=4)
+        store.add_doc_source(pad_id="DWabc", tab_id="t1", title="改了标题")
+        src = next(s for s in store.list_doc_sources() if s["id"] == got["id"])
+        self.assertEqual(src["link_col"], 4)
+
+    def test_set_columns_zero_clears(self):
+        """改回自动识别：这里 0 必须是"清空"。"""
+        got = store.add_doc_source(pad_id="DWabc", tab_id="t1", link_col=4)
+        self.assertTrue(store.set_doc_columns(got["id"]))
+        src = next(s for s in store.list_doc_sources() if s["id"] == got["id"])
+        self.assertEqual(src["link_col"], 0)
+
+    def test_set_columns_unknown_id(self):
+        self.assertFalse(store.set_doc_columns(999))
+
+
+class TestDocColumnsMigration(unittest.TestCase):
+    """老库的 doc_sources 没有列号字段，init 要补上。
+
+    线上已经有这种库了（两张表已经跑过一轮全量）。迁移漏掉的后果不是报错，
+    是 `--set-cols` 写一个不存在的字段——或者更糟，`ALTER` 失败被静默吞掉。
+    """
+
+    OLD_SCHEMA = """
+        CREATE TABLE doc_sources (
+            id          INTEGER PRIMARY KEY,
+            url         TEXT    NOT NULL DEFAULT '',
+            pad_id      TEXT    NOT NULL,
+            tab_id      TEXT    NOT NULL DEFAULT '',
+            title       TEXT    NOT NULL DEFAULT '',
+            last_row    INTEGER NOT NULL DEFAULT 0,
+            last_rev    TEXT    NOT NULL DEFAULT '',
+            last_run_at INTEGER NOT NULL DEFAULT 0,
+            last_ok_at  INTEGER NOT NULL DEFAULT 0,
+            last_error  TEXT    NOT NULL DEFAULT '',
+            added_at    INTEGER NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1
+        );
+        INSERT INTO doc_sources(pad_id, tab_id, title, last_row, added_at)
+            VALUES ('DWabc', 't1', '最新资源1', 380642, 1);
+    """
+
+    def test_old_doc_sources_get_column_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "old.db"
+            conn = sqlite3.connect(str(db))
+            conn.executescript(self.OLD_SCHEMA)
+            conn.close()
+
+            store.init(db)
+
+            with store._session() as conn:
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(doc_sources)")]
+                row = conn.execute(
+                    "SELECT last_row, title_col, link_col, code_col FROM doc_sources"
+                ).fetchone()
+            for name in ("title_col", "link_col", "code_col"):
+                self.assertIn(name, cols)
+            # 老订阅默认全 0 = 自动识别，行为跟升级前一致；进度必须留着
+            self.assertEqual(tuple(row), (380642, 0, 0, 0))
+
+
 class TestMigration(unittest.TestCase):
     """老库升级：`resource_hits` 没有 channel 列时，init 必须把它迁过来。
 

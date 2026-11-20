@@ -50,6 +50,13 @@ MAX_TITLE = 120
 # 一列里超过这个比例是 4 位码，就当提取码列。定 0.6 而不是 0.8：
 # 收集表常有人空着或写"无"。
 _CODE_COL_RATIO = 0.6
+# 「没有提取码」的常见写法。这些不是码，但**也不该算进分母**：
+# 真实收集表里它们占比很高（"无"能占一半以上），算进去整列比例就跌破阈值，
+# 结果是链接和标题都对、只有码整列丢了，最难被发现的一种残缺。
+_NO_CODE = frozenset({
+    "无", "没有", "不需", "不需要", "空", "暂无", "-", "—", "－", "/", "\\",
+    "n/a", "na", "none", "no", "null",
+})
 
 
 @dataclass(slots=True)
@@ -115,9 +122,13 @@ def _detect_header(row: list[str]) -> dict[int, str] | None:
     """第一行像表头就返回 {列号: 类型}，否则 None。"""
     kinds = {i: _header_kind(c) for i, c in enumerate(row)}
     hits = {i: k for i, k in kinds.items() if k}
-    # 至少两列认出来，或者至少认出一个标题列，才当表头。
-    # 只认出 1 个链接列就下结论，容易把「https://xxx」这种数据行误判成表头。
-    if len(hits) >= 2 or "title" in hits.values():
+    # 判据是「至少两列认出来，且其中必须有链接列或码列」。
+    #
+    # 早先写的是「≥2 列 **或者** 有标题列」，后者太松：首行常是
+    # 「2026年11月资源合集」这种大标题，命中「资源」就被当表头整行吃掉，
+    # 后面的真表头反而成了数据行。表头的本质特征是"有一列放链接"，
+    # 光有"标题"两个字不算。
+    if len(hits) >= 2 and any(k in ("link", "code") for k in hits.values()):
         return hits
     return None
 
@@ -132,6 +143,7 @@ def _code_column(rows: list[list[str]], header: dict[int, str] | None) -> int:
     best, best_ratio = -1, 0.0
     for idx in range(cols):
         values = [str(r[idx]).strip() for r in rows if idx < len(r) and str(r[idx]).strip()]
+        values = [v for v in values if v.lower() not in _NO_CODE]
         if len(values) < 3:
             continue
         ratio = sum(1 for v in values if _CODE_ONLY.match(v)) / len(values)
@@ -224,15 +236,137 @@ def assign_codes(text: str, links: list[str]) -> dict[str, str]:
     return out
 
 
+def check_link_column(rows: list[list[str]], link_col: int) -> str:
+    """人工指定的链接列指对了吗？返回警告文案，空串表示没问题。
+
+    指错的代价不是报错，是整表 0 条入库或者标题全变成备注，而定时任务
+    会安静地跑好几天。所以登记时就要拦。
+
+    两个必须算失败、但很容易被"放过"的形态：
+    - **这一列全是空的**。指到不存在的列（表只有 2 列却指了第 3 列）就是这样，
+      空集合会让"按比例算"的校验整条绕过去。
+    - 有内容但不到一半是链接。指到了备注列、分类列。
+    """
+    if link_col < 1:
+        return ""
+    hit = total = 0
+    for row in rows:
+        if len(row) < link_col:
+            continue
+        cell = str(row[link_col - 1]).strip()
+        if not cell:
+            continue
+        total += 1
+        if clean.extract_net_disk_links(cell):
+            hit += 1
+    if total == 0:
+        return f"第 {link_col} 列在前 40 行里全是空的，这一列不存在或不是链接列"
+    if hit / total < 0.5:
+        return f"第 {link_col} 列里只有 {hit}/{total} 行有网盘链接，列号八成不对"
+    return ""
+
+
+def iter_row_batches(
+    rows: list[list[str]], size: int = 5000
+) -> list[tuple[bool, list[list[str]]]]:
+    """把整表切成若干批，只让**第一批**去猜表头。
+
+    为什么不能每批各自猜：`parse_rows` 的自动表头检测是按"这一批的第一行"
+    判断的。38 万行的表切 76 批，只要某一批的首行标题里恰好有「资源」「链接」
+    这类词（比如一条资源就叫《资源链接大全》），它就被当成表头整行吃掉。
+    错误量级是"每批最多吃一行"，散在 76 个批次里，对账时根本看不出来。
+
+    返回 `[(是否第一批, 该批行), ...]`，调用方对非首批传 `has_header=False`。
+    """
+    if not rows:
+        return []
+    size = max(1, size)
+    return [
+        (start == 0, rows[start:start + size])
+        for start in range(0, len(rows), size)
+    ]
+
+
+def probe_columns(rows: list[list[str]], sample: int = 3) -> list[dict]:
+    """猜每列是干什么的，附样本值。给人看的，不是给解析用的。
+
+    自动识别永远有猜错的时候，而且猜错的表现是"数据看着有、就是搜不到"。
+    与其让人盲填列号，不如先把猜测和证据摆出来：看见第 2 列的样本是
+    `https://pan.quark.cn/...`，就知道该填 2；看见样本是「无」，就知道
+    那列是码列。
+    """
+    if not rows:
+        return []
+    header = _detect_header([str(c or "") for c in rows[0]])
+    body = rows[1:] if header else rows
+    if not body:
+        return []
+
+    title_col = _title_column(header)
+    code_col = _code_column(body, header)
+    cols = max((len(r) for r in body), default=0)
+
+    # 没有表头时也要猜标题列。收集表里"没有表头"比"表头写得不标准"更常见
+    # （很多作者直接从第一行开始填数据），探测报告里全标"其他"等于没探测。
+    # 判据：那一列有文字、不是链接、不是纯 4 位码，占比过半。
+    if title_col < 0:
+        best_col, best_ratio = -1, 0.0
+        for idx in range(cols):
+            values = [str(r[idx]).strip() for r in body if idx < len(r) and str(r[idx]).strip()]
+            if len(values) < 2:
+                continue
+            ratio = sum(1 for v in values if _looks_like_title(v)) / len(values)
+            if ratio > best_ratio:
+                best_col, best_ratio = idx, ratio
+        if best_ratio >= 0.5:
+            title_col = best_col
+
+    report: list[dict] = []
+    for idx in range(cols):
+        values = [str(r[idx]).strip() for r in body if idx < len(r) and str(r[idx]).strip()]
+        if not values:
+            continue
+        link_hits = sum(1 for v in values if clean.extract_net_disk_links(v))
+        code_hits = sum(1 for v in values if _CODE_ONLY.match(v))
+        if link_hits and link_hits >= len(values) * 0.5:
+            kind = "link"
+        elif code_col == idx:
+            kind = "code"
+        elif title_col == idx:
+            kind = "title"
+        elif link_hits:
+            kind = "mixed"          # 链接和别的东西混在一格
+        else:
+            kind = "other"
+        report.append({
+            "col": idx + 1,             # 对外一律 1 起，跟人看表格的方式一致
+            "kind": kind,
+            "filled": len(values),
+            "samples": values[:sample],
+        })
+    return report
+
+
 def parse_rows(
     rows: list[list[str]],
     *,
     has_header: bool | None = None,
     source_name: str = "doc",
+    title_col: int = 0,
+    link_col: int = 0,
+    code_col: int = 0,
 ) -> IntakeResult:
     """表格行 → 待入库条目。
 
     `has_header=None` 时自动判断（第一行认得出 ≥2 个表头词，或认出标题列）。
+
+    `title_col` / `link_col` / `code_col` 是**人工指定**，一律 1 起（跟表格里
+    看到的列号一致），0 表示"没指定，自己猜"。自动识别负责九成的表，剩下
+    一成结构不常规的（标题在第 3 列、链接在第 5 列、中间夹着分类和备注），
+    靠这三个参数一劳永逸——配置存在 `doc_sources` 上，每天定时任务照用。
+
+    指定了就不许猜：宁可报错让人改，也不要"猜一半"——半猜的结果是最难查的
+    那种错，链接对但标题错位，搜得到却点开是别的东西。
     """
     result = IntakeResult()
     if not rows:
@@ -248,8 +382,10 @@ def parse_rows(
         header = _detect_header([str(c or "") for c in rows[0]]) or {}
         body = rows[1:]
 
-    title_col = _title_column(header)
-    code_col = _code_column(rows if header is None else body, header)
+    # 对外 1 起，内部 1 起统一转 0 起下标；0 是哨兵值表示没指定
+    t_col = title_col - 1 if title_col > 0 else _title_column(header)
+    c_col = code_col - 1 if code_col > 0 else _code_column(rows if header is None else body, header)
+    l_col = link_col - 1 if link_col > 0 else -1
 
     for offset, row in enumerate(body):
         line_no = offset + (2 if header is not None else 1)
@@ -258,15 +394,24 @@ def parse_rows(
         result.rows += 1
 
         text = " ".join(str(c or "") for c in row)
-        links = clean.extract_net_disk_links(text)
+        if l_col >= 0:
+            cell = str(row[l_col]) if l_col < len(row) else ""
+            links = clean.extract_net_disk_links(cell)
+            if not links:
+                # 指定了列却在这列里找不到链接。单个空行是表里本来就有空单元格，
+                # 大面积出现才说明作者插了一列、列号错位了——由调用方按比例判断。
+                result.skipped.append((line_no, f"第 {l_col + 1} 列没有网盘链接"))
+                continue
+        else:
+            links = clean.extract_net_disk_links(text)
         if not links:
             result.skipped.append((line_no, "没有网盘链接"))
             continue
 
-        title = _row_title([str(c or "") for c in row], title_col, code_col)
+        title = _row_title([str(c or "") for c in row], t_col, c_col)
         row_code = ""
-        if 0 <= code_col < len(row):
-            raw = str(row[code_col]).strip()
+        if 0 <= c_col < len(row):
+            raw = str(row[c_col]).strip()
             if _CODE_ONLY.match(raw):
                 row_code = raw
 

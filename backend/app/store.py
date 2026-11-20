@@ -203,7 +203,13 @@ CREATE TABLE IF NOT EXISTS doc_sources (
     last_ok_at  INTEGER NOT NULL DEFAULT 0,
     last_error  TEXT    NOT NULL DEFAULT '',
     added_at    INTEGER NOT NULL,
-    enabled     INTEGER NOT NULL DEFAULT 1
+    enabled     INTEGER NOT NULL DEFAULT 1,
+    -- 人工指定的列号，0 = 自动识别。1 起（跟表格里数的一致）。
+    -- 存下来的意义在于：cron 每天跑，不可能每次都在命令行里重填一遍；
+    -- 而表格作者插一列，列号就会静默错位——所以导入时还要校验列内容。
+    title_col   INTEGER NOT NULL DEFAULT 0,
+    link_col    INTEGER NOT NULL DEFAULT 0,
+    code_col    INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_doc_sources ON doc_sources(pad_id, tab_id);
 """
@@ -232,8 +238,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """把老库升到当前结构。每次启动都跑，幂等，代价是一次 PRAGMA 查表。
 
     必须在 executescript(_SCHEMA) **之前**调用：建表语句全是 IF NOT EXISTS，
-    先执行建表会让老结构的 resource_hits 蒙混过关，迁移从此再也不会发生。
+    先执行建表会让老结构蒙混过关，迁移从此再也不会发生。
+
+    每一步**各自**判存在性，不许在函数开头统一 return —— 加第二个迁移点时
+    早退会让后来者永远不执行，而且完全没有报错。这个坑踩过一次。
     """
+    _migrate_hits_channel(conn)
+    _migrate_doc_columns(conn)
+
+
+def _migrate_hits_channel(conn: sqlite3.Connection) -> None:
     if not _has_table(conn, "resource_hits"):
         return
     if _has_column(conn, "resource_hits", "channel"):
@@ -267,6 +281,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_hits_query ON resource_hits(query, day DESC)"
     )
     log.info("资源库迁移：resource_hits 加 channel 列，%d 行历史命中归为 upstream", moved)
+
+
+def _migrate_doc_columns(conn: sqlite3.Connection) -> None:
+    """doc_sources 加三个列号字段。老订阅默认 0，走自动识别，行为不变。"""
+    if not _has_table(conn, "doc_sources"):
+        return
+    for name in ("title_col", "link_col", "code_col"):
+        if not _has_column(conn, "doc_sources", name):
+            conn.execute(
+                f"ALTER TABLE doc_sources ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+            )
 
 
 def init(db_path: str | Path) -> None:
@@ -790,12 +815,18 @@ def add_doc_source(
     tab_id: str = "",
     title: str = "",
     url: str = "",
+    title_col: int = 0,
+    link_col: int = 0,
+    code_col: int = 0,
     now: int | None = None,
 ) -> dict:
     """登记一份要长期跟的文档。已有的只补标题和链接，**不动进度**。
 
     进度不动是刻意的：同一份文档重复登记（换了个带 `?tab=` 的链接、或者
     手工重跑一次导入）不该把 `last_row` 清零，否则第二天会把 38 万行重拉一遍。
+
+    列号是例外——传了非 0 就覆盖。改了列配置立刻要生效，等下次登记没有意义。
+    想改回自动识别用 `set_doc_columns`（显式传 0）。
     """
     stamp = int(now if now is not None else time.time())
     with _session() as conn:
@@ -804,17 +835,40 @@ def add_doc_source(
             (pad_id, tab_id),
         ).fetchone()
         if row:
-            conn.execute(
-                "UPDATE doc_sources SET title=?, url=? WHERE id=?",
-                (title or "", url or "", row["id"]),
-            )
+            sets, args = ["title=?", "url=?"], [title or "", url or ""]
+            for name, val in (
+                ("title_col", title_col), ("link_col", link_col), ("code_col", code_col)
+            ):
+                if val:                       # 0 = 没指定，不动原值
+                    sets.append(f"{name}=?")
+                    args.append(int(val))
+            args.append(row["id"])
+            conn.execute(f"UPDATE doc_sources SET {', '.join(sets)} WHERE id=?", args)
             return {"id": int(row["id"]), "created": False, "last_row": int(row["last_row"])}
         cur = conn.execute(
-            "INSERT INTO doc_sources (url, pad_id, tab_id, title, added_at)"
-            " VALUES (?,?,?,?,?)",
-            (url or "", pad_id, tab_id, title or "", stamp),
+            "INSERT INTO doc_sources"
+            " (url, pad_id, tab_id, title, added_at, title_col, link_col, code_col)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (url or "", pad_id, tab_id, title or "", stamp,
+             int(title_col), int(link_col), int(code_col)),
         )
         return {"id": int(cur.lastrowid), "created": True, "last_row": 0}
+
+
+def set_doc_columns(
+    source_id: int, *, title_col: int = 0, link_col: int = 0, code_col: int = 0
+) -> bool:
+    """显式改写列配置。0 表示回到自动识别。
+
+    跟 `add_doc_source` 的区别：这里 0 是"清空"，那边 0 是"不改"。
+    要区分开，否则没法把配错的列配置撤掉。
+    """
+    with _session() as conn:
+        cur = conn.execute(
+            "UPDATE doc_sources SET title_col=?, link_col=?, code_col=? WHERE id=?",
+            (int(title_col), int(link_col), int(code_col), source_id),
+        )
+        return cur.rowcount > 0
 
 
 def list_doc_sources(*, enabled_only: bool = False) -> list[dict]:

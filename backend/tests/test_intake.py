@@ -22,6 +22,197 @@ import unittest
 from app import intake
 
 
+class TableVariationTest(unittest.TestCase):
+    """不同作者建的表，形状不一样。这三条是"结构差异真的会让数据变少"的地方。"""
+
+    Q = "https://pan.quark.cn/s/a1"
+    B = "https://pan.baidu.com/s/1b2"
+    X = "https://pan.xunlei.com/s/c3"
+
+    def test_big_title_row_is_not_header(self):
+        """首行是「2026年11月资源合集」这种大标题，不能整行吃掉。
+
+        它含「资源」两个字，会被 `_header_kind` 认成标题列。原来的判据是
+        「认得 ≥2 列 **或** 有标题列」，单个标题词就成立，于是这一行凭空消失。
+        """
+        rows = [
+            ["2026年11月资源合集"],
+            ["资源名称", "网盘链接", "提取码"],
+            ["三体", self.Q, "1234"],
+        ]
+        result = intake.parse_rows(rows)
+        self.assertEqual(result.rows, 3)      # 大标题行也要算进来
+        self.assertEqual(result.resources, 1)
+
+    def test_later_batch_does_not_treat_data_as_header(self):
+        """分批导入时，第二批的首行是数据行，不许当表头。
+
+        `docs_watch` 每 5000 行切一批，原来每批都独立自动检测表头。
+        某行标题恰好写成「资源链接大全」，它会被认成表头然后整行丢掉——
+        每多一批就可能多吃一行，38 万行的表能吃几十条。
+        """
+        rows = [["名称", "链接"]] + [["片名", self.Q]] * 3 + [["资源链接大全", self.B]]
+        batches = list(intake.iter_row_batches(rows, size=4))
+        self.assertEqual([head for head, _ in batches], [True, False])
+
+        total = 0
+        for head, chunk in batches:
+            total += intake.parse_rows(
+                chunk, has_header=None if head else False
+            ).resources
+        self.assertEqual(total, 4)
+
+    def test_code_column_tolerates_no_password_markers(self):
+        """码列里大量「无」不该把整列拖到阈值以下。
+
+        真实收集表里"没有提取码"常常写「无」，原来这些值算进分母，
+        7 行里 3 个码 + 4 个无 → 0.43，整列码全部丢掉。链接和标题都在，
+        只有码没了——这种残缺最难被发现。
+        """
+        rows = [
+            [self.Q, "a", "1111"],
+            [self.B, "b", "2222"],
+            [self.X, "c", "3333"],
+            [self.Q, "d", "无"],
+            [self.B, "e", "无"],
+            [self.X, "f", "无"],
+            [self.Q, "g", "无"],
+        ]
+        result = intake.parse_rows(rows, has_header=False)
+        self.assertEqual([i["sharePwd"] for i in result.items], ["1111", "2222", "3333", "", "", "", ""])
+
+
+class ExplicitColumnTest(unittest.TestCase):
+    """人工指定列号。自动识别猜错时，这是唯一的确定性出口。"""
+
+    Q = "https://pan.quark.cn/s/a1"
+    B = "https://pan.baidu.com/s/1b2"
+
+    def test_odd_shape_table(self):
+        """表头用「影片」「下载」这类词，自动识别认不出标题列和链接列。
+
+        真实表里就有这么写的。认不出的后果不是报错，是 `_row_title` 退回
+        "取行内最长的像标题的格子"——备注写得比标题长，标题就成了备注。
+        指定列号才能拿到真标题。
+        """
+        rows = [
+            ["序号", "分类", "影片", "备注", "下载", "码"],
+            ["1", "影视", "三体", "4K HDR 杜比视界内封中字超高清合集", self.Q, "ab12"],
+            ["2", "剧集", "狂飙", "全 39 集 4K 内封字幕版 附花絮", self.B, "cd34"],
+        ]
+        auto = intake.parse_rows(rows)
+        self.assertEqual(
+            [i["title"] for i in auto.items],
+            ["4K HDR 杜比视界内封中字超高清合集", "全 39 集 4K 内封字幕版 附花絮"],
+        )
+
+        fixed = intake.parse_rows(rows, title_col=3, link_col=5, code_col=6)
+        self.assertEqual([i["title"] for i in fixed.items], ["三体", "狂飙"])
+        self.assertEqual([i["sharePwd"] for i in fixed.items], ["ab12", "cd34"])
+        self.assertEqual([i["shareUrl"] for i in fixed.items], [self.Q, self.B])
+
+    def test_link_column_excludes_other_columns(self):
+        """指定了链接列，别的列里的链接不该被一起收进来。
+
+        "备用链接"列是常见结构。不指定列时整行扫描会把备用链接也入库，
+        同一行产出两条资源、标题还一样，看起来像重复数据。
+        """
+        rows = [
+            ["资源名称", "主链接", "备用链接"],
+            ["三体全集", self.Q, self.B],
+        ]
+        auto = intake.parse_rows(rows)
+        self.assertEqual(auto.resources, 2)
+
+        fixed = intake.parse_rows(rows, title_col=1, link_col=2)
+        self.assertEqual(fixed.resources, 1)
+        self.assertEqual(fixed.items[0]["shareUrl"], self.Q)
+
+    def test_wrong_column_is_reported_not_silent(self):
+        """列号写错（或作者插了一列）时，必须报出来。
+
+        静默的下场比报错糟得多：链接列指到了备注列，整表 0 条入库，
+        而报表只写"读到 5000 行、新增 0"，看不出是配置错了。
+        """
+        rows = [["名称", "备注", "链接"], ["三体", "高清", self.Q]]
+        result = intake.parse_rows(rows, title_col=1, link_col=2)
+        self.assertEqual(result.resources, 0)
+        self.assertEqual(len(result.skipped), 1)
+        self.assertIn("第 2 列", result.skipped[0][1])
+
+    def test_columns_are_one_based(self):
+        """列号跟人在表格里数的一致，第一列是 1 不是 0。"""
+        rows = [["三体全集", self.Q], ["狂飙", self.B]]
+        result = intake.parse_rows(rows, has_header=False, title_col=1, link_col=2)
+        self.assertEqual([i["title"] for i in result.items], ["三体全集", "狂飙"])
+
+    def test_zero_means_auto(self):
+        rows = [["名称", "链接"], ["三体", self.Q]]
+        auto = intake.parse_rows(rows)
+        explicit_zero = intake.parse_rows(rows, title_col=0, link_col=0, code_col=0)
+        self.assertEqual([i["title"] for i in auto.items],
+                         [i["title"] for i in explicit_zero.items])
+
+
+class CheckLinkColumnTest(unittest.TestCase):
+    """登记时校验人工指定的链接列。指错了要在登记这一刻就拦下来。"""
+
+    Q = "https://pan.quark.cn/s/a1"
+
+    def test_good_column_passes(self):
+        rows = [["三体", self.Q], ["狂飙", "https://pan.baidu.com/s/1b2"]]
+        self.assertEqual(intake.check_link_column(rows, 2), "")
+
+    def test_wrong_column_warns(self):
+        rows = [["三体", "高清 4K", self.Q], ["狂飙", "1080P", "https://pan.baidu.com/s/1b2"]]
+        warn = intake.check_link_column(rows, 2)
+        self.assertIn("只有 0/2", warn)
+
+    def test_empty_column_is_failure_not_unknown(self):
+        """这一列全空 = 指到了不存在的列，不是"没数据所以判断不了"。
+
+        原来 `if total and ...` 把总数为 0 的情形直接放过了，
+        结果 `--set-cols 2 --link-col 3` 在只有两列的表上被当成"没问题"，
+        配置写进库，定时任务每天导入 0 条。
+        """
+        rows = [["三体", self.Q], ["狂飙", "https://pan.baidu.com/s/1b2"]]
+        warn = intake.check_link_column(rows, 3)
+        self.assertNotEqual(warn, "")
+        self.assertIn("全是空", warn)
+
+    def test_zero_means_not_configured(self):
+        self.assertEqual(intake.check_link_column([["x"]], 0), "")
+
+
+class ProbeColumnsTest(unittest.TestCase):
+    def test_reports_kinds_and_samples(self):
+        """探测结果要带样本值，人才能核对列号对不对。"""
+        rows = [
+            ["序号", "资源名称", "下载地址", "提取码"],
+            ["1", "三体全集", "https://pan.quark.cn/s/a1", "ab12"],
+            ["2", "狂飙", "https://pan.baidu.com/s/1b2", "cd34"],
+        ]
+        report = intake.probe_columns(rows)
+        kinds = {item["col"]: item["kind"] for item in report}
+        self.assertEqual(kinds[1], "other")     # 序号
+        self.assertEqual(kinds[2], "title")
+        self.assertEqual(kinds[3], "link")
+        self.assertEqual(kinds[4], "code")
+        link = next(i for i in report if i["col"] == 3)
+        self.assertIn("pan.quark.cn", link["samples"][0])
+        self.assertEqual(link["filled"], 2)
+
+    def test_no_header_still_probes(self):
+        """没有表头也要能探测，不然新表第一次登记就抓瞎。"""
+        rows = [
+            ["三体全集", "https://pan.quark.cn/s/a1"],
+            ["狂飙", "https://pan.baidu.com/s/1b2"],
+        ]
+        report = intake.probe_columns(rows)
+        kinds = {item["col"]: item["kind"] for item in report}
+        self.assertEqual(kinds[2], "link")
+
+
 class HeaderTest(unittest.TestCase):
     def test_header_detected(self):
         rows = [["片名", "夸克链接", "提取码"], ["三体", "https://pan.quark.cn/s/a1", "8k2m"]]
