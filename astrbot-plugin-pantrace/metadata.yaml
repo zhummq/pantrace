@@ -1,0 +1,10 @@
+name: astrbot_plugin_pantrace
+display_name: 盘迹网盘搜索
+desc: 通过 PanTrace 后端搜索网盘资源，支持夸克/百度/阿里等平台，群聊私聊通用。
+version: v1.0.0
+author: 老编
+repo: 无
+support_platforms:
+  - qq_official
+  - qq_official_webhook
+  - aiocqhttp

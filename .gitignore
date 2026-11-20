@@ -15,6 +15,10 @@ backend/data/
 *.log
 _preview.html
 
+# 插件打包产物。源码在 astrbot-plugin-pantrace/，改了源码就得重打一次，
+# zip 跟着入库只会长期对不上；要发版直接从这里打
+astrbot-plugin-pantrace.zip
+
 # 竞品参考源码（只读借鉴，绝不入库）
 xiageba2/
 pansou/
