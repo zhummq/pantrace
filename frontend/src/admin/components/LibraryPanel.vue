@@ -125,6 +125,7 @@ async function probe() {
       tab._titleCol = null
       tab._linkCol = null
       tab._codeCol = null
+      tab._startRow = null
       if (!tab.error && (!biggest || tab.max_row > biggest.max_row)) biggest = tab
     }
     if (biggest) biggest._pick = true
@@ -168,6 +169,7 @@ async function addSelected() {
   addMsg.value = ''
   const warnings = []
   const fresh = []
+  const reset = []
   try {
     for (const tab of tabs) {
       const got = await api.libraryAdd({
@@ -177,20 +179,26 @@ async function addSelected() {
         title_col: tab._titleCol || 0,
         link_col: tab._linkCol || 0,
         code_col: tab._codeCol || 0,
+        start_row: tab._startRow || 0,
       })
       if (got.warning) warnings.push(`${tab.title}：${got.warning}`)
       if (got.created) fresh.push({ id: got.id, title: tab.title })
+      else if (got.reset) reset.push({ id: got.id, title: tab.title })
     }
     await refresh()
     // 新登记的立刻起抓取。用户的目的就是"把数据加进来"，
     // 让他再点一次"开始抓"只是在制造一步多余的操作。
-    for (const item of fresh) {
+    // 配错后重导（配置变了）同理：他要的是"按新配置重来一遍"。
+    for (const item of fresh.concat(reset)) {
       await api.librarySync(item.id).catch(() => {})
     }
     const names = fresh.map((f) => f.title).join('、')
     addMsg.value = fresh.length
       ? `已登记 ${fresh.length} 份（${names}），正在抓取——进度看下面的列表。`
       : '这些表之前已经登记过，没有重复添加。'
+    if (reset.length) {
+      addMsg.value += ` ${reset.length} 份改了列号/起始行，进度已归零，正在按新配置重读。`
+    }
     if (warnings.length) addMsg.value += ' ⚠ ' + warnings.join('；')
     doc.value = null
     url.value = ''
@@ -247,6 +255,7 @@ function openEdit(src) {
     title: src.title_col || 0,
     link: src.link_col || 0,
     code: src.code_col || 0,
+    start: src.start_row || 0,
   }
 }
 
@@ -257,6 +266,7 @@ async function saveEdit(src) {
       title_col: Number(editCols.value.title) || 0,
       link_col: Number(editCols.value.link) || 0,
       code_col: Number(editCols.value.code) || 0,
+      start_row: Number(editCols.value.start) || 0,
     })
     editing.value = 0
     await refresh()
@@ -342,6 +352,7 @@ function colsText(src) {
   if (src.title_col) parts.push(`标${src.title_col}`)
   if (src.link_col) parts.push(`链${src.link_col}`)
   if (src.code_col) parts.push(`码${src.code_col}`)
+  if (src.start_row) parts.push(`起${src.start_row}`)
   return parts.length ? parts.join(' ') : '自动'
 }
 
@@ -460,7 +471,32 @@ onUnmounted(stopPolling)
                 提取码列
                 <input v-model.number="tab._codeCol" type="number" min="0" max="40" placeholder="自动" />
               </label>
-              <span class="lib-hint lib-inline">留空 = 自动识别；数字按表格里看到的列号填</span>
+              <label>
+                数据起始行
+                <input v-model.number="tab._startRow" type="number" min="0" :max="tab.max_row" placeholder="第 1 行" />
+              </label>
+              <span class="lib-hint lib-inline">留空 = 自动识别；数字按表格里看到的行列号填</span>
+            </div>
+
+            <div v-if="tab.preview && tab.preview.length" class="lib-preview">
+              <div class="lib-preview-head">
+                表格开头长这样
+                <span class="lib-muted">点行号即设为起始行</span>
+              </div>
+              <table>
+                <tr v-for="row in tab.preview" :key="row.line">
+                  <th
+                    class="lib-preview-n"
+                    :class="{ on: tab._startRow === row.line }"
+                    @click="tab._startRow = row.line"
+                  >
+                    {{ row.line }}
+                  </th>
+                  <td v-for="(cell, i) in row.cells" :key="i" :class="{ weak: !cell.trim() }">
+                    {{ cell.trim() || '（空）' }}
+                  </td>
+                </tr>
+              </table>
             </div>
 
             <div class="lib-probe">
@@ -544,12 +580,16 @@ onUnmounted(stopPolling)
                 <label>标题列 <input v-model.number="editCols.title" type="number" min="0" max="40" placeholder="自动" /></label>
                 <label>链接列 <input v-model.number="editCols.link" type="number" min="0" max="40" placeholder="自动" /></label>
                 <label>提取码列 <input v-model.number="editCols.code" type="number" min="0" max="40" placeholder="自动" /></label>
+                <label>起始行 <input v-model.number="editCols.start" type="number" min="0" placeholder="1" /></label>
                 <button class="btn-primary lib-mini" :disabled="busy[src.id]" @click="saveEdit(src)">
                   {{ busy[src.id] ? '校验中…' : '保存' }}
                 </button>
                 <button class="btn-ghost lib-mini" @click="editing = 0">取消</button>
               </div>
-              <div class="lib-hint">留空 = 自动识别。保存时后端会真的去读那几列，指错了不让存。</div>
+              <div class="lib-hint">
+                留空 = 自动识别。保存时后端会真的去读那几列，指错了不让存。
+                <b>起始行改了会把进度归零，下一轮从头重读一遍</b>——否则旧配置下入库的错数据会一直留着。
+              </div>
               <div v-if="rowError[src.id]" class="lib-row-err">{{ rowError[src.id] }}</div>
             </div>
           </div>
@@ -571,7 +611,7 @@ onUnmounted(stopPolling)
             >
               {{ (src.job || {}).state === 'running' ? '抓取中' : '立即抓取' }}
             </button>
-            <button class="btn-ghost lib-mini" @click="openEdit(src)">改列号</button>
+            <button class="btn-ghost lib-mini" @click="openEdit(src)">改配置</button>
             <button class="btn-ghost lib-mini" :disabled="busy[src.id]" @click="toggle(src)">
               {{ src.enabled ? '暂停' : '恢复' }}
             </button>
@@ -581,7 +621,8 @@ onUnmounted(stopPolling)
 
         <p class="lib-hint lib-foot">
           删除订阅只停掉每日抓取，<b>已入库的资源不动</b>。
-          列号锁死后，如果表格作者插了一列，下次抓取会大面积"第 N 列没有链接"——那就是该回来改列号了。
+          列号锁死后，如果表格作者插了一列，下次抓取会大面积"第 N 列没有链接"——那就是该回来改配置了。
+          <b>改列号或起始行会把进度归零</b>，下一轮从头重读（upsert，不会产生重复）。
         </p>
       </div>
     </div>

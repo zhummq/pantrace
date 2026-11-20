@@ -2728,6 +2728,76 @@ textarea::placeholder {
   background: var(--surface-3);
 }
 
+/* 表头预览。列样本回答"哪列是链接"，回答不了"第一条资源在第几行"——
+   那得看整行长什么样，才知道哪行是作者写的广告。行号可点，点了就是起始行。 */
+.lib-preview {
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+}
+
+.lib-preview-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+  font-size: var(--text-xs);
+  color: var(--ink-2);
+}
+
+.lib-preview table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+}
+
+.lib-preview td,
+.lib-preview th {
+  max-width: 240px;
+  padding: 3px 10px 3px 0;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-bottom: 1px dashed var(--line);
+}
+
+.lib-preview tr:last-child td,
+.lib-preview tr:last-child th {
+  border-bottom: 0;
+}
+
+.lib-preview td {
+  color: var(--ink-2);
+}
+
+.lib-preview td.weak {
+  color: var(--faint);
+}
+
+.lib-preview-n {
+  width: 36px;
+  padding-right: 12px !important;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right !important;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.lib-preview-n:hover {
+  color: var(--brand-hover);
+}
+
+.lib-preview-n.on {
+  color: var(--on-brand);
+  background: var(--brand);
+}
+
 .lib-col-sample {
   font-family: var(--mono);
   color: var(--ink-2);

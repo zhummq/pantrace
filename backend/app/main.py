@@ -1930,6 +1930,7 @@ class DocSourceIn(BaseModel):
     title_col: int = 0
     link_col: int = 0
     code_col: int = 0
+    start_row: int = 0
 
 
 class DocSourcePatch(BaseModel):
@@ -1938,6 +1939,7 @@ class DocSourcePatch(BaseModel):
     title_col: int | None = None
     link_col: int | None = None
     code_col: int | None = None
+    start_row: int | None = None
     enabled: bool | None = None
 
 
@@ -2008,7 +2010,12 @@ async def admin_library_add(payload: DocSourceIn, request: Request):
     url = (payload.url or "").strip()
     if not url:
         return JSONResponse(status_code=400, content={"code": 400, "msg": "链接不能为空"})
-    cols = {"title_col": payload.title_col, "link_col": payload.link_col, "code_col": payload.code_col}
+    cols = {
+        "title_col": payload.title_col,
+        "link_col": payload.link_col,
+        "code_col": payload.code_col,
+        "start_row": payload.start_row,
+    }
 
     try:
         pad_id, tab_id = await asyncio.to_thread(_pad_and_tab, url, payload.tab_id)
@@ -2041,7 +2048,14 @@ def _pad_and_tab(url: str, tab_id: str) -> tuple[str, str]:
 
 @app.patch("/api/admin/library/sources/{sid}", include_in_schema=False)
 async def admin_library_patch(sid: int, payload: DocSourcePatch, request: Request):
-    """改列配置 / 启停。改列配置要校验，指错了直接拒——这是唯一能在写入前拦住的机会。"""
+    """改列配置 / 起始行 / 启停。
+
+    改列配置要校验，指错了直接拒——这是唯一能在写入前拦住的机会。
+
+    **列号或起始行真变了，就把进度归零。** 已入库那批是按旧配置解析的，
+    不重读的话错数据会一直躺在库里，而新配置只对以后新增的行生效。
+    归零后下一轮从头读一遍（upsert，不会重复），代价是表大的话要重跑几分钟。
+    """
     if not LIBRARY_ON:
         return _library_off()
     if not _admin_allowed(request):
@@ -2053,11 +2067,13 @@ async def admin_library_patch(sid: int, payload: DocSourcePatch, request: Reques
     if payload.enabled is not None:
         store.set_doc_enabled(sid, payload.enabled)
 
-    if payload.title_col is not None or payload.link_col is not None or payload.code_col is not None:
+    touched = (payload.title_col, payload.link_col, payload.code_col, payload.start_row)
+    if any(v is not None for v in touched):
         cols = {
             "title_col": payload.title_col if payload.title_col is not None else int(src["title_col"]),
             "link_col": payload.link_col if payload.link_col is not None else int(src["link_col"]),
             "code_col": payload.code_col if payload.code_col is not None else int(src["code_col"]),
+            "start_row": payload.start_row if payload.start_row is not None else int(src["start_row"]),
         }
         if cols["link_col"]:
             try:
@@ -2068,13 +2084,15 @@ async def admin_library_patch(sid: int, payload: DocSourcePatch, request: Reques
                 return JSONResponse(status_code=400, content={"code": 400, "msg": str(exc)})
             if warn:
                 return JSONResponse(status_code=400, content={"code": 400, "msg": warn})
-        store.set_doc_columns(
-            sid,
-            title_col=cols["title_col"],
-            link_col=cols["link_col"],
-            code_col=cols["code_col"],
-        )
-    return {"code": 0, "data": {"id": sid}}
+        changed = any(int(src.get(k) or 0) != int(v) for k, v in cols.items())
+        if changed and library_sync.is_running(sid):
+            return JSONResponse(
+                status_code=409,
+                content={"code": 409, "msg": "这份表正在抓取，等它跑完再改配置"},
+            )
+        store.set_doc_columns(sid, reset_progress=changed, **cols)
+        return {"code": 0, "data": {"id": sid, "reset": changed}}
+    return {"code": 0, "data": {"id": sid, "reset": False}}
 
 
 @app.delete("/api/admin/library/sources/{sid}", include_in_schema=False)

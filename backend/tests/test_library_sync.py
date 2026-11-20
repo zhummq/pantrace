@@ -98,6 +98,103 @@ class ColsTest(SyncTestBase):
         src = next(s for s in store.list_doc_sources() if s["id"] == got["id"])
         self.assertEqual(library_sync.cols_of(src), {"title_col": 3, "link_col": 5, "code_col": 6})
 
+    def test_ncols_covers_far_column(self):
+        """指定的列在第 5 列，就得读 5 列。
+
+        之前固定读 3 列：第 5 列永远读回来是空串，整张表一条也入不了库，
+        而表现不是报错，是"全部跳过"——最难查的那种。
+        """
+        src = dict(self.source(), title_col=1, link_col=5, code_col=0)
+        self.assertEqual(library_sync.read_ncols(src), 5)
+
+    def test_ncols_keeps_scan_floor(self):
+        """没指定或指定在前几列时，仍读满 COLUMN_SCAN——自动识别要看样本。"""
+        src = dict(self.source(), title_col=1, link_col=2)
+        self.assertEqual(library_sync.read_ncols(src), library_sync.docs_qq.COLUMN_SCAN)
+
+
+class StartRowTest(SyncTestBase):
+    """用户指了"第 3 行开始才是资源"，就从第 3 行读、且不许再猜表头。"""
+
+    Q = "https://pan.quark.cn/s/a1"
+
+    def _fake_read(self, seen: list):
+        class _Meta:
+            rev = "r1"
+            title = "测试表"
+
+            def tab(self, _tid):
+                class _Tab:
+                    title = "测试表"
+                    max_row = 4
+                return _Tab()
+
+        def inner(url, **kw):
+            seen.append(kw)
+            # 起始行之前的广告行根本不会被读回来——这正是这个配置的意义
+            return [
+                ["踢毽子视频教学", "https://pan.quark.cn/s/c1"],
+                ["植物大战僵尸", "https://pan.quark.cn/s/c2"],
+            ], _Meta()
+
+        return inner
+
+    def test_reads_from_start_row(self):
+        got = store.add_doc_source(pad_id="DWs", tab_id="t1", url="https://docs.qq.com/sheet/DWs", start_row=3)
+        src = next(s for s in store.list_doc_sources() if s["id"] == got["id"])
+        seen: list = []
+        with patch.object(library_sync.docs_qq, "read_tab", self._fake_read(seen)):
+            report = library_sync.sync_one(src, dry_run=True)
+        self.assertEqual(seen[0]["start_row"], 2)      # 1 起转 0 起
+        self.assertEqual(report.added, 2)              # 第一行没有被当表头吃掉
+
+    def test_first_line_offset_keeps_report_rows_absolute(self):
+        """增量只读后半段时，报告里的行号要对得上原表，不能从 1 重新数。"""
+        rows = [["三体", "https://pan.quark.cn/s/d1"], ["狂飙", "没有链接"]]
+        got = library_sync.ingest_rows(rows, "test", assume_header=False, first_line=101)
+        self.assertEqual(got["skipped"][0][0], 102)
+
+    def test_changing_config_resets_progress(self):
+        """改了列号/起始行，进度归零——否则旧配置下入库的错数据永远留着。"""
+        got = store.add_doc_source(pad_id="DWc", tab_id="t", url="u", title_col=1, link_col=2)
+        store.save_doc_progress(got["id"], last_row=380000)
+        store.set_doc_columns(got["id"], title_col=1, link_col=3, start_row=2, reset_progress=True)
+        after = next(s for s in store.list_doc_sources() if s["id"] == got["id"])
+        self.assertEqual(after["last_row"], 0)
+        self.assertEqual(after["start_row"], 2)
+
+    def test_saving_same_config_keeps_progress(self):
+        got = store.add_doc_source(pad_id="DWk", tab_id="t", url="u", title_col=1, link_col=2)
+        store.save_doc_progress(got["id"], last_row=900)
+        store.set_doc_columns(got["id"], title_col=1, link_col=2, reset_progress=False)
+        after = next(s for s in store.list_doc_sources() if s["id"] == got["id"])
+        self.assertEqual(after["last_row"], 900)
+
+    def test_readd_with_new_config_resets_progress(self):
+        """同一张表重导、但起始行变了：进度要归零。
+
+        不归零的话，已入库的那批还是按旧配置解析的，人看到"已登记过"会
+        以为修好了，实际错数据一直躺着。
+        """
+        first = store.add_doc_source(pad_id="DWr", tab_id="t", url="u", title_col=1, link_col=2)
+        store.save_doc_progress(first["id"], last_row=5000)
+        again = store.add_doc_source(
+            pad_id="DWr", tab_id="t", url="u", title_col=1, link_col=2, start_row=3
+        )
+        self.assertFalse(again["created"])
+        self.assertTrue(again["reset"])
+        self.assertEqual(again["last_row"], 0)
+
+    def test_readd_identical_config_keeps_progress(self):
+        """单纯重复点了一次导入（配置没变）不许把 38 万行重拉一遍。"""
+        first = store.add_doc_source(pad_id="DWq", tab_id="t", url="u", title_col=1, link_col=2)
+        store.save_doc_progress(first["id"], last_row=5000)
+        again = store.add_doc_source(
+            pad_id="DWq", tab_id="t", url="u", title_col=1, link_col=2
+        )
+        self.assertFalse(again["reset"])
+        self.assertEqual(again["last_row"], 5000)
+
 
 class SkipSummaryTest(unittest.TestCase):
     def test_groups_by_reason(self):

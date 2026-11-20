@@ -354,10 +354,13 @@ class TestDocSources(StoreTestBase):
         src = next(s for s in store.list_doc_sources() if s["id"] == got["id"])
         self.assertEqual((src["title_col"], src["link_col"], src["code_col"]), (3, 5, 6))
 
-    def test_readd_keeps_progress_but_updates_columns(self):
-        """重复登记：进度不许清零，但列配置要能改。
+    def test_readd_with_changed_columns_resets_progress(self):
+        """重复登记：列配置改了，进度跟着归零。
 
-        进度清零会让第二天把 38 万行重拉一遍；列配置不改则改错了撤不回来。
+        原来是"改列号但不动进度"，理由是"别让第二天重拉 38 万行"。但那条
+        理由只适用于**配置没变**的重复登记。真改了列号，说明上一次配错了，
+        已入库的那批还是按旧列号解析的——不重读，错数据会一直躺着，
+        而人看到"已登记过、没重复添加"会以为修好了。
         """
         first = store.add_doc_source(pad_id="DWabc", tab_id="t1", title="资源表")
         store.save_doc_progress(first["id"], last_row=12345)
@@ -366,9 +369,21 @@ class TestDocSources(StoreTestBase):
             pad_id="DWabc", tab_id="t1", title="资源表", link_col=4
         )
         self.assertEqual(again["id"], first["id"])
+        self.assertTrue(again["reset"])
+        src = next(s for s in store.list_doc_sources() if s["id"] == first["id"])
+        self.assertEqual(src["last_row"], 0)
+        self.assertEqual(src["link_col"], 4)
+
+    def test_readd_with_same_columns_keeps_progress(self):
+        """配置没变的重复登记（手快点两次导入）不许重拉。"""
+        first = store.add_doc_source(pad_id="DWsame", tab_id="t1", title_col=1, link_col=2)
+        store.save_doc_progress(first["id"], last_row=12345)
+        again = store.add_doc_source(
+            pad_id="DWsame", tab_id="t1", title_col=1, link_col=2
+        )
+        self.assertFalse(again["reset"])
         src = next(s for s in store.list_doc_sources() if s["id"] == first["id"])
         self.assertEqual(src["last_row"], 12345)
-        self.assertEqual(src["link_col"], 4)
 
     def test_readd_with_zero_leaves_columns_alone(self):
         """不传列号（0）是"不改"，不是"清空"。"""

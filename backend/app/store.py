@@ -211,7 +211,12 @@ CREATE TABLE IF NOT EXISTS doc_sources (
     -- 而表格作者插一列，列号就会静默错位——所以导入时还要校验列内容。
     title_col   INTEGER NOT NULL DEFAULT 0,
     link_col    INTEGER NOT NULL DEFAULT 0,
-    code_col    INTEGER NOT NULL DEFAULT 0
+    code_col    INTEGER NOT NULL DEFAULT 0,
+    -- 第一条真数据在第几行（1 起），0 = 没指定、从头读。
+    -- 表头那几行是作者写的说明/广告（"最新资源在下方，找资源+v"），
+    -- 它们长得跟数据一样、位置也不固定，靠猜永远有例外。让人直接说第几行
+    -- 开始是资源，比让程序去识别"看起来不像广告"可靠得多。
+    start_row   INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_doc_sources ON doc_sources(pad_id, tab_id);
 """
@@ -286,10 +291,10 @@ def _migrate_hits_channel(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_doc_columns(conn: sqlite3.Connection) -> None:
-    """doc_sources 加三个列号字段。老订阅默认 0，走自动识别，行为不变。"""
+    """doc_sources 加列号/起始行字段。老订阅默认 0，走自动识别，行为不变。"""
     if not _has_table(conn, "doc_sources"):
         return
-    for name in ("title_col", "link_col", "code_col"):
+    for name in ("title_col", "link_col", "code_col", "start_row"):
         if not _has_column(conn, "doc_sources", name):
             conn.execute(
                 f"ALTER TABLE doc_sources ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
@@ -820,41 +825,61 @@ def add_doc_source(
     title_col: int = 0,
     link_col: int = 0,
     code_col: int = 0,
+    start_row: int = 0,
     now: int | None = None,
 ) -> dict:
-    """登记一份要长期跟的文档。已有的只补标题和链接，**不动进度**。
+    """登记一份要长期跟的文档。已有的只补标题/列配置，**默认不动进度**。
 
     进度不动是刻意的：同一份文档重复登记（换了个带 `?tab=` 的链接、或者
     手工重跑一次导入）不该把 `last_row` 清零，否则第二天会把 38 万行重拉一遍。
 
     列号是例外——传了非 0 就覆盖。改了列配置立刻要生效，等下次登记没有意义。
     想改回自动识别用 `set_doc_columns`（显式传 0）。
+
+    列号/起始行**真的变了**会把进度归零：那说明上一次配错了，已入库的那批
+    还是按旧配置解析的，不重读就永远错着。配置没变则照旧不动。
     """
     stamp = int(now if now is not None else time.time())
     with _session() as conn:
         row = conn.execute(
-            "SELECT id, last_row FROM doc_sources WHERE pad_id=? AND tab_id=?",
+            "SELECT id, last_row, title_col, link_col, code_col, start_row"
+            " FROM doc_sources WHERE pad_id=? AND tab_id=?",
             (pad_id, tab_id),
         ).fetchone()
         if row:
             sets, args = ["title=?", "url=?"], [title or "", url or ""]
+            changed = False
             for name, val in (
-                ("title_col", title_col), ("link_col", link_col), ("code_col", code_col)
+                ("title_col", title_col), ("link_col", link_col),
+                ("code_col", code_col), ("start_row", start_row),
             ):
                 if val:                       # 0 = 没指定，不动原值
+                    if int(row[name] or 0) != int(val):
+                        changed = True
                     sets.append(f"{name}=?")
                     args.append(int(val))
+            # 重新导入同一张表、但列号/起始行跟上一次不一样：说明上一次配错了。
+            # 只改配置不重读，已经入库的那批仍是按旧配置解析的错数据——
+            # 而人看到"已登记过，没重复添加"会以为修好了。所以这里跟着归零。
+            # 配置没变（单纯重复点了一次导入）照旧不动进度。
+            if changed:
+                sets += ["last_row=0", "last_rev=''", "last_error=''"]
             args.append(row["id"])
             conn.execute(f"UPDATE doc_sources SET {', '.join(sets)} WHERE id=?", args)
-            return {"id": int(row["id"]), "created": False, "last_row": int(row["last_row"])}
+            return {
+                "id": int(row["id"]),
+                "created": False,
+                "last_row": 0 if changed else int(row["last_row"]),
+                "reset": changed,
+            }
         cur = conn.execute(
             "INSERT INTO doc_sources"
-            " (url, pad_id, tab_id, title, added_at, title_col, link_col, code_col)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            " (url, pad_id, tab_id, title, added_at, title_col, link_col, code_col, start_row)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (url or "", pad_id, tab_id, title or "", stamp,
-             int(title_col), int(link_col), int(code_col)),
+             int(title_col), int(link_col), int(code_col), int(start_row)),
         )
-        return {"id": int(cur.lastrowid), "created": True, "last_row": 0}
+        return {"id": int(cur.lastrowid), "created": True, "last_row": 0, "reset": False}
 
 
 def set_doc_enabled(source_id: int, enabled: bool) -> bool:
@@ -867,18 +892,30 @@ def set_doc_enabled(source_id: int, enabled: bool) -> bool:
 
 
 def set_doc_columns(
-    source_id: int, *, title_col: int = 0, link_col: int = 0, code_col: int = 0
+    source_id: int,
+    *,
+    title_col: int = 0,
+    link_col: int = 0,
+    code_col: int = 0,
+    start_row: int = 0,
+    reset_progress: bool = False,
 ) -> bool:
     """显式改写列配置。0 表示回到自动识别。
 
     跟 `add_doc_source` 的区别：这里 0 是"清空"，那边 0 是"不改"。
     要区分开，否则没法把配错的列配置撤掉。
+
+    `reset_progress` 由调用方判断——列号或起始行真变了才传 True。原因：
+    已入库的那批是按旧列号解析的，改完配置只对新行生效，历史数据会一直错着。
+    归零后下一轮从头重读一遍（upsert，不会产生重复），错配的标题才会被覆盖。
     """
+    sets = "title_col=?, link_col=?, code_col=?, start_row=?"
+    args = [int(title_col), int(link_col), int(code_col), int(start_row)]
+    if reset_progress:
+        sets += ", last_row=0, last_rev='', last_error=''"
+    args.append(source_id)
     with _session() as conn:
-        cur = conn.execute(
-            "UPDATE doc_sources SET title_col=?, link_col=?, code_col=? WHERE id=?",
-            (int(title_col), int(link_col), int(code_col), source_id),
-        )
+        cur = conn.execute(f"UPDATE doc_sources SET {sets} WHERE id=?", args)
         return cur.rowcount > 0
 
 

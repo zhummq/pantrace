@@ -38,6 +38,9 @@ BATCH = 5000
 # 一次最多同时跑几份表。腾讯文档侧对并发有限制，而且真正的并发在块级
 # （workers），这里排队反而更快也更稳。
 MAX_CONCURRENT = 2
+# 探测报告里展示几行原文。够看清"哪几行是作者写的广告"，又不用把前 40 行
+# 全铺在面板上。
+PREVIEW_ROWS = 8
 
 
 @dataclass
@@ -95,14 +98,37 @@ def cols_of(src: dict) -> dict:
     }
 
 
+def read_ncols(src: dict) -> int:
+    """这一轮要读几列。
+
+    下限是 `COLUMN_SCAN`（自动识别得看得见前几列的样本），但**用户指定的列号
+    可能在更远处**。之前固定读 3 列：有人把链接填在第 5 列，第 5 列永远读回来
+    是空串，整张表一条也入不了库，还看不出原因——不是报错，是"全部跳过"。
+    """
+    want = max(
+        (int(src.get(key) or 0) for key in ("title_col", "link_col", "code_col")),
+        default=0,
+    )
+    return max(docs_qq.COLUMN_SCAN, want)
+
+
 def ingest_rows(
     rows: list[list[str]],
     source_name: str,
     *,
     dry_run: bool = False,
     cols: dict | None = None,
+    assume_header: bool | None = None,
+    first_line: int = 1,
 ) -> dict:
-    """二维表 → 库。分批走，返回 {added, touched, skipped}。"""
+    """二维表 → 库。分批走，返回 {added, touched, skipped}。
+
+    `assume_header=None` 时让第一批自己猜表头；用户指定了数据起始行就传 False
+    ——那一行是他指着说"这里开始是资源"的，不能被当成表头吃掉。
+
+    `first_line` 是 `rows[0]` 在原表里的行号（1 起）。增量只读后半段时，
+    报告里的行号必须能对上原表，否则"第 3 行有问题"根本没法回表里找。
+    """
     added = touched = 0
     skipped: list[tuple[int, str]] = []
     opts = dict(cols or {})
@@ -112,12 +138,12 @@ def ingest_rows(
     for first, chunk in intake.iter_row_batches(rows, BATCH):
         result = intake.parse_rows(
             chunk,
-            has_header=None if first else False,
+            has_header=assume_header if assume_header is not None else (None if first else False),
             source_name=source_name,
             **opts,
         )
         # 批内行号是相对的，报告里要能对上原表，否则"第 3 行有问题"根本没法找
-        skipped.extend((n + offset, why) for n, why in result.skipped)
+        skipped.extend((n + offset + first_line - 1, why) for n, why in result.skipped)
         offset += len(chunk)
         if not result.items:
             continue
@@ -148,21 +174,37 @@ def sync_one(
         if on_progress:
             on_progress(offset, total)
 
-    start = max(0, int(src.get("last_row") or 0) - LOOKBACK) if src.get("last_row") else 0
+    # 是从第几行开始读。三档取最大：
+    #   用户指定的数据起始行（1 起转 0 起）、上次读到哪减去回看量、0。
+    # 指定起始行还有一层作用——表头那几行是作者的说明/广告，长得跟数据一样，
+    # 让程序认"这行不像资源"永远有例外，让人直接说第几行开始反而干净。
+    first_data = max(0, int(src.get("start_row") or 0) - 1)
+    seen = int(src.get("last_row") or 0)
+    start = max(first_data, seen - LOOKBACK) if seen else first_data
     end_row = None if limit is None else start + limit
+    ncols = read_ncols(src)
     rows, meta = docs_qq.read_tab(
         src["url"],
         tab_id=src.get("tab_id") or "",
         start_row=start,
         end_row=end_row,
         workers=workers,
+        ncols=ncols,
         on_progress=progress,
     )
     tab = meta.tab(src.get("tab_id") or "")
     report.rows = len(rows)
 
     source_name = f"doc:{(tab.title or meta.title or label)[:40]}"
-    got = ingest_rows(rows, source_name, dry_run=dry_run, cols=cols_of(src))
+    got = ingest_rows(
+        rows,
+        source_name,
+        dry_run=dry_run,
+        cols=cols_of(src),
+        # 指定了起始行，第一行就是资源，不许再当表头吃掉
+        assume_header=False if src.get("start_row") else None,
+        first_line=start + 1,
+    )
     report.added = got["added"]
     report.touched = got["touched"]
     report.skipped = got["skipped"]
@@ -212,6 +254,13 @@ def probe(url: str, tab_id: str = "", *, sample_rows: int = 40) -> dict:
             rows, _ = docs_qq.read_tab(url, tab_id=tab.tab_id, end_row=sample_rows)
             item["columns"] = intake.probe_columns(rows)
             item["sample_rows"] = min(len(rows), sample_rows)
+            # 前几行原文，带 1 起的行号。列样本只能回答"哪列是链接"，
+            # 回答不了"第一条资源在第几行"——那要看整行长什么样才知道哪行是
+            # 作者写的广告。给他看表头，让他指行号，比程序去认"不像资源"可靠。
+            item["preview"] = [
+                {"line": i + 1, "cells": [str(c or "")[:120] for c in row]}
+                for i, row in enumerate(rows[:PREVIEW_ROWS])
+            ]
         except docs_qq.DocError as exc:
             item["error"] = str(exc)
         except Exception as exc:  # noqa: BLE001
