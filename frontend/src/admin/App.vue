@@ -391,7 +391,7 @@ onUnmounted(() => {
           <div class="tb-name">{{ TITLES[route] }}</div>
           <div class="tb-sub">
             <template v-if="route === 'library'">
-              腾讯文档收集表 → 资源库 · 每天 4:20 自动增量
+              腾讯文档收集表 → 资源库
             </template>
             <template v-else>
               {{ rangeText }}<template v-if="lastLoaded"> · 更新于 {{ lastLoaded }}</template>

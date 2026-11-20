@@ -19,11 +19,14 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
 
 from . import docs_qq, intake, store
+
+log = logging.getLogger("pantrace.docsync")
 
 # 每次往回多看这么多行。表格中间插入新行时，纯按 last_row 往前读会漏，
 # 重叠一段靠 dedup_key 合并就能补上；512 行的代价约两次请求，很值。
@@ -335,3 +338,180 @@ def _run(source_id: int, kwargs: dict) -> None:
     finally:
         with _lock:
             _running.discard(source_id)
+
+
+# ---------------------------------------------------------------- 每日调度
+
+_daily_started = False
+_daily_hour: int | None = None
+_daily_last: dict = {}            # 最近一次自动跑的结果，看板显示用
+_daily_next: float = 0.0
+
+# 启动后如果发现有订阅超过这么久没跑，就先补一轮再进入按点循环。
+# 补跑前等 5 分钟：刚起来的几十秒是建表、开 WAL、群入口抢同一个 SQLite 的时候，
+# 这个时候插一个大表抓取进去，实测能把群入口挤成 "readonly database"。
+CATCH_UP_AFTER = 24 * 3600
+CATCH_UP_GRACE = 300
+
+
+def next_run_at(hour: int, now: float | None = None) -> float:
+    """下一个 `hour`:00 的时间戳（服务器本地时间）。今天的点已过就顺延到明天。
+
+    不用 `dateutil` 或 cron 表达式：一天一次、整点触发，这点需求算一个时间戳
+    就够了。用 `mktime` 而不是手算 86400，是为了让夏令时/时区库自己处理——
+    中国没有夏令时，但部署环境不一定。
+    """
+    base = time.time() if now is None else float(now)
+    cur = time.localtime(base)
+    target = time.mktime((cur.tm_year, cur.tm_mon, cur.tm_mday, hour, 0, 0, 0, 0, -1))
+    while target <= base:
+        target += 86400
+    return target
+
+
+def _needs_catch_up(now: float) -> bool:
+    """有订阅超过一天没跑过吗。首次部署、服务器重启、停机维护都靠它补回来。
+
+    不只看"今天几点"，是因为重启时间是不可控的：凌晨 3:55 重启，等到 4:00
+    还有五分钟，没必要补；下午 2 点重启，今天就彻底没人跑了，得补。
+    """
+    try:
+        sources = store.list_doc_sources(enabled_only=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("每日同步查订阅失败，跳过补跑判断：%s", exc)
+        return False
+    return any(now - float(src.get("last_run_at") or 0) > CATCH_UP_AFTER for src in sources)
+
+
+def run_all(*, wait_max: float = 3600.0, poll: float = 2.0) -> dict:
+    """把启用的订阅挨个跑一遍，返回汇总。
+
+    串行而不是并发：一份表内部已经把块级并发开到 6，两份表再叠上去，腾讯文档
+    那边会开始限流，总耗时反而变长，还把 MAX_CONCURRENT 的名额占满——用户
+    在面板上点什么都是 busy。
+
+    每份表走 `start()` 而不是直接调 `sync_one()`：这样面板能看到"正在抓"、
+    能看到进度条，而且同一份表重复触发会被 start() 自己挡掉。
+    """
+    summary = {"total": 0, "ok": 0, "failed": 0, "added": 0, "rows": 0, "failed_ids": []}
+    try:
+        sources = store.list_doc_sources(enabled_only=True)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("每日同步读订阅失败：%s", exc)
+        return summary
+
+    for src in sources:
+        summary["total"] += 1
+        sid = int(src["id"])
+        job = start(sid)
+        if job.get("state") == "busy":
+            log.warning("每日同步跳过 [%s]：别的表还占着并发名额", sid)
+            continue
+
+        deadline = time.time() + wait_max
+        while is_running(sid) and time.time() < deadline:
+            time.sleep(poll)
+
+        done = status(sid)
+        if done.get("state") == "done":
+            summary["ok"] += 1
+            summary["added"] += int(done.get("added") or 0)
+            summary["rows"] += int(done.get("rows") or 0)
+            log.info(
+                "每日同步 [%s] %s：读 %s 行，新增 %s，更新 %s",
+                sid, src.get("title") or src.get("tab_id"),
+                done.get("rows"), done.get("added"), done.get("touched"),
+            )
+        else:
+            summary["failed"] += 1
+            summary["failed_ids"].append(sid)
+            log.warning(
+                "每日同步 [%s] 失败：%s",
+                sid, done.get("error") or f"等了 {int(wait_max)} 秒还没结束",
+            )
+    return summary
+
+
+def _run_once(reason: str) -> dict:
+    """跑一轮并记下结果。异常不能逃出线程，否则这条线程就死了、之后永远不跑。"""
+    global _daily_last
+    started = time.time()
+    try:
+        result = run_all()
+        state = {
+            "at": int(started),
+            "reason": reason,
+            "ok": result["ok"],
+            "failed": result["failed"],
+            "added": result["added"],
+            "rows": result["rows"],
+            "error": "",
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.warning("每日同步整体失败：%s", exc)
+        state = {
+            "at": int(started),
+            "reason": reason,
+            "ok": 0, "failed": 0, "added": 0, "rows": 0,
+            "error": f"{exc.__class__.__name__}: {exc}"[:200],
+        }
+    _daily_last = state
+    return state
+
+
+def daily_info() -> dict:
+    """给面板：下次什么时候跑、上次跑成什么样。"""
+    return {
+        "enabled": _daily_started,
+        "hour": _daily_hour,
+        "next_at": int(_daily_next) if _daily_next else 0,
+        "last": dict(_daily_last),
+    }
+
+
+def start_daily(hour: int = 4, *, tick: float = 60.0) -> None:
+    """起一条每天跑一轮的守护线程。重复调用只会起一条。
+
+    **为什么用线程不用 systemd timer。** 部署只有一个 `pantrace.service`，
+    加 timer 就多两个 unit 文件、多一份日志、多一处要跟着仓库同步的配置；
+    而这份作业本来就在同一个进程里读写 SQLite，放进来反而少一层协调。
+    代价是重启会丢掉等待状态——所以下面先判断"今天是不是漏了"，漏了就补跑。
+
+    **单个 worker 才成立。** 多进程部署时每个进程都会起一条，同一份表被并发
+    抓 N 遍。抓取是幂等的（dup_key 合并），不会写坏数据，但会浪费请求。真上
+    多 worker 时这里要换成文件锁，注释留在这里免得以后忘。
+    """
+    global _daily_started, _daily_hour, _daily_next
+    with _lock:
+        if _daily_started:
+            return
+        _daily_started = True
+        _daily_hour = int(hour)
+
+    def _loop() -> None:
+        global _daily_next
+        try:
+            if _needs_catch_up(time.time()):
+                log.info("检测到有订阅超过一天没跑，%s 秒后补一轮", CATCH_UP_GRACE)
+                time.sleep(CATCH_UP_GRACE)
+                _run_once("补跑")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("补跑判断失败，直接进入按点循环：%s", exc)
+
+        while True:
+            _daily_next = next_run_at(hour)
+            # 分片睡：一次 sleep 到明天，遇上系统休眠或时钟被改，醒来时刻会偏；
+            # 每 60 秒醒一次重算，代价可以忽略，换来"时间被改了也能跟上"。
+            while True:
+                left = _daily_next - time.time()
+                if left <= 0:
+                    break
+                time.sleep(min(left, tick))
+            _run_once("每日")
+            log.info("下一轮自动同步：%s", time.strftime("%Y-%m-%d %H:%M", time.localtime(_daily_next)))
+
+    threading.Thread(target=_loop, name="doc-daily-sync", daemon=True).start()
+    # 线程第一件事可能是补跑（要睡 5 分钟），这期间面板上"下次自动跑"不能是 0。
+    # 补跑如果发生，跑完会把它重算成真正的下一个整点。
+    _daily_next = next_run_at(hour)
+    log.info("资源库每日增量已启用：每天 %02d:00（本地时间）", hour)

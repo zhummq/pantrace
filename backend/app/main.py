@@ -88,6 +88,11 @@ async def lifespan(_: FastAPI):
     # 绝不阻塞在探测上。只在 TG 源被启用时启动，否则白打一次 t.me。
     if any(p.name == "tg_searchers" for p in _sources):
         TG_GATE.start()
+    # 文档订阅的每日增量放在这里而不是模块顶层：模块顶层是"被 import 就起线程"，
+    # 任何脚本、任何测试只要 import 到 app.main 都会顺手拉起一条调度，还会真去
+    # 连库。服务启动才起，语义才对，也便于测试隔离。
+    if LIBRARY_ON and settings.library_daily_sync:
+        library_sync.start_daily(settings.library_daily_hour)
     yield
     # 退出时关连接池，否则 uvicorn --reload 会留一堆 TIME_WAIT
     await close_source_clients()
@@ -1963,6 +1968,9 @@ async def admin_library_sources(request: Request):
             "sources": items,
             "stats": _library_stats(),
             "concurrency": {"running": len(library_sync._running), "max": library_sync.MAX_CONCURRENT},
+            # 下次自动跑的时间 + 上次跑的结果。面板上的"每天 04:00 自动同步"
+            # 不是写死的文案，是这里给出来的真实值——改配置立刻能看出来。
+            "daily": library_sync.daily_info(),
         },
     }
 

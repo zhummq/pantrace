@@ -19,6 +19,15 @@
    38 万行的表要 1400+ 次请求。所以增量只能靠 `max_row` 变化判断，
    每次都全量重拉等于每天给人家文档刷 1400 次。
 
+4. **越过表尾的请求不会报错，它会把表头那一块给你。**
+   这条最阴。`start_row >= max_row` 时接口照样返回 257 行完整数据，
+   内容是**第 0 行开始的表头区**，跟越界位置毫无关系。2026-11 因此误判过一次：
+   看到"从 max_row 往后连读几百块都有数据"，就断定 `max_row` 是过时的快照值、
+   真实表有 200 万行，还写了探底逻辑去追——其实那 200 万行是同一段表头被
+   重复读了几千遍，`max_row` 一直是对的。
+   判别方法：把返回的首行和 `read_block(..., 0)` 的首行比一下，一样就是越界了。
+   `read_block` 里已经加了这层判断，别绕过它直接调 `_opendoc`。
+
 **只支持"任何人可查看"的文档。** 需要登录的会返回空 block，`block_datas` 为空，
 这里不抛异常而是返回空——上层据此报"文档没权限"，比抛栈更容易让人看懂。
 """
@@ -476,14 +485,49 @@ def fetch_meta(url: str) -> DocMeta:
     return meta
 
 
+_header_cache: dict[tuple[str, str], str] = {}
+
+
+def _header_fingerprint(pad_id: str, tab_id: str) -> str:
+    """表头第一行的文本，用来识破"越界返回表头"这种假数据。
+
+    只取首行：它是作者写在最上面的说明/广告行（"Ctel+F查询文件 最新日期资源
+    在下方…"），正常资源不会长这样。
+
+    请求范围必须和 `read_block` 一致（都是 256 行）——同样的表头，用
+    `end_row=0` 请求时富文本里的链接不会被解析出来，用 `end_row=255` 才有，
+    拿前者当基准会一直比不上，保护等于没写。
+
+    只读一次、按 (pad, tab) 缓存。表头被作者改了也不影响判断：那时越界返回的
+    是新表头，指纹跟着变，仍然对得上。
+    """
+    key = (pad_id, tab_id)
+    if key not in _header_cache:
+        payload = _opendoc(pad_id, tab_id, 0, BLOCK_ROWS - 1)
+        rows: list[list[str]] = []
+        for _end_row, blob in _block_offsets(payload):
+            rows.extend(parse_block(blob))
+        _header_cache[key] = "".join(rows[0]) if rows else ""
+    return _header_cache[key]
+
+
 def read_block(pad_id: str, tab_id: str, start_row: int) -> list[list[str]]:
-    """拉一块（最多 256 行）。空列表表示这块没数据。"""
+    """拉一块（最多 256 行）。空列表表示这块没数据。
+
+    **越界不报错，它把表头那块还给你。** `start_row >= max_row` 时接口照样返回
+    257 行，内容从第 0 行开始。所以这里拿表头指纹比对，一旦撞上就当"没数据"
+    处理——不这么判，上层会以为表比实际长几百上千倍（见模块头第 4 条）。
+    """
+    start_row = max(0, int(start_row))
     end = start_row + BLOCK_ROWS - 1
     payload = _opendoc(pad_id, tab_id, start_row, end)
     for _end_row, blob in _block_offsets(payload):
         rows = parse_block(blob)
-        if rows:
-            return rows
+        if not rows:
+            continue
+        if start_row > 0 and "".join(rows[0]) == _header_fingerprint(pad_id, tab_id):
+            return []
+        return rows
     return []
 
 

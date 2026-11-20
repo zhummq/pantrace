@@ -36,6 +36,7 @@ const addMsg = ref('')
 const sources = ref([])
 const stats = ref({})
 const concurrency = ref({})
+const daily = ref({})
 const loadError = ref('')
 const loaded = ref(false)
 
@@ -55,6 +56,30 @@ const totalRows = computed(() => Number(stats.value.total) || 0)
 const byPlatform = computed(() =>
   Object.entries(stats.value.by_platform || {}).sort((a, b) => b[1] - a[1])
 )
+
+function fmtStamp(ts) {
+  if (!ts) return ''
+  const d = new Date(Number(ts) * 1000)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+// 自动同步这块显示的是服务端真实状态，不是写死的文案：关掉了配置就显示"未启用"，
+// 改过小时数就跟着变，跑过一轮就带上"新增几条"。面板上看到的必须是真的。
+const dailyHour = computed(() =>
+  daily.value.hour === null || daily.value.hour === undefined
+    ? ''
+    : `${String(daily.value.hour).padStart(2, '0')}:00`
+)
+const dailyNext = computed(() => fmtStamp(daily.value.next_at))
+const dailyLast = computed(() => {
+  const last = daily.value.last || {}
+  if (!last.at) return ''
+  if (last.error) return `${fmtStamp(last.at)} 失败：${last.error}`
+  const parts = [`新增 ${Number(last.added) || 0} 条`]
+  if (Number(last.failed)) parts.push(`失败 ${last.failed} 份`)
+  return `${fmtStamp(last.at)} ${parts.join('，')}`
+})
 
 function kindLabel(kind) {
   return KIND[kind] || kind
@@ -164,6 +189,7 @@ async function refresh() {
     sources.value = data.sources || []
     stats.value = data.stats || {}
     concurrency.value = data.concurrency || {}
+    daily.value = data.daily || {}
     loadError.value = ''
   } catch (e) {
     loadError.value = e.message
@@ -329,6 +355,15 @@ onUnmounted(stopPolling)
         </span>
         <span v-if="!byPlatform.length" class="lib-muted">还没有数据</span>
       </div>
+      <!-- 自动同步：每天几点、下次什么时候、上一轮抓了多少。数据来自后端，
+           配置改了这里跟着变，不写死文案 -->
+      <div class="lib-auto">
+        <span class="lib-auto-dot" :class="{ on: dailyHour }" />
+        <span v-if="dailyHour">每天 {{ dailyHour }} 自动同步</span>
+        <span v-else-if="daily.enabled === false" class="lib-muted">自动同步未启用</span>
+        <span v-if="dailyNext" class="lib-muted">· 下次 {{ dailyNext }}</span>
+        <span v-if="dailyLast" class="lib-muted">· 上次 {{ dailyLast }}</span>
+      </div>
     </div>
 
     <div v-if="loadError" class="err" style="margin-bottom: 12px">{{ loadError }}</div>
@@ -434,7 +469,8 @@ onUnmounted(stopPolling)
       <div class="lib-step-body">
         <div class="lib-doc-head">
           <b>已登记的文档</b>
-          <span class="lib-muted">每天 4:20 自动增量</span>
+          <span v-if="dailyHour" class="lib-muted">每天 {{ dailyHour }} 自动增量</span>
+          <span v-else class="lib-muted">自动增量未启用，只能手动抓取</span>
           <span class="lib-spacer" />
           <span v-if="running" class="lib-running">
             <i class="lib-spin" />{{ running }} 份抓取中

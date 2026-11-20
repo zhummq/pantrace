@@ -23,7 +23,9 @@ from app import library_sync, store
 
 class SyncTestBase(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
+        # ignore_cleanup_errors：同步线程可能刚好在写库，Windows 下临时目录删不掉
+        # 会抛 WinError 32，把一个通过的用例报成 ERROR，误导性极大
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         store.init(Path(self._tmp.name) / "library.db")
         # 作业状态是模块级的，测试之间必须清干净，否则上一个用例的 done 会串过来
         with library_sync._lock:
@@ -31,6 +33,11 @@ class SyncTestBase(unittest.TestCase):
             library_sync._running.clear()
 
     def tearDown(self) -> None:
+        # 后台作业收尾（写进度、关连接）要一点时间，早删一毫秒就 WinError 32
+        for _ in range(40):
+            if not library_sync._running:
+                break
+            time.sleep(0.05)
         self._tmp.cleanup()
 
     def source(self, **kw) -> dict:
@@ -266,3 +273,156 @@ class ProbeTabTest(unittest.TestCase):
              patch.object(library_sync.docs_qq, "read_tab", lambda *a, **k: ([], None)):
             got = library_sync.probe("https://docs.qq.com/sheet/DWabc")
         self.assertEqual(len(got["tabs"]), 2)
+
+class DailyScheduleTest(SyncTestBase):
+    """每日调度：算时间、判断要不要补跑、串行跑一遍。
+
+    这三件事错了都不会报错——只是"某天没跑"或"跑了两遍"，而日志里看不出来。
+    所以时间计算单独测，用固定时间戳构造，不依赖当前钟点。
+    """
+
+    def _fake_read(self):
+        class _Meta:
+            rev = "r1"
+            title = "测试表"
+
+            def tab(self, _tid):
+                class _Tab:
+                    title = "测试表"
+                    max_row = 2
+                return _Tab()
+
+        def inner(url, **kw):
+            return [["名称", "链接"], ["三体", "https://pan.quark.cn/s/daily"]], _Meta()
+
+        return inner
+
+    def test_next_run_before_hour_is_today(self):
+        base = time.mktime((2026, 11, 20, 10, 0, 0, 0, 0, -1))
+        got = library_sync.next_run_at(23, base)
+        self.assertEqual(time.localtime(got)[:5], (2026, 11, 20, 23, 0))
+
+    def test_next_run_after_hour_is_tomorrow(self):
+        base = time.mktime((2026, 11, 20, 10, 0, 0, 0, 0, -1))
+        got = library_sync.next_run_at(4, base)
+        self.assertEqual(time.localtime(got)[:5], (2026, 11, 21, 4, 0))
+
+    def test_next_run_at_exact_hour_goes_tomorrow(self):
+        """正好卡在 4:00 的这一刻也算"过了"，否则会当场再跑一遍。"""
+        base = time.mktime((2026, 11, 20, 4, 0, 0, 0, 0, -1))
+        got = library_sync.next_run_at(4, base)
+        self.assertEqual(time.localtime(got)[:5], (2026, 11, 21, 4, 0))
+
+    def test_no_source_no_catch_up(self):
+        self.assertFalse(library_sync._needs_catch_up(time.time()))
+
+    def test_never_run_needs_catch_up(self):
+        """刚登记的表 last_run_at=0，应该被补跑捞起来。"""
+        self.source()
+        self.assertTrue(library_sync._needs_catch_up(time.time()))
+
+    def test_recent_run_no_catch_up(self):
+        src = self.source()
+        store.save_doc_progress(src["id"])
+        self.assertFalse(library_sync._needs_catch_up(time.time() + 3600))
+
+    def test_stale_run_needs_catch_up(self):
+        src = self.source()
+        store.save_doc_progress(src["id"])
+        self.assertTrue(library_sync._needs_catch_up(time.time() + 25 * 3600))
+
+    def test_run_all_handles_every_source(self):
+        self.source()
+        store.add_doc_source(
+            pad_id="DWtwo", tab_id="t1", title="第二张", url="https://docs.qq.com/sheet/DWtwo"
+        )
+        with patch.object(library_sync.docs_qq, "read_tab", self._fake_read()):
+            got = library_sync.run_all(poll=0.01, wait_max=10)
+        self.assertEqual(got["total"], 2)
+        self.assertEqual(got["ok"], 2)
+        self.assertEqual(got["failed"], 0)
+
+    def test_run_all_keeps_going_after_failure(self):
+        """一份表炸了不能拖停后面那份——这是"整轮停住"最隐蔽的形态。"""
+        self.source()
+        store.add_doc_source(
+            pad_id="DWtwo", tab_id="t1", title="第二张", url="https://docs.qq.com/sheet/DWtwo"
+        )
+        boom = {"left": 1}
+
+        def flaky(url, **kw):
+            if boom["left"]:
+                boom["left"] -= 1
+                raise RuntimeError("boom")
+            return self._fake_read()(url, **kw)
+
+        with patch.object(library_sync.docs_qq, "read_tab", flaky):
+            got = library_sync.run_all(poll=0.01, wait_max=10)
+        self.assertEqual(got["total"], 2)
+        self.assertEqual(got["failed"], 1)
+        self.assertEqual(got["ok"], 1)
+
+    def test_daily_info_shape(self):
+        info = library_sync.daily_info()
+        self.assertIn("next_at", info)
+        self.assertIn("last", info)
+
+class DailyThreadTest(SyncTestBase):
+    """守护线程本身：它会真的跑起来吗，跑完还记得结果吗。
+
+    这是最容易出错也最难发现的一环——线程里抛个异常直接退出，服务照常响应，
+    只是从此再也不自动同步，日志里一句 "Thread died" 也没有。
+    """
+
+    def _fake_read(self):
+        class _Meta:
+            rev = "r1"
+            title = "测试表"
+
+            def tab(self, _tid):
+                class _Tab:
+                    title = "测试表"
+                    max_row = 2
+                return _Tab()
+
+        return lambda *a, **k: ([["名称", "链接"], ["三体", "https://pan.quark.cn/s/thr"]], _Meta())
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 别的用例可能已经起过调度（模块级状态），不复位的话 start_daily 会静默返回
+        library_sync._daily_started = False
+        library_sync._daily_last = {}
+        library_sync._daily_next = 0.0
+
+    def tearDown(self) -> None:
+        # 模块级状态：不清掉，后面任何用例调 start_daily 都会静默返回
+        library_sync._daily_started = False
+        library_sync._daily_last = {}
+        library_sync._daily_next = 0.0
+        super().tearDown()
+
+    def test_catch_up_runs_and_records(self):
+        self.source()
+        with patch.object(library_sync, "CATCH_UP_GRACE", 0), \
+             patch.object(library_sync.docs_qq, "read_tab", self._fake_read()):
+            library_sync.start_daily(4)
+            for _ in range(80):
+                if library_sync._daily_last:
+                    break
+                time.sleep(0.05)
+
+        last = library_sync._daily_last
+        self.assertEqual(last.get("reason"), "补跑")
+        self.assertEqual(last.get("ok"), 1)
+        self.assertEqual(last.get("error"), "")
+        # 补跑之后必须把下一次整点排上，否则面板会一直显示"未设置"
+        self.assertGreater(library_sync._daily_next, time.time())
+
+    def test_start_twice_keeps_one_scheduler(self):
+        with patch.object(library_sync, "CATCH_UP_GRACE", 0), \
+             patch.object(library_sync.docs_qq, "read_tab", self._fake_read()):
+            library_sync.start_daily(4)
+            before = library_sync._daily_next
+            library_sync.start_daily(5)      # 第二次应该被忽略
+        self.assertEqual(library_sync._daily_hour, 4)
+        self.assertGreater(before, 0)

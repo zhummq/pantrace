@@ -87,6 +87,10 @@ class Settings(BaseSettings):
     # "每次现抓、抓完就扔"变成"越用越厚"。关掉它搜索行为完全不变，只是库不再增长。
     library_enabled: bool = True
     library_db: str = ""              # 留空 = backend/data/library.db
+    # 每天自动跑一轮订阅增量。关掉只是不自动跑，面板上的「同步」照旧可用——
+    # 抓数是 IO 密集的，真出问题要能单独停掉它去排查，别逼着停整个服务。
+    library_daily_sync: bool = True
+    library_daily_hour: int = 4       # 服务器本地时间几点跑，默认凌晨 4 点
 
     # ---- 反馈 / 求资源 ----
     # 和埋点共用 backend/data/analytics.db，同一个文件备份一次就够。
