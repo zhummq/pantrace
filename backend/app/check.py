@@ -12,7 +12,8 @@
 1. **不在搜索链路里同步做**。搜索本身已经要等上游 2~60 秒，不能再加 20 条
    外部请求。检测一律异步：搜索返回后提交线程池，结果落表，下一次渲染时读表。
 2. **不用转存账号**。这里打的都是不需要登录的匿名接口（夸克/UC 的
-   sharepage/token、阿里的 get_share_by_anonymous、123 的 share/info）。
+   sharepage/token、阿里的 get_share_by_anonymous、123 的 share/info、
+   迅雷的 drive/v1/share、115 的 share/snap、天翼的 getShareInfoByCodeV2）。
    账号是稀缺资源，拿去探活等于烧配额，还会把风控引到账号上。
 3. **判不准就必须说判不准**。网络错误、限流、验证码、接口改版，一律
    `uncertain`，绝不 `bad`。`bad` 会让结果从页面消失——误杀的代价远大于漏放。
@@ -35,16 +36,19 @@ TTL 的取舍和 PanSou 相反：**ok 和 bad 都是 6 小时**。
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import random
 import re
 import sqlite3
 import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
@@ -88,7 +92,7 @@ _ALIAS = {
 }
 
 # 真正实现了 checker 的平台。其余平台直接落 unsupported，不去发请求。
-_IMPLEMENTED = frozenset({"quark", "uc", "aliyun", "123", "baidu"})
+_IMPLEMENTED = frozenset({"quark", "uc", "aliyun", "123", "baidu", "xunlei", "115", "tianyi"})
 
 # 夸克和 UC 共用一套接口，只差 pr / api 基址 / referer / UA。
 # 与 sdk/adapters/quark/const.py 的 PROFILES 保持一致——那边改了这里也要改，
@@ -127,6 +131,37 @@ _QUARK_BAD_CODES = {41004, 41006, 41009, 41010, 41011, 41012, 41026, 41031}
 _QUARK_LOCKED_CODES = {41007, 41008}
 _BAD_WORDS = ("不存在", "失效", "违规", "过期", "取消", "删除", "封禁")
 _LOCKED_WORDS = ("提取码", "访问码", "密码", "passcode")
+
+# 天翼云盘：错误码是服务端给的确定性枚举，可以直接映射成结论。
+# 码表以外的一律 uncertain —— 189 有时回 HTML 错误页，那时只能承认判不了。
+_TIANYI_BAD_CODES = {
+    "ShareInfoNotFound": "分享信息不存在",
+    "ShareNotFound": "分享链接不存在",
+    "FileNotFound": "分享文件不存在",
+    "ShareExpiredError": "分享链接已过期",
+    "ShareAuditNotPass": "分享因审核未通过已失效",
+    "FolderNotFound": "分享文件夹不存在",
+}
+_TIANYI_LOCKED_CODES = {"AccessCodeError", "NeedAccessCode", "ErrorAccessCode"}
+
+# 迅雷匿名接口要求 captcha_token，token 的签名是 9 轮链式 md5：
+# 每轮把上一轮的 hex 结果拼上一段盐再算一次。盐、client_id、device_id
+# 都抄自 pan.xunlei.com 的网页端，迅雷换版本时这三样要一起换。
+_XUNLEI_CLIENT_ID = "ZUBzD9J_XPXfn7f7"
+_XUNLEI_DEVICE_ID = "5505bd0cab8c9469b98e5891d9fb3e0d"
+_XUNLEI_CLIENT_VERSION = "1.10.0.2633"
+_XUNLEI_PACKAGE_NAME = "com.xunlei.browser"
+_XUNLEI_SIGN_SALTS = (
+    "uWRwO7gPfdPB/0NfPtfQO+71",
+    "F93x+qPluYy6jdgNpq+lwdH1ap6WOM+nfz8/V",
+    "0HbpxvpXFsBK5CoTKam",
+    "dQhzbhzFRcawnsZqRETT9AuPAJ+wTQso82mRv",
+    "SAH98AmLZLRa6DB2u68sGhyiDh15guJpXhBzI",
+    "unqfo7Z64Rie9RNHMOB",
+    "7yxUdFADp3DOBvXdz0DPuKNVT35wqa5z0DEyEvf",
+    "RBG",
+    "ThTWPG5eC0UBqlbQ+04nZAptqGCdpv9o55A",
+)
 
 # 同一平台两次请求之间至少隔这么久（秒）。匿名接口没有配额说明，
 # 4 个 worker 全速打等于每秒 8~10 发，容易被当成爬虫。0.25s 大约 4 发/秒，
@@ -259,11 +294,16 @@ def key_of(platform: str, url: str) -> str:
     return f"{disk}:url:{digest}"
 
 
-# sdk/urls.py 的域名白名单只收"我们能转存"的盘。检测要覆盖 123 这类
-# 没有转存适配器的平台，所以这里补一条只用于取 share id 的规则。
+# sdk/urls.py 的域名白名单只收"我们能转存"的盘。检测要覆盖 123 / 天翼 / 115
+# 这类没有转存适配器的平台，所以这里补一条只用于取 share id 的规则。
 _EXTRA_RULES = {
     "123": (re.compile(r"/s/([A-Za-z0-9_-]+)", re.I),),
-    "tianyi": (re.compile(r"/t/([A-Za-z0-9_-]+)", re.I),),
+    "tianyi": (
+        re.compile(r"/t/([A-Za-z0-9_-]+)", re.I),
+        # 新版分享页是 /web/share?code=xxx，code 就是分享 id
+        re.compile(r"[?&]code=([A-Za-z0-9_-]+)", re.I),
+    ),
+    "115": (re.compile(r"/(?:s|share)/([A-Za-z0-9_-]+)", re.I),),
 }
 
 
@@ -300,6 +340,11 @@ def disk_of(url: str, platform: str = "") -> str:
         ("alipan.com", "aliyun"),
         ("aliyundrive.com", "aliyun"),
         ("pan.baidu.com", "baidu"),
+        ("pan.xunlei.com", "xunlei"),
+        ("xunlei.com", "xunlei"),
+        ("115cdn.com", "115"),
+        ("115.com", "115"),
+        ("189.cn", "tianyi"),
         ("123pan.com", "123"),
         ("123684.com", "123"),
         ("123865.com", "123"),
@@ -506,6 +551,19 @@ def _request_page(url: str, **kwargs) -> tuple[int, str, str]:
     return resp.status_code, body[:4000], resp.headers.get("location", "")
 
 
+def _request_raw(method: str, url: str, **kwargs) -> tuple[int, str]:
+    """发请求，返回 (状态码, 正文)。天翼回 XML，`_request` 只认 JSON。
+
+    不截断、不判断 200：天翼的结论有时藏在一个非 2xx 的 XML 里，交给调用方解析。
+    """
+    host = url.split("/")[2] if "://" in url else url
+    _throttle(host)
+    kwargs.setdefault("timeout", (4.0, _timeout))
+    kwargs.setdefault("allow_redirects", True)
+    resp = _get_session().request(method, url, **kwargs)
+    return resp.status_code, resp.text or ""
+
+
 def _request(method: str, url: str, **kwargs) -> tuple[int, Any]:
     """发请求，返回 (状态码, 解析后的 JSON 或 None)。不抛异常。"""
     host = url.split("/")[2] if "://" in url else url
@@ -549,6 +607,13 @@ def check_one(disk: str, url: str, pwd: str = "") -> tuple[str, str]:
             return _check_123(pwd_id, passcode)
         if disk == "baidu":
             return _check_baidu(pwd_id, passcode)
+        if disk == "xunlei":
+            return _check_xunlei(pwd_id, passcode)
+        if disk == "115":
+            # 115 的码常挂在 `?password=`，上游给的 sharePwd 又经常为空，两头都收
+            return _check_115(pwd_id, passcode or _query_passcode(url, ("password", "pwd")))
+        if disk == "tianyi":
+            return _check_tianyi(pwd_id, passcode or _tianyi_passcode(url), url)
     except requests.RequestException as exc:
         return STATE_UNCERTAIN, f"网络异常（{type(exc).__name__}）"
     except Exception as exc:  # noqa: BLE001
@@ -776,6 +841,303 @@ def _check_baidu_init(short: str) -> tuple[str, str]:
         # 200 但不是提取码页：多半是中转页或被安全验证拦住，不下结论
         return STATE_UNCERTAIN, "分享页无法识别（可能需要安全验证）"
     return STATE_UNCERTAIN, f"分享页返回 HTTP {status}"
+
+
+def _check_tianyi(share_code: str, passcode: str, share_url: str = "") -> tuple[str, str]:
+    """天翼云盘：一条 GET 就能拿到结论，五种盘里最省事的。
+
+    接口回 XML（`<shareVO>` 表示分享还在，`<error>` 表示有明确错误码），
+    偶尔回 JSON。**只认它自己的错误码枚举**，码表以外不看正文猜：
+    189 的 HTML 错误页里"不存在"三个字可能来自页脚文案，拿它判死会误杀。
+    """
+    if not share_code:
+        return STATE_UNSUPPORTED, "无法解析分享地址"
+    # 有访问码时 189 要求把它拼进 shareCode 参数里，这不是我们的发明，
+    # 是网页端的实际做法（`/t/xxx（访问码：abcd）`）。不带码只传 shareCode。
+    code_param = share_code if not passcode else f"{share_code}（访问码：{passcode}）"
+    status, body = _request_raw(
+        "GET",
+        "https://cloud.189.cn/api/open/share/getShareInfoByCodeV2.action",
+        params={"noCache": f"{random.random():.6f}", "shareCode": code_param},
+        headers={
+            "referer": share_url or "https://cloud.189.cn/",
+            "sign-type": "1",
+            "accept": "application/xml, text/xml, application/json, */*",
+        },
+    )
+    body = (body or "").strip()
+    if not body:
+        return STATE_UNCERTAIN, f"接口返回空（HTTP {status}）"
+
+    verdict = _tianyi_xml_state(body) or _tianyi_json_state(body)
+    if verdict:
+        return verdict
+    # 既不是 shareVO 也不是 error：可能被拦到中转页。不猜。
+    return STATE_UNCERTAIN, f"返回内容无法识别（HTTP {status}）"
+
+
+def _tianyi_xml_state(body: str) -> tuple[str, str] | None:
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return None
+    tag = root.tag.split("}")[-1]
+    fields = {child.tag.split("}")[-1]: (child.text or "").strip() for child in root}
+    if tag == "shareVO":
+        if _as_int(fields.get("shareId"), 0) > 0 or fields.get("fileName"):
+            return STATE_OK, "可访问"
+        if _as_int(fields.get("needAccessCode"), 0) == 1:
+            # 分享还在、只是要码。带码也回这个说明码不对，仍归 locked（提示不隐藏）。
+            return STATE_LOCKED, "需要访问码"
+        return STATE_UNCERTAIN, "分享信息不完整"
+    if tag == "error":
+        return _tianyi_error_state(fields.get("code", ""), fields.get("message", ""))
+    return None
+
+
+def _tianyi_json_state(body: str) -> tuple[str, str] | None:
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if _as_int(payload.get("shareId"), 0) > 0 or payload.get("fileName"):
+        return STATE_OK, "可访问"
+    if _as_int(payload.get("needAccessCode"), 0) == 1:
+        return STATE_LOCKED, "需要访问码"
+    code = str(payload.get("error_code") or "").strip()
+    message = str(payload.get("res_message") or "").strip()
+    if code:
+        return _tianyi_error_state(code, message)
+    if message:
+        return _tianyi_error_state("", message)
+    return STATE_UNCERTAIN, "返回内容无法识别"
+
+
+def _tianyi_error_state(code: str, message: str) -> tuple[str, str]:
+    code = (code or "").strip()
+    message = (message or "").strip()
+    if code in _TIANYI_BAD_CODES:
+        return STATE_BAD, _TIANYI_BAD_CODES[code]
+    if code in _TIANYI_LOCKED_CODES or any(word in message for word in _LOCKED_WORDS):
+        return STATE_LOCKED, message or "需要访问码"
+    if message and any(word in message for word in _BAD_WORDS):
+        return STATE_BAD, message
+    return STATE_UNCERTAIN, message or code or "未知错误"
+
+
+def _xunlei_captcha_token() -> str:
+    """换迅雷的 captcha_token。拿不到就返回空串——多数分享不需要它也能查。"""
+    timestamp = str(int(time.time() * 1000))
+    content = (
+        f"{_XUNLEI_CLIENT_ID}{_XUNLEI_CLIENT_VERSION}"
+        f"{_XUNLEI_PACKAGE_NAME}{_XUNLEI_DEVICE_ID}{timestamp}"
+    )
+    for salt in _XUNLEI_SIGN_SALTS:
+        content = hashlib.md5((content + salt).encode("utf-8")).hexdigest()
+    headers = {
+        "accept": "application/json;charset=UTF-8",
+        "content-type": "application/json",
+        "x-device-id": _XUNLEI_DEVICE_ID,
+        "x-client-id": _XUNLEI_CLIENT_ID,
+        "x-client-version": _XUNLEI_CLIENT_VERSION,
+    }
+    try:
+        _, payload = _request(
+            "POST",
+            "https://xluser-ssl.xunlei.com/v1/shield/captcha/init",
+            json={
+                "action": "get:/drive/v1/share",
+                "captcha_token": "",
+                "client_id": _XUNLEI_CLIENT_ID,
+                "device_id": _XUNLEI_DEVICE_ID,
+                "meta": {
+                    "timestamp": timestamp,
+                    "captcha_sign": f"1.{content}",
+                    "client_version": _XUNLEI_CLIENT_VERSION,
+                    "package_name": _XUNLEI_PACKAGE_NAME,
+                },
+                "redirect_uri": "xlaccsdk01://xunlei.com/callback?state=harbor",
+            },
+            headers=headers,
+        )
+    except requests.RequestException:
+        return ""
+    if not isinstance(payload, dict) or payload.get("url"):
+        # 回 url 表示要求人机验证，这次没戏，按无 token 继续。
+        return ""
+    return str(payload.get("captcha_token") or "")
+
+
+def _check_xunlei(share_id: str, passcode: str) -> tuple[str, str]:
+    """迅雷网盘：share 接口直接把 `share_status` 和文件数吐出来。"""
+    if not share_id:
+        return STATE_UNSUPPORTED, "无法解析分享地址"
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/json",
+        "origin": "https://pan.xunlei.com",
+        "referer": "https://pan.xunlei.com/",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+        ),
+        "x-client-id": _XUNLEI_CLIENT_ID,
+        "x-device-id": _XUNLEI_DEVICE_ID,
+    }
+    token = _xunlei_captcha_token()
+    if token:
+        headers["x-captcha-token"] = token
+    status, payload = _request(
+        "GET",
+        "https://api-pan.xunlei.com/drive/v1/share",
+        params={
+            "share_id": share_id, "pass_code": passcode, "limit": 100,
+            "pass_code_token": "", "page_token": "", "thumbnail_size": "SIZE_SMALL",
+        },
+        headers=headers,
+    )
+    if status == 404:
+        return STATE_BAD, "链接不存在或已失效"
+    if status in (403, 429):
+        # 403 在迅雷经常是风控而不是死链，判死会成片误杀，只报判不了。
+        return STATE_UNCERTAIN, f"被限流或需要验证（HTTP {status}）"
+    if not isinstance(payload, dict):
+        return STATE_UNCERTAIN, f"分享接口返回非 JSON（HTTP {status}）"
+
+    share_status = str(payload.get("share_status") or "").strip()
+    error = str(payload.get("error") or "")
+    message = str(payload.get("error_description") or payload.get("error_msg") or "")
+    lowered = f"{error} {message}".lower()
+    # 服务端把具体原因放在 error_details[].detail 里，实测：
+    #   {"error":"invalid_argument","error_code":3,"detail":"share_id can not be empty or share_id invalid"}
+    details = " ".join(
+        str(entry.get("detail") or entry.get("message") or "")
+        for entry in payload.get("error_details") or []
+        if isinstance(entry, dict)
+    ).lower()
+
+    if share_status.upper() == "OK":
+        return STATE_OK, "可访问"
+    if payload.get("file_count") or payload.get("share_id") or payload.get("share_name"):
+        return STATE_OK, "可访问"
+    if "pass_code" in lowered or any(word in message for word in _LOCKED_WORDS):
+        return STATE_LOCKED, message or "需要提取码"
+    if share_status:
+        # share_status 是服务端的枚举字段，非 OK 就是"这个分享不在可访问状态"
+        text = str(payload.get("share_status_text") or "").strip()
+        return STATE_BAD, text or f"分享状态 {share_status}"
+    if "share_id" in details and ("invalid" in details or "can not be empty" in details):
+        # 请求格式是对的（否则不会走到这个分支），服务端明确说 id 不成立
+        return STATE_BAD, "分享不存在或链接已失效"
+    if error or message:
+        if any(word in lowered for word in ("not found", "不存在", "失效", "过期", "删除")):
+            return STATE_BAD, message or error
+        return STATE_UNCERTAIN, message or error
+    return STATE_UNCERTAIN, "无法确认链接状态"
+
+
+def _check_115(share_code: str, passcode: str) -> tuple[str, str]:
+    """115 网盘：snap 接口列出目录就算活。
+
+    和 pansou 有一处不同：**没有提取码时不预先判 locked，照样发请求**。
+    115 确实有不需要码的公开分享，先入为主判 locked 会让它们永远带个错徽标。
+    代价是没码时判不精：接口的"码不对"和"分享没了"回的是同一类文案，
+    所以这一支**只允许 ok / locked / uncertain，绝不 bad**。
+    """
+    if not share_code:
+        return STATE_UNSUPPORTED, "无法解析分享地址"
+    referer = f"https://115cdn.com/s/{share_code}"
+    if passcode:
+        referer += f"?password={passcode}&"
+    status, payload = _request(
+        "GET",
+        "https://115cdn.com/webapi/share/snap",
+        params={"share_code": share_code, "offset": 0, "limit": 20, "receive_code": passcode, "cid": ""},
+        headers={
+            "priority": "u=1, i",
+            "referer": referer,
+            "x-requested-with": "XMLHttpRequest",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "accept": "application/json, text/plain, */*",
+        },
+    )
+    if not isinstance(payload, dict):
+        return STATE_UNCERTAIN, f"分享接口返回非 JSON（HTTP {status}）"
+
+    def _dead(summary: str) -> tuple[str, str]:
+        # 没带码时判不了死：接口分不清"码不对"和"分享没了"
+        return (STATE_BAD if passcode else STATE_UNCERTAIN), summary
+
+    if payload.get("state") is True and _as_int(payload.get("errno"), -1) == 0:
+        data = payload.get("data") or {}
+        info = data.get("shareinfo") or {}
+        share_state = _as_int(data.get("share_state"), 0) or _as_int(info.get("share_state"), 0)
+        reason = str(info.get("forbid_reason") or "").strip()
+        if reason:
+            if any(word in reason for word in _LOCKED_WORDS):
+                return STATE_LOCKED, reason
+            return _dead(reason)
+        has_content = (
+            bool(data.get("list"))
+            or _as_int(data.get("count"), 0) > 0
+            or bool(info.get("snap_id"))
+            or bool(info.get("share_title"))
+        )
+        if share_state in (0, 1) and has_content:
+            return STATE_OK, "可访问"
+        if share_state in (0, 1):
+            return STATE_UNCERTAIN, "分享信息为空"
+        # 未知 share_state：不猜。115 改一个枚举值就会让一批好资源消失。
+        return STATE_UNCERTAIN, f"链接状态异常（share_state={share_state}）"
+
+    error = str(payload.get("error") or "").strip()
+    lowered = error.lower()
+    if (
+        any(word in error for word in _LOCKED_WORDS)
+        or "passcode" in lowered
+        or "receive_code" in lowered
+    ):
+        return STATE_LOCKED, error or "需要提取码"
+    if _as_int(payload.get("errno"), 0) == 990002:
+        # 实测：不带 receive_code 时 115 一律回 errno 990002「参数错误。」，
+        # 换句话说没码就问不出任何结论。它证明不了分享没了，所以两种处理：
+        #   没码 → 提示要码（115 几乎都带码，比 uncertain 有用，且 locked 不隐藏资源）
+        #   有码 → 如实说判不了，不许推成死链
+        if not passcode:
+            return STATE_LOCKED, "115 链接通常需要提取码"
+        return STATE_UNCERTAIN, "接口不接受这组参数"
+    if error and any(
+        word in lowered
+        for word in ("不存在", "失效", "违规", "删除", "取消", "share_code", "forbid", "forbidden", "not found")
+    ):
+        return _dead(error)
+    return STATE_UNCERTAIN, error or "无法确认链接状态"
+
+
+def _query_passcode(url: str, keys: tuple[str, ...]) -> str:
+    """从 URL 的 query 里取提取码。不同盘的参数名不一样，按 keys 顺序试。"""
+    try:
+        query = parse_qs(urlparse(str(url or "")).query)
+    except ValueError:
+        return ""
+    lowered = {k.lower(): v for k, v in query.items()}
+    for key in keys:
+        values = query.get(key) or lowered.get(key.lower()) or []
+        if values and str(values[0]).strip():
+            return str(values[0]).strip()
+    return ""
+
+
+def _tianyi_passcode(url: str) -> str:
+    """天翼的访问码常跟在链接后面的「（访问码：abcd）」里，不在 query 上。"""
+    match = re.search(r"（访问码[：:]\s*([a-zA-Z0-9]+)）", str(url or ""))
+    if match:
+        return match.group(1)
+    return _query_passcode(url, ("accessCode", "pwd"))
 
 
 def _as_int(value: Any, default: int = 0) -> int:

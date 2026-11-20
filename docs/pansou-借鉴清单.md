@@ -158,6 +158,12 @@ CREATE INDEX IF NOT EXISTS idx_lc_exp ON link_check(expires_at);
 
 3. 检测点先只做三家（覆盖我们 80% 的结果）：**夸克**（`drive-h.quark.cn/.../sharepage/token`，照抄 `check_service.go:309` 的 code 映射）、**UC**（同构，`:439`）、**百度**（`:468`，要 verify + init 两步）。其余先返回 `unsupported`，前端不显示角标，别硬凑。
 
+   > 2026-11-20 补：天翼（`:547`）、迅雷（`:714`）、115（`:800`）已移植进 `app/check.py`。三处都按"宁可 uncertain 绝不 bad"重写了判定：
+   > - 天翼只认自己的错误码枚举，HTML 错误页不猜；
+   > - 迅雷的 403/429 归 uncertain（风控≠死链），只有 `error_details` 明说 `share_id invalid` 才判死；
+   > - 115 没有提取码时接口问不出结论（恒回 990002），此时只提示「需提取码」，绝不判死。
+   > 光鸭 / 移动 139 仍是 `unsupported`。
+
 4. 调用方式：**不在搜索链路里同步做**。搜索返回后 `background.add_task`，只检当页 20 条里命中缓存 miss 的，`ThreadPoolExecutor(max_workers=6)`，结果写表。前端下次拿到同一批结果时读表标角标（`item.state`）。这样搜索延迟一点不变。
 
 5. 出口过滤复用现有机制：在 `_apply_hidden()` 旁边加 `_drop_checked_bad()`，`state == "bad"` 且未过期 → 从 `items` 里剔除。**注意**：现有注释写了"过滤只发生在响应出口，缓存里存原始结果"，检测表也要照这个原则，别往 `_cache` 里写加工后的数据。

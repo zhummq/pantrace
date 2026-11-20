@@ -47,6 +47,10 @@ class FakeSession:
             if needle in url:
                 if isinstance(payload, Exception):
                     raise payload
+                # 直接给 FakeResponse 时原样返回：天翼那条判定要读 XML 正文，
+                # 不是 JSON，只能这样喂进去。
+                if isinstance(payload, FakeResponse):
+                    return payload
                 return FakeResponse(payload)
         raise AssertionError(f"未预期的请求：{method} {url}")
 
@@ -204,9 +208,194 @@ class TestBaidu(BaseCase):
         self.assertEqual(state, check.STATE_UNCERTAIN)
 
 
+class TestTianyi(BaseCase):
+    """天翼：只认它自己的 XML 错误码枚举，码表外一律判不了。"""
+
+    def route(self, body: str, status: int = 200):
+        self.use({"getShareInfoByCodeV2": FakeResponse(None, status=status, text=body)})
+
+    def test_share_vo_is_ok(self):
+        self.route(
+            '<?xml version="1.0" encoding="UTF-8"?><shareVO>'
+            "<shareId>123</shareId><fileName>电影合集</fileName>"
+            "<needAccessCode>0</needAccessCode></shareVO>"
+        )
+        state, _ = check.check_one("tianyi", "https://cloud.189.cn/t/AbCdEf123")
+        self.assertEqual(state, check.STATE_OK)
+
+    def test_need_access_code_is_locked(self):
+        self.route("<shareVO><shareId>0</shareId><needAccessCode>1</needAccessCode></shareVO>")
+        state, _ = check.check_one("tianyi", "https://cloud.189.cn/t/AbCdEf123")
+        self.assertEqual(state, check.STATE_LOCKED)
+
+    def test_known_error_code_is_bad(self):
+        self.route("<error><code>ShareExpiredError</code><message>分享已过期</message></error>")
+        state, summary = check.check_one("tianyi", "https://cloud.189.cn/t/AbCdEf123")
+        self.assertEqual(state, check.STATE_BAD)
+        self.assertIn("过期", summary)
+
+    def test_access_code_error_is_locked_not_bad(self):
+        self.route("<error><code>AccessCodeError</code><message>访问码错误</message></error>")
+        state, _ = check.check_one("tianyi", "https://cloud.189.cn/t/AbCdEf123")
+        self.assertEqual(state, check.STATE_LOCKED)
+
+    def test_unknown_error_code_is_uncertain_not_bad(self):
+        # 189 的码表会变，新码不认识时不许当成死链
+        self.route("<error><code>SomeBrandNewError</code><message>系统繁忙</message></error>")
+        state, _ = check.check_one("tianyi", "https://cloud.189.cn/t/AbCdEf123")
+        self.assertEqual(state, check.STATE_UNCERTAIN)
+
+    def test_html_page_is_uncertain_not_bad(self):
+        self.route("<html><body>页面不存在</body></html>")
+        state, _ = check.check_one("tianyi", "https://cloud.189.cn/t/AbCdEf123")
+        self.assertEqual(state, check.STATE_UNCERTAIN)
+
+    def test_empty_body_is_uncertain(self):
+        self.route("")
+        state, _ = check.check_one("tianyi", "https://cloud.189.cn/t/AbCdEf123")
+        self.assertEqual(state, check.STATE_UNCERTAIN)
+
+    def test_access_code_from_share_text(self):
+        # 天翼的码常写在链接后面的「（访问码：xxxx）」，要拼进 shareCode 一起发
+        seen: dict = {}
+
+        def fake_request(method, url, **kwargs):
+            seen.update(kwargs)
+            return 200, "<shareVO><shareId>1</shareId><fileName>x</fileName></shareVO>"
+
+        orig, check._request_raw = check._request_raw, fake_request
+        try:
+            state, _ = check.check_one("tianyi", "https://cloud.189.cn/t/AbCdEf123（访问码：8xy2）")
+        finally:
+            check._request_raw = orig
+        self.assertEqual(state, check.STATE_OK)
+        self.assertEqual(seen["params"]["shareCode"], "AbCdEf123（访问码：8xy2）")
+
+
+class TestXunlei(BaseCase):
+    """迅雷：share_status 是服务端枚举，非 OK 才算死；403 是风控不是死链。"""
+
+    def route(self, payload, status: int = 200):
+        self.use({
+            "captcha/init": {"captcha_token": "tk"},
+            "drive/v1/share": FakeResponse(payload, status=status),
+        })
+
+    def test_share_status_ok(self):
+        self.route({"share_status": "OK", "file_count": 3})
+        state, _ = check.check_one("xunlei", "https://pan.xunlei.com/s/VNabc123")
+        self.assertEqual(state, check.STATE_OK)
+
+    def test_file_count_without_status_is_ok(self):
+        self.route({"file_count": 5, "share_name": "剧集"})
+        state, _ = check.check_one("xunlei", "https://pan.xunlei.com/s/VNabc123")
+        self.assertEqual(state, check.STATE_OK)
+
+    def test_404_is_bad(self):
+        self.route(None, status=404)
+        state, _ = check.check_one("xunlei", "https://pan.xunlei.com/s/VNabc123")
+        self.assertEqual(state, check.STATE_BAD)
+
+    def test_403_is_uncertain_not_bad(self):
+        self.route(None, status=403)
+        state, _ = check.check_one("xunlei", "https://pan.xunlei.com/s/VNabc123")
+        self.assertEqual(state, check.STATE_UNCERTAIN)
+
+    def test_pass_code_error_is_locked(self):
+        self.route({"error": "invalid_pass_code", "error_description": "提取码错误"})
+        state, _ = check.check_one("xunlei", "https://pan.xunlei.com/s/VNabc123")
+        self.assertEqual(state, check.STATE_LOCKED)
+
+    def test_deleted_status_is_bad(self):
+        self.route({"share_status": "SHARE_STATUS_DELETED", "share_status_text": "分享已删除"})
+        state, summary = check.check_one("xunlei", "https://pan.xunlei.com/s/VNabc123")
+        self.assertEqual(state, check.STATE_BAD)
+        self.assertIn("删除", summary)
+
+    def test_unknown_error_is_uncertain(self):
+        self.route({"error": "internal_error", "error_description": "服务开小差"})
+        state, _ = check.check_one("xunlei", "https://pan.xunlei.com/s/VNabc123")
+        self.assertEqual(state, check.STATE_UNCERTAIN)
+
+    def test_share_id_invalid_detail_is_bad(self):
+        # 实测真实返回：请求格式对、只有 id 不成立，这时才是死链
+        self.route({
+            "error": "invalid_argument", "error_code": 3, "error_description": "请求参数错误",
+            "error_details": [{"detail": "share_id can not be empty or share_id invalid"}],
+        })
+        state, _ = check.check_one("xunlei", "https://pan.xunlei.com/s/VNabc123")
+        self.assertEqual(state, check.STATE_BAD)
+
+
+class Test115(BaseCase):
+    """115：没有提取码时判不了死，这支只允许 ok / locked / uncertain。"""
+
+    def route(self, payload):
+        self.use({"/webapi/share/snap": payload})
+
+    def test_snap_with_files_is_ok(self):
+        self.route({"state": True, "errno": 0, "data": {
+            "count": 2, "share_state": 1, "list": [{"n": "a"}, {"n": "b"}],
+            "shareinfo": {"snap_id": "s1", "share_title": "电影"},
+        }})
+        state, _ = check.check_one("115", "https://115.com/s/swg8xyz", "ab12")
+        self.assertEqual(state, check.STATE_OK)
+
+    def test_public_share_without_code_is_ok(self):
+        # 115 有不带码的公开分享，不能因为没码就先判 locked
+        self.route({"state": True, "errno": 0, "data": {
+            "count": 1, "share_state": 1, "shareinfo": {"snap_id": "s1"},
+        }})
+        state, _ = check.check_one("115", "https://115.com/s/swg8xyz")
+        self.assertEqual(state, check.STATE_OK)
+
+    def test_wrong_code_is_locked(self):
+        self.route({"state": False, "errno": 40004, "error": "密码错误"})
+        state, _ = check.check_one("115", "https://115.com/s/swg8xyz", "ab12")
+        self.assertEqual(state, check.STATE_LOCKED)
+
+    def test_forbid_reason_with_code_is_bad(self):
+        self.route({"state": True, "errno": 0, "data": {
+            "share_state": 2, "shareinfo": {"forbid_reason": "分享已取消"},
+        }})
+        state, _ = check.check_one("115", "https://115.com/s/swg8xyz", "ab12")
+        self.assertEqual(state, check.STATE_BAD)
+
+    def test_dead_text_without_code_stays_uncertain(self):
+        # 没带码时接口分不清"码不对"和"分享没了"，绝不能判死
+        self.route({"state": False, "errno": 40001, "error": "分享不存在"})
+        state, _ = check.check_one("115", "https://115.com/s/swg8xyz")
+        self.assertEqual(state, check.STATE_UNCERTAIN)
+
+    def test_unknown_share_state_is_uncertain(self):
+        self.route({"state": True, "errno": 0, "data": {
+            "share_state": 9, "shareinfo": {"snap_id": "s1"},
+        }})
+        state, _ = check.check_one("115", "https://115.com/s/swg8xyz", "ab12")
+        self.assertEqual(state, check.STATE_UNCERTAIN)
+
+    def test_password_from_url_query(self):
+        # 115 的码常挂在 ?password=，上游 sharePwd 常为空，得自己从 URL 取
+        self.route({"state": False, "errno": 40001, "error": "分享不存在"})
+        state, _ = check.check_one("115", "https://115.com/s/swg8xyz?password=ab12")
+        self.assertEqual(state, check.STATE_BAD)
+
+    def test_no_code_param_error_asks_for_code(self):
+        # 实测：不带 receive_code 时 115 一律回 990002 参数错误，问不出结论
+        self.route({"state": False, "errno": 990002, "error": "参数错误。"})
+        state, _ = check.check_one("115", "https://115.com/s/swg8xyz")
+        self.assertEqual(state, check.STATE_LOCKED)
+
+    def test_param_error_with_code_is_uncertain_not_bad(self):
+        # 带码时也可能是码格式不对，"参数错误"证明不了分享没了
+        self.route({"state": False, "errno": 990002, "error": "参数错误。"})
+        state, _ = check.check_one("115", "https://115.com/s/swg8xyz", "ab12")
+        self.assertEqual(state, check.STATE_UNCERTAIN)
+
+
 class TestScope(BaseCase):
     def test_unimplemented_platform_is_unsupported(self):
-        state, _ = check.check_one("xunlei", "https://pan.xunlei.com/s/abc")
+        state, _ = check.check_one("guangya", "https://www.guangyapan.com/s/abc")
         self.assertEqual(state, check.STATE_UNSUPPORTED)
 
     def test_key_is_share_id_not_url(self):

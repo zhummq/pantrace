@@ -305,8 +305,11 @@ sqlite3 backend/data/analytics.db \
 | 阿里 | `api.alipan.com/.../get_share_by_anonymous` | 最省事，一次请求拿到元信息 |
 | 123 | `www.123865.com/api/share/info` | `123pan.com` 已改版成 HTML，只有 123865 还回 JSON |
 | 百度 | 有码走 `share/verify` + `share/list`；无码走 `share/init` 页 | `share/list` 匿名一律回 9019「need verify」，所以**没有提取码时改看 init 页**：200 且正文含「请输入提取码」= 存在但要码，404 = 不存在或已失效，3xx 跳转 = 公开分享可访问 |
+| 天翼 | `cloud.189.cn/api/open/share/getShareInfoByCodeV2.action` | 回 XML：`<shareVO>` 有 shareId/fileName = 活，`<error>` 按它自己的错误码枚举判死。码表以外一律 `uncertain` |
+| 迅雷 | `api-pan.xunlei.com/drive/v1/share` | 要 `x-captcha-token`（9 轮链式 md5 签名换的），`share_status=OK` 或 file_count>0 才算活；403/429 是风控，只报 `uncertain` |
+| 115 | `115cdn.com/webapi/share/snap` | 不需要登录，但**没有提取码时问不出结论**（一律回 errno 990002 参数错误）。没码时只提示「需提取码」，绝不判死 |
 
-其余平台（天翼/迅雷/115/光雅/移动等）没有可用的匿名接口，落 `unsupported`，前端不显示任何东西——宁可不说，也不能瞎说。
+其余平台（光鸭/移动 139 等）没有可用的匿名接口，落 `unsupported`，前端不显示任何东西——宁可不说，也不能瞎说。
 
 ### 五态与 TTL
 
