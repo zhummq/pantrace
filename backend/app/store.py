@@ -109,6 +109,39 @@ FRESH_STEPS = ((7, 150), (30, 80), (90, 40), (365, 15))
 # `yidong`（PLATFORM_NAMES 里就是这个名字），入库前对齐，否则按平台筛选会漏。
 _PLATFORM_ALIAS = {"c139": "yidong", "aliyun": "ali", "mobile": "yidong"}
 
+# ---------------------------------------------------------------- 入库丢弃观测
+# 以前 `_prepare` 里 `parse().ok` 为假就是一句 `continue`，**静默丢数据**：
+# 某个平台一条都进不了库，看总量根本看不出来（123/天翼就这么被埋了很久）。
+# 这里按原因累计并留样本 URL，`stats()` 直接能读到。
+#
+# 进程内累计、重启归零——它是"这次上线以来丢了什么"的观测，不是账本。
+_drop_lock = threading.Lock()
+_drop_counts: dict[str, int] = {}
+_drop_samples: dict[str, list[str]] = {}
+_DROP_SAMPLE_MAX = 3
+
+
+def _note_drop(reason: str, url: str) -> None:
+    with _drop_lock:
+        _drop_counts[reason] = _drop_counts.get(reason, 0) + 1
+        bucket = _drop_samples.setdefault(reason, [])
+        if len(bucket) < _DROP_SAMPLE_MAX and url not in bucket:
+            bucket.append(url[:160])
+
+
+def drop_stats() -> dict:
+    """入库被丢弃的次数与样本，用于回答"某个平台为什么一条都没有"。
+
+    `unsupported` 是重点：它代表"链接看着像资源，但我们解析不出分享 id"。
+    这类数字持续上涨，要么是新平台该加规则，要么是某站换了分享链接形态。
+    """
+    with _drop_lock:
+        return {
+            "counts": dict(_drop_counts),
+            "samples": {k: list(v) for k, v in _drop_samples.items()},
+        }
+
+
 # 候选集上限。FTS 命中几千条时不能全取回来算分，先按 bm25 截断。
 # 注意 bm25 在 SQLite 里是"越负越相关"，排序方向别写反。
 CANDIDATE_LIMIT = 1000
@@ -341,15 +374,20 @@ def _prepare(rows: list[dict], now: int) -> list[dict]:
         url = (row.get("url") or row.get("shareUrl") or "").strip()
         title = (row.get("title") or "").strip()
         if not url or not title:
+            # 没 URL 是脏数据；有 URL 没标题，多半是上游给了空标题。
+            _note_drop("no_url" if not url else "no_title", url)
             continue
 
         parsed = parse_share(url)
         if not parsed.ok:
             # 详情页 / 不支持的站 / 识别不出分享 ID：不入库。
             # 这条门挡住的是"看着像资源、点开是介绍页"的那一类。
+            _note_drop("unsupported", url)
             continue
 
-        platform = platform_key(row.get("platform") or parsed.platform)
+        # 平台一律以解析结果为准。上游自报的 `platform` 常见 `others` / `pan`
+        # 这种粗值，拿它拼 dedup_key 会让同一条资源裂成多个 key，热度也被劈开。
+        platform = platform_key(parsed.platform)
         key = f"{platform}:{parsed.pwd_id}"
         pwd = (row.get("pwd") or row.get("sharePwd") or parsed.passcode or "").strip()
         file_count = _int(row.get("file_count") or row.get("fileCount"))
@@ -837,6 +875,9 @@ def stats() -> dict:
         "new_7d": 0,
         "hits_7d": 0,
         "hits_7d_by_channel": {},
+        # 进程内的入库丢弃统计。库的总量看不出"某个平台被静默丢光"，
+        # 这个字段就是为了让那种事再也藏不住。
+        "dropped": {"counts": {}, "samples": {}},
     }
     if not _inited:
         return out
@@ -866,6 +907,7 @@ def stats() -> dict:
         ):
             out["hits_7d_by_channel"][row["channel"]] = int(row["c"])
         out["hits_7d"] = sum(out["hits_7d_by_channel"].values())
+    out["dropped"] = drop_stats()
     return out
 
 

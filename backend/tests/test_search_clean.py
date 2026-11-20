@@ -168,6 +168,38 @@ class ExtractLinksTest(unittest.TestCase):
         self.assertEqual(clean.extract_net_disk_links(text), ["https://123pan.com/s/abc123"])
 
 
+class Pan115AndPikPakTest(unittest.TestCase):
+    """115 / PikPak 必须走专属正则，不能只靠末尾的通用兜底。
+
+    通用兜底是 `[^\\s'"<>()]*`，中文不算结束符：链接后面紧跟标题时整段会被粘上来
+    （`.../s/VOabc资源合集`），`parse()` 拿到的 pwd_id 是对的，但 `url` 带着垃圾
+    尾巴落库，`/go` 回跳过去就是 404。这个坑天翼已经踩过一次。
+    """
+
+    def test_115_keeps_password(self):
+        text = "https://115.com/s/swabcdef?password=1234"
+        self.assertEqual(
+            clean.extract_net_disk_links(text),
+            ["https://115.com/s/swabcdef?password=1234"],
+        )
+
+    def test_115_duplicate_collapsed(self):
+        text = "https://115.com/s/swabcdef https://115.com/s/swabcdef"
+        self.assertEqual(clean.extract_net_disk_links(text), ["https://115.com/s/swabcdef"])
+
+    def test_pikpak_chinese_tail_not_glued(self):
+        text = "PikPak 资源 https://mypikpak.com/s/VOabc123资源合集"
+        self.assertEqual(
+            clean.extract_net_disk_links(text),
+            ["https://mypikpak.com/s/VOabc123"],
+        )
+
+    def test_both_are_supported(self):
+        for url in ("https://115.com/s/swabcdef", "https://mypikpak.com/s/VOabc123"):
+            with self.subTest(url=url):
+                self.assertTrue(clean.is_supported_link(url))
+
+
 class MergeTest(unittest.TestCase):
     def test_same_key_keeps_more_complete(self):
         thin = SearchResult(unique_id="src-1", title="三体")

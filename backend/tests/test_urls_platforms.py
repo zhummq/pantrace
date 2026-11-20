@@ -11,6 +11,10 @@
 2. 天翼 `/web/share?code=xxx` 里的 `code` 是分享 id，不是提取码。
    `PASSCODE_RE` 里恰好也有 `code=`，一不小心就把 `Qn2mYv` 截成 `Qn2m` 当密码发出去。
 
+2026-11 又补了 115 与 PikPak：两家都是"清洗层能提取、解析层不认"，
+表现同样是静默丢数据。115 的 `115cdn.com` / `anxia.com` 是同一站点的镜像，
+必须落到同一个 `pwd_id`，否则同一条资源会以两个 `dedup_key` 各存一份。
+
 跑法：``.venv/Scripts/python.exe -m unittest tests.test_urls_platforms -v``
 """
 
@@ -78,6 +82,61 @@ class TestTianyi(unittest.TestCase):
     def test_web_share_explicit_pwd(self) -> None:
         p = parse("https://cloud.189.cn/web/share?code=Qn2mYv&pwd=9a8b")
         self.assertEqual(p.passcode, "9a8b")
+
+
+class TestPan115(unittest.TestCase):
+    """115 的三个域名指向同一套分享 id，镜像站必须落到同一个 pwd_id。
+
+    少认一个镜像域名，同一条资源就会以两个 `dedup_key` 各存一份：搜索结果里
+    出现两条一模一样的记录，热度也被劈成两半。
+    """
+
+    def test_main_domain(self) -> None:
+        p = parse("https://115.com/s/swabcdef?password=1234")
+        self.assertEqual(p.platform, "115")
+        self.assertEqual(p.pwd_id, "swabcdef")
+        self.assertEqual(p.passcode, "1234")
+        self.assertTrue(p.ok)
+
+    def test_mirror_domains_share_id(self) -> None:
+        ids = {
+            parse(f"https://{host}/s/swabcdef").pwd_id
+            for host in ("115.com", "www.115.com", "115cdn.com", "anxia.com")
+        }
+        self.assertEqual(ids, {"swabcdef"})
+
+    def test_access_code_glued_to_url(self) -> None:
+        # 微信文案：码粘在链接后面，且没有 ?password=
+        p = parse("https://115.com/s/swabcdef（访问码：1a2b）")
+        self.assertEqual(p.pwd_id, "swabcdef")
+        self.assertEqual(p.passcode, "1a2b")
+        self.assertNotIn("（", p.url)
+
+    def test_id_allows_hyphen(self) -> None:
+        p = parse("https://115.com/s/swabc-def")
+        self.assertEqual(p.pwd_id, "swabc-def")
+
+    def test_homepage_stays_unknown(self) -> None:
+        self.assertFalse(parse("https://115.com/").ok)
+
+
+class TestPikPak(unittest.TestCase):
+    def test_share_link(self) -> None:
+        p = parse("https://mypikpak.com/s/VOabc123")
+        self.assertEqual(p.platform, "pikpak")
+        self.assertEqual(p.pwd_id, "VOabc123")
+        self.assertTrue(p.ok)
+
+    def test_www_prefix(self) -> None:
+        self.assertEqual(parse("https://www.mypikpak.com/s/VOabc_-123").pwd_id, "VOabc_-123")
+
+    def test_password_in_query(self) -> None:
+        p = parse("https://mypikpak.com/s/VOabc123?pwd=9z8y")
+        self.assertEqual(p.pwd_id, "VOabc123")
+        self.assertEqual(p.passcode, "9z8y")
+
+    def test_homepage_stays_unknown(self) -> None:
+        self.assertFalse(parse("https://mypikpak.com/").ok)
 
 
 class TestStillBlocked(unittest.TestCase):

@@ -74,6 +74,9 @@ PAN115 = re.compile(
     r"https?://(?:115\.com|115cdn\.com|anxia\.com)/s/[a-zA-Z0-9_-]+(?:\?password=[a-zA-Z0-9]{4})?(?:#)?",
     _AI,
 )
+# PikPak 没有专属清洗函数，但必须有专属正则：只靠末尾的通用兜底，`[^\s'"<>()]*`
+# 会把紧跟在链接后的中文标题一起吞进去（`.../s/VOabc资源合集`），落库后 /go 回跳 404。
+PIKPAK_PAN = re.compile(r"https?://(?:www\.)?mypikpak\.com/s/[a-zA-Z0-9_-]+", _AI)
 ALIYUN_PAN = re.compile(r"https?://(?:www\.)?(?:alipan|aliyundrive)\.com/s/[a-zA-Z0-9_-]+", _AI)
 GUANGYA_PAN = re.compile(r"https?://(?:www\.)?guangyapan\.com/s/[a-zA-Z0-9_-]+", _AI)
 MOBILE_PAN = re.compile(
@@ -179,7 +182,7 @@ def is_supported_link(url: str) -> bool:
     lower = url.lower()
     for pat in (
         BAIDU_PAN, TIANYI_PAN, UC_PAN, PAN123, GUANGYA_PAN,
-        QUARK_PAN, XUNLEI_PAN, PAN115, MOBILE_PAN,
+        QUARK_PAN, XUNLEI_PAN, PAN115, PIKPAK_PAN, MOBILE_PAN,
     ):
         if pat.search(lower):
             return True
@@ -602,6 +605,9 @@ def extract_net_disk_links(text: str) -> list[str]:
     for match in PAN115.findall(text):
         _append_dedup(clean_115_pan_url(match))
 
+    for match in PIKPAK_PAN.findall(text):
+        _append_dedup(match.strip())
+
     for match in ALIYUN_PAN.findall(text):
         _append_dedup(clean_aliyun_pan_url(match))
 
@@ -630,6 +636,7 @@ def extract_net_disk_links(text: str) -> list[str]:
         "cloud.189.cn", "drive.uc.cn", "yun.139.com", "caiyun.139.com",
         "caiyun.feixin.10086.cn", "123684.com", "123685.com", "123865.com",
         "123912.com", "123pan.com", "123pan.cn", "123592.com",
+        "115.com", "115cdn.com", "anxia.com", "mypikpak.com",
     )
     for match in ALL_PAN_LINKS.findall(text):
         u = _strip_tail(match)

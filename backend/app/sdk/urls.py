@@ -50,6 +50,16 @@ ALLOWED_HOSTS = frozenset({
     "123592.com",
     # 天翼云盘
     "cloud.189.cn",
+    # 115：115cdn / anxia 是同站镜像域名，分享 id 通用
+    "115.com",
+    "www.115.com",
+    "115cdn.com",
+    "www.115cdn.com",
+    "anxia.com",
+    "www.anxia.com",
+    # PikPak
+    "mypikpak.com",
+    "www.mypikpak.com",
 })
 
 PASSCODE_RE = re.compile(
@@ -97,6 +107,12 @@ _RULES: tuple[_Rule, ...] = (
             re.I,
         ),
     ),
+    # 115：id 后面常跟 `?password=xxxx`（固定 4 位）。这里**不用**关整串扫码：
+    # 115 没有天翼那种 `code=` 与访问码同名的问题，而微信粘贴的分享文案常写成
+    # `115.com/s/xxx（访问码：1a2b）`，关掉就抓不到码了。
+    _Rule("115", re.compile(r"(?:115(?:cdn)?|anxia)\.com/s/([a-zA-Z0-9_-]+)", re.I)),
+    # PikPak：多数分享免密；有密码也只可能是 `?pwd=`/`?password=`，同样正常扫。
+    _Rule("pikpak", re.compile(r"mypikpak\.com/s/([a-zA-Z0-9_-]+)", re.I)),
     # 天翼两种形态：老的 /t/<id>，新的 /web/share?code=<id>。
     # 老的 /t/ 后面常直接粘中文"（访问码：xxxx）"，字符集收到中文之前就停。
     _Rule("tianyi", re.compile(r"cloud\.189\.cn/t/([a-zA-Z0-9_-]+)", re.I)),

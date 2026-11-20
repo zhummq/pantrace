@@ -68,7 +68,8 @@ _ALLOWED_HOST_RE = re.compile(
     r"(^|\.)("
     r"pan\.quark\.cn|drive\.uc\.cn|pan\.baidu\.com|"
     r"(alipan|aliyundrive)\.com|pan\.xunlei\.com|cloud\.189\.cn|"
-    r"115\.com|(123pan|123684|123865|123912|123592)\.(com|cn)|(caiyun|yun)\.139\.com|"
+    r"115(?:cdn)?\.com|anxia\.com|mypikpak\.com|"
+    r"(123pan|123684|123865|123912|123592)\.(com|cn)|(caiyun|yun)\.139\.com|"
     r"lanzou[a-z]*\.com|ilanzou\.com|share\.weiyun\.com|guangyapan\.com|"
     r"ctfile\.com|pan\.wo\.cn"
     r")$",
@@ -235,7 +236,8 @@ _PWD_PARAM: tuple[tuple[str, str], ...] = (
     (r"(^|\.)pan\.baidu\.com$", "pwd"),
     (r"(^|\.)pan\.xunlei\.com$", "pwd"),
     (r"(^|\.)(alipan|aliyundrive)\.com$", "pwd"),
-    (r"(^|\.)115\.com$", "password"),
+    (r"(^|\.)115(?:cdn)?\.com$", "password"),
+    (r"(^|\.)anxia\.com$", "password"),
     (r"(^|\.)lanzou[a-z]*\.com$", "pwd"),
     (r"(^|\.)ilanzou\.com$", "pwd"),
     (r"(^|\.)ctfile\.com$", "pwd"),

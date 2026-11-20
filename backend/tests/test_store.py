@@ -297,6 +297,47 @@ class TestHitsChannel(StoreTestBase):
         self.assertEqual(store.stats()["hits_7d_by_channel"], {"local": 1})
 
 
+class TestDropStats(StoreTestBase):
+    """入库丢弃必须留数字。
+
+    以前 `_prepare` 里解析失败就是一句 `continue`：某个平台整类进不了库，
+    看总量完全看不出来（123 / 天翼就这么被埋了很久）。这个计数存在的意义
+    就是让"整类被静默丢掉"当场可见，而不是等对着库做 group by 才发现。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        store._drop_counts.clear()
+        store._drop_samples.clear()
+
+    def test_counts_and_samples(self) -> None:
+        store.upsert_many([
+            _row("https://www.lanzoue.com/iAbCdEf", "蓝奏资源", platform=""),
+            _row("https://pan.quark.cn/s/abc", ""),
+        ])
+        dropped = store.stats()["dropped"]
+        self.assertEqual(dropped["counts"], {"unsupported": 1, "no_title": 1})
+        self.assertIn("lanzoue.com", dropped["samples"]["unsupported"][0])
+
+    def test_115_is_no_longer_dropped(self) -> None:
+        result = store.upsert_many([
+            _row("https://115.com/s/swabcdef?password=1234", "115 资源", platform=""),
+        ])
+        self.assertEqual(result["added"], 1)
+        self.assertEqual(store.stats()["by_platform"], {"115": 1})
+        self.assertEqual(store.stats()["dropped"]["counts"], {})
+
+    def test_platform_comes_from_url_not_from_caller(self) -> None:
+        """调用方把 115 链接标成 quark，也不许按 quark 存。
+
+        标错就分裂 dedup_key：同一条资源两条记录，热度各算一半。
+        """
+        store.upsert_many([
+            _row("https://115.com/s/swabcdef", "115 资源", platform="quark"),
+        ])
+        self.assertEqual(store.stats()["by_platform"], {"115": 1})
+
+
 class TestMigration(unittest.TestCase):
     """老库升级：`resource_hits` 没有 channel 列时，init 必须把它迁过来。
 
