@@ -92,6 +92,37 @@ class PanClient(ABC):
 
     # ---- 默认实现 ----
 
+    def find_child_dir(self, parent_id: str, name: str) -> str:
+        """在 `parent_id` 下找名为 `name` 的子目录，返回其 fid；找不到返回空串。
+
+        给 make_watermark 用的查重钩子。夸克/迅雷建目录都不幂等：同名已存在
+        时上游直接报错（夸克「同名冲突」400），水印名又是全局固定值，同一
+        账号 30 分钟内多次转存必然撞名——所以建之前必须先查，查到就复用。
+
+        各盘 list_files 的 size 上限不同，传 200 由各自 clamp。水印目录是刚
+        建的、排序靠前，第一页足够命中，不翻页省请求。列目录失败只记日志，
+        返回空串让调用方退回"尝试新建"的旧路径——绝不让查重拖垮转存。
+        """
+        if not name:
+            return ""
+        try:
+            for entry in self.list_files(parent_id, 1, 200):
+                if entry.is_dir and entry.name == name and entry.fid:
+                    return entry.fid
+        except NetdiskError as exc:
+            log.info("%s 查同名目录「%s」失败：%s", self.display, name[:24], exc)
+        return ""
+
+    def delete_watermark(self, name: str, to_dir: str = "") -> bool:
+        """删除名为 `name` 的旧水印目录，返回是否删成功。
+
+        水印改成账号级常驻后，只有**改名/关闭**时才需要清旧目录。各盘 `to_dir`
+        到父目录的解析方式不同（夸克走 ensure_dir、迅雷走 _resolve_transfer_parent、
+        百度直接拼路径），delete 收的又是 fid 还是路径也不同，所以由各 adapter
+        覆盖。默认返回 False（视为无需清理），不支持水印的盘不用管。
+        """
+        return False
+
     def make_watermark(self, name: str, to_dir: str = "") -> str:
         """在转存落点目录里建一个**空文件夹**当引流水印，返回它的 fid。
 
@@ -198,28 +229,39 @@ class PanClient(ABC):
         if not fids:
             raise NetdiskError("转存没有返回文件 id")
         # 引流水印：转存完就地在落点目录建一个空文件夹，fid 并入 fids。
-        # 它必须赶在 create_share 之前——分享要把它一起带出去，回收也靠这
-        # 份 fids 删它。建水印失败只记日志，绝不让一条本已成功的转存变失败。
-        fids = self._with_watermark(fids)
+        # 它必须赶在 create_share 之前——分享要把它一起带出去。建水印失败只
+        # 记日志，绝不让一条本已成功的转存变失败。
+        #
+        # 关键：水印是**账号级常驻**的，不随转存回收。所以水印 fid 只进
+        # "建分享用的 fids"，绝不进 link.fids（那份要存进 mirrors、供到期
+        # 回收 / 重转旧副本 / 冷清理三条路径删文件）。混进去的后果是第一个
+        # 转存到期就把共享水印删了，后面所有分享的水印一起消失。改名时才
+        # 由 save_watermark_settings 统一清理旧水印目录。
+        share_fids, wfid = self._with_watermark(fids)
         try:
-            link = self.create_share(fids, info.title or title or "资源分享", expire_hours)
+            link = self.create_share(share_fids, info.title or title or "资源分享", expire_hours)
         except ViolationError:
             # 违规文件已经转存下来了，只是建不了分享。不删就是孤儿：mirrors
             # 里没有它的行，回收任务永远扫不到，账号上白白挂着违规内容。
             # 这条约定原本只写在 errors.py 的表里，这里把它兑现。
+            # 只删正片 fids——水印是常驻的，别跟着一起删。
             try:
                 self.delete(fids)
                 log.warning("%s 建分享被拒（违规），已删除转存副本 %s 个", self.display, len(fids))
             except NetdiskError as exc:
                 log.error("%s 违规副本删除失败（%s 个）：%s", self.display, len(fids), exc)
             raise
-        # 把 fids 带回上层：清理任务要知道删哪些文件，重新列目录去猜代价太大
+        # 只把正片 fids 带回上层：水印是常驻的，不进 mirrors、不参与任何回收。
+        # 清理任务靠这份 fids 删正片，重新列目录去猜代价太大。
         link.fids = list(fids)
         link.size = info.total_size
         return link
 
-    def _with_watermark(self, fids: list[str]) -> list[str]:
-        """把引流水印文件夹的 fid 并进转存 fids。失败/不支持时原样返回。
+    def _with_watermark(self, fids: list[str]) -> tuple[list[str], str]:
+        """建水印并把它并进"建分享用 fids"，返回 (分享用 fids, 水印 fid)。
+
+        水印 fid 单独回传，让 mirror() 只把它用在 create_share，不写进
+        link.fids——水印是账号级常驻目录，不参与任何回收。
 
         这是"锦上添花"，不是主流程：建文件夹要额外请求，而且空目录能不能进
         分享各盘不一样。所以任何异常都在这里吞掉，只记日志——绝不能让用户
@@ -227,16 +269,16 @@ class PanClient(ABC):
         """
         name = (self.watermark_name or "").strip()
         if not name:
-            return fids
+            return fids, ""
         try:
             wfid = self.make_watermark(name, self.account.temp_dir)
         except Exception as exc:  # noqa: BLE001 - 水印失败不影响转存，故兜到最宽
             log.info("%s 建引流水印文件夹「%s」失败，跳过：%s", self.display, name[:24], exc)
-            return fids
+            return fids, ""
         if not wfid:
-            return fids
+            return fids, ""
         log.info("%s 引流水印文件夹「%s」已建（fid=%s）", self.display, name[:24], wfid)
-        return [*fids, wfid]
+        return [*fids, wfid], wfid
 
     def _prefilter_ads(self, info: ShareInfo) -> None:
         """转存前把顶层广告附件从待转清单里摘掉。就地改 `info`。

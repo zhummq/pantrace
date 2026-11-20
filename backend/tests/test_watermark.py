@@ -1,8 +1,9 @@
 """转存引流水印的接线测试。
 
 adfilter 那套管"广告判据对不对"，这里管"水印接线对不对"：水印 fid 有没有
-进 fids（这样才随分享出去、随回收删掉）、关掉时是不是零动作、建失败会不会
-拖垮一条本来成功的转存、不支持的盘是不是自动跳过。
+进建分享用的清单（用户能看到）、有没有被排除在回收用的 link.fids 之外
+（水印是账号级常驻目录，不随转存删）、改名时有没有清旧目录、关掉时是不是
+零动作、建失败会不会拖垮一条本来成功的转存、不支持的盘是不是自动跳过。
 
 跑法：``cd backend && .venv/Scripts/python.exe -m unittest tests.test_watermark -v``
 """
@@ -74,16 +75,16 @@ class _NoWatermarkClient(_FakeClient):
 
 
 class TestWatermarkWiring(unittest.TestCase):
-    def test_watermark_fid_joins_fids_and_link(self):
+    def test_watermark_in_share_but_not_in_recycle_fids(self):
         client = _FakeClient(watermark_name="资源搜索网址panseek.xyz")
         link = client.mirror("https://example.com/s/x")
 
         # 建水印用的是落点目录
         self.assertEqual(client.make_calls, [("资源搜索网址panseek.xyz", "tmpdir")])
-        # 分享时水印 fid 已经在清单里 → 用户能看到
+        # 分享时水印 fid 在清单里 → 用户能看到
         self.assertEqual(client.shared_fids, ["new-fid", "wm-fid"])
-        # link.fids 也带着它 → 30 分钟回收会连它一起删
-        self.assertEqual(link.fids, ["new-fid", "wm-fid"])
+        # 但 link.fids（存 mirrors、供三条回收路径删）只有正片 → 水印常驻不被删
+        self.assertEqual(link.fids, ["new-fid"])
 
     def test_empty_name_disables_entirely(self):
         for name in ("", "   "):
@@ -172,8 +173,12 @@ class TestWatermarkSettings(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.db = Path(self._tmp.name) / "settings.db"
         pan.init(self.db, watermark_name="资源搜索网址panseek.xyz")
+        # 关掉改名清理的后台线程：测试只验证存储层，别让它持有 db 连接
+        self._cleanup_before = pan._WATERMARK_CLEANUP_ENABLED
+        pan._WATERMARK_CLEANUP_ENABLED = False
 
     def tearDown(self):
+        pan._WATERMARK_CLEANUP_ENABLED = self._cleanup_before
         self._tmp.cleanup()
 
     def test_save_hot_updates(self):
@@ -213,6 +218,211 @@ class TestWatermarkSettings(unittest.TestCase):
         with self.assertRaises(ValueError):
             pan.save_watermark_settings(name="a/b")
         self.assertEqual(pan.watermark_settings(), before)
+
+
+class TestWatermarkSameName(unittest.TestCase):
+    """同名水印撞名：必须先查到已存在目录复用 fid，别让水印漏进 fids。
+
+    线上实测：夸克第二次转存时同名目录已存在，建目录回 400「同名冲突」，
+    fid 没进 fids，分享里就没水印。修法是建前先列目录查同名。
+    """
+
+    def _quark(self):
+        from unittest import mock
+        from app.sdk.adapters.quark.client import QuarkClient
+        from app.sdk.types import Account
+
+        with mock.patch.object(QuarkClient, "_build_requester", return_value=mock.Mock()):
+            return QuarkClient(Account(id=1, type="quark", temp_dir="pantrace"))
+
+    def test_quark_reuses_existing_dir_without_mkdir(self):
+        """同名目录已存在 → 直接返回它的 fid，不新建。"""
+        from unittest import mock
+        from app.sdk.types import File
+
+        client = self._quark()
+        with mock.patch.object(client, "ensure_dir", return_value="parent-fid"), \
+             mock.patch.object(client, "list_files", return_value=[
+                 File(fid="existing-wm", name="水印", size=0, is_dir=True),
+             ]), \
+             mock.patch.object(client, "mkdir") as mkdir:
+            result = client.make_watermark("水印")
+        mkdir.assert_not_called()
+        self.assertEqual(result, "existing-wm")
+
+    def test_quark_creates_when_no_same_name(self):
+        """没同名 → 才走 mkdir。"""
+        from unittest import mock
+
+        client = self._quark()
+        with mock.patch.object(client, "ensure_dir", return_value="parent-fid"), \
+             mock.patch.object(client, "list_files", return_value=[
+                 File(fid="other", name="别的东西", size=0, is_dir=True),
+             ]), \
+             mock.patch.object(client, "mkdir", return_value="new-wm") as mkdir:
+            result = client.make_watermark("水印")
+        mkdir.assert_called_once_with("水印", "parent-fid")
+        self.assertEqual(result, "new-wm")
+
+    def test_quark_race_recovers_fid_after_conflict(self):
+        """查完到建之间被抢先建了：mkdir 抛撞名，再列一次捞回 fid。"""
+        from unittest import mock
+        from app.sdk.errors import UpstreamError
+        from app.sdk.types import File
+
+        client = self._quark()
+        # 第一次列目录（查重）空，mkdir 抛撞名，第二次列目录（兜底）有同名
+        with mock.patch.object(client, "ensure_dir", return_value="parent-fid"), \
+             mock.patch.object(client, "list_files", side_effect=[
+                 [],
+                 [File(fid="raced-wm", name="水印", size=0, is_dir=True)],
+             ]), \
+             mock.patch.object(client, "mkdir", side_effect=UpstreamError("同名冲突")):
+            result = client.make_watermark("水印")
+        self.assertEqual(result, "raced-wm")
+
+    def test_quark_real_conflict_still_skips(self):
+        """兜底也没捞到（真失败）→ 返回空，交给基类跳过，不拖垮转存。"""
+        from unittest import mock
+        from app.sdk.errors import UpstreamError
+
+        client = self._quark()
+        with mock.patch.object(client, "ensure_dir", return_value="parent-fid"), \
+             mock.patch.object(client, "list_files", return_value=[]), \
+             mock.patch.object(client, "mkdir", side_effect=UpstreamError("同名冲突")):
+            result = client.make_watermark("水印")
+        self.assertEqual(result, "")
+
+    def test_find_child_dir_ignores_files_and_other_names(self):
+        """查重只认 is_dir 且名字精确相等的，文件/别的名字不算。"""
+        from unittest import mock
+        from app.sdk.types import File
+
+        client = self._quark()
+        with mock.patch.object(client, "list_files", return_value=[
+            File(fid="f", name="水印", size=10, is_dir=False),
+            File(fid="d2", name="水印副本", size=0, is_dir=True),
+            File(fid="d3", name="水印", size=0, is_dir=True),
+        ]):
+            self.assertEqual(client.find_child_dir("parent", "水印"), "d3")
+
+    def test_xunlei_reuses_existing_dir(self):
+        """迅雷同样：同名已存在就复用，不建、不取 captcha。"""
+        from unittest import mock
+        from app.sdk.adapters.xunlei.client import XunleiClient
+        from app.sdk.types import Account, File
+
+        with mock.patch.object(XunleiClient, "_build_requester", return_value=mock.Mock()):
+            client = XunleiClient(Account(id=1, type="xunlei", temp_dir="pantrace",
+                                          refresh_token="r"))
+        with mock.patch.object(client, "_resolve_transfer_parent", return_value="parent"), \
+             mock.patch.object(client, "find_child_dir", return_value="existing-x"), \
+             mock.patch.object(client, "_call") as call:
+            result = client.make_watermark("水印")
+        call.assert_not_called()
+        self.assertEqual(result, "existing-x")
+
+
+class TestWatermarkPersistence(unittest.TestCase):
+    """水印常驻 + 改名清理旧目录。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Path(self._tmp.name) / "settings.db"
+        pan.init(self.db, watermark_name="旧水印")
+        self._cleanup_before = pan._WATERMARK_CLEANUP_ENABLED
+        # 改名清理走后台线程，测试里关掉自动触发，改由显式调用验证
+        pan._WATERMARK_CLEANUP_ENABLED = False
+
+    def tearDown(self):
+        pan._WATERMARK_CLEANUP_ENABLED = self._cleanup_before
+        self._tmp.cleanup()
+
+    def test_rename_queues_cleanup(self):
+        """改名时排队清理旧名字，关名也清理。"""
+        from unittest import mock
+
+        # 临时打开开关，mock 掉真起线程的函数，只验证"有没有排队"
+        pan._WATERMARK_CLEANUP_ENABLED = True
+        try:
+            with mock.patch.object(pan, "_queue_watermark_cleanup") as queue:
+                pan.save_watermark_settings(name="新水印")
+                queue.assert_called_once_with("旧水印")
+                queue.reset_mock()
+                pan.save_watermark_settings(name="")  # 关闭也要清旧目录
+                queue.assert_called_once_with("新水印")
+        finally:
+            pan._WATERMARK_CLEANUP_ENABLED = False
+
+    def test_same_name_no_cleanup(self):
+        """名字没变不触发清理。"""
+        from unittest import mock
+
+        with mock.patch.object(pan, "_queue_watermark_cleanup") as queue:
+            pan.save_watermark_settings(name="旧水印")
+            queue.assert_not_called()
+
+    def test_run_cleanup_visits_enabled_accounts(self):
+        """后台清理遍历启用账号，对每家调 delete_watermark(old, temp_dir)。"""
+        from unittest import mock
+        from app.sdk.types import Account
+
+        enabled = Account(id=1, type="quark", temp_dir="tmp1", status=1)
+        disabled = Account(id=2, type="baidu", temp_dir="tmp2", status=0)
+        client = mock.Mock()
+        with mock.patch.object(pan, "list_accounts", return_value=[enabled, disabled]), \
+             mock.patch.object(pan, "_client_for", return_value=client):
+            pan._run_watermark_cleanup("旧水印")
+        client.delete_watermark.assert_called_once_with("旧水印", "tmp1")
+        client.close.assert_called_once()
+
+    def test_run_cleanup_survives_one_account_failure(self):
+        """一个账号清理抛异常，不影响后面账号。"""
+        from unittest import mock
+        from app.sdk.types import Account
+
+        a1 = Account(id=1, type="quark", temp_dir="tmp1", status=1)
+        a2 = Account(id=2, type="baidu", temp_dir="tmp2", status=1)
+        c1, c2 = mock.Mock(), mock.Mock()
+        c1.delete_watermark.side_effect = RuntimeError("挂了")
+        with mock.patch.object(pan, "list_accounts", return_value=[a1, a2]), \
+             mock.patch.object(pan, "_client_for", side_effect=[c1, c2]):
+            pan._run_watermark_cleanup("旧水印")
+        c1.close.assert_called_once()
+        c2.delete_watermark.assert_called_once_with("旧水印", "tmp2")
+
+    def test_quark_delete_watermark(self):
+        """夸克：列目录找到 fid 后删。"""
+        from unittest import mock
+
+        client = self._quark_helper()
+        with mock.patch.object(client, "ensure_dir", return_value="parent"), \
+             mock.patch.object(client, "find_child_dir", return_value="old-wm"), \
+             mock.patch.object(client, "delete") as delete:
+            result = client.delete_watermark("旧水印", "tmpdir")
+        delete.assert_called_once_with(["old-wm"])
+        self.assertTrue(result)
+
+    def test_quark_delete_watermark_not_found(self):
+        """找不到旧目录 → 不删，返回 False。"""
+        from unittest import mock
+
+        client = self._quark_helper()
+        with mock.patch.object(client, "ensure_dir", return_value="parent"), \
+             mock.patch.object(client, "find_child_dir", return_value=""), \
+             mock.patch.object(client, "delete") as delete:
+            result = client.delete_watermark("旧水印", "tmpdir")
+        delete.assert_not_called()
+        self.assertFalse(result)
+
+    @staticmethod
+    def _quark_helper():
+        from unittest import mock
+        from app.sdk.adapters.quark.client import QuarkClient
+        from app.sdk.types import Account
+
+        with mock.patch.object(QuarkClient, "_build_requester", return_value=mock.Mock()):
+            return QuarkClient(Account(id=1, type="quark", temp_dir="tmpdir"))
 
 
 if __name__ == "__main__":

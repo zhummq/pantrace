@@ -330,6 +330,20 @@ class XunleiClient(PanClient):
         self._temp_dir_id, self._temp_dir_name = fid, name
         return fid
 
+    def delete_watermark(self, name: str, to_dir: str = "") -> bool:
+        """改名时清理旧水印目录：在落点目录找同名文件夹，找到就删。"""
+        parent = self._resolve_transfer_parent(to_dir)
+        wid = self.find_child_dir(parent, name)
+        if not wid:
+            return False
+        try:
+            self.delete([wid])
+            log.info("%s 已清理旧水印目录「%s」（id=%s）", self.display, name[:24], wid)
+            return True
+        except NetdiskError as exc:
+            log.info("%s 清理旧水印目录「%s」失败：%s", self.display, name[:24], exc)
+            return False
+
     def make_watermark(self, name: str, to_dir: str = "") -> str:
         """引流水印：在转存落点目录里建一个空文件夹，返回它的 fid。
 
@@ -337,6 +351,10 @@ class XunleiClient(PanClient):
         落点目录，水印才会和转存项同级、一起进分享、一起被回收。
         """
         parent = self._resolve_transfer_parent(to_dir)
+        # 和夸克同理：同名已存在会撞名，先查到就复用，别让它拖累水印进 fids
+        existing = self.find_child_dir(parent, name)
+        if existing:
+            return existing
         try:
             resp = self._call(
                 "POST",
@@ -347,6 +365,7 @@ class XunleiClient(PanClient):
                 # (POST:/drive/v1/files)，缓存的 token 可能被上游用过一次就失效。
                 captcha_renew=True,
             )
+            return str((resp.get("file") or {}).get("id") or "")
         except (AuthError, UpstreamError) as exc:
             # 排查留痕：captcha 这类 400 以前日志只有一句"验证码无效"，分不清
             # 是 user_id 没拿到还是 token 复用。带上真实 user_id 一眼就能定位。
@@ -354,8 +373,11 @@ class XunleiClient(PanClient):
                 "%s 建水印目录失败 user_id=%s parent=%s action=%s：%s",
                 self.display, self._user_id or "(空)", parent, "POST:/drive/v1/files", exc,
             )
+            # 查完到建之间被并发抢先建了：再列一次捞已存在目录的 id。
+            # 只兜 UpstreamError（撞名在这类里）；AuthError 是登录态问题，别白查。
+            if isinstance(exc, UpstreamError):
+                return self.find_child_dir(parent, name)
             raise
-        return str((resp.get("file") or {}).get("id") or "")
 
     # ---- 分享侧 ----
 

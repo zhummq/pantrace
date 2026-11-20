@@ -361,6 +361,24 @@ class BaiduClient(PanClient):
                 )
         self._ensured_dirs.add(path)
 
+    def delete_watermark(self, name: str, to_dir: str = "") -> bool:
+        """改名时清理旧水印目录：拼出路径，存在就删。"""
+        parent = (to_dir or self.account.temp_dir or "/").strip()
+        if not parent.startswith("/"):
+            parent = "/" + parent
+        parent = parent.rstrip("/") or "/"
+        name = name.strip().strip("/")
+        target = f"{parent}/{name}" if parent != "/" else f"/{name}"
+        if not self._dir_exists(target):
+            return False
+        try:
+            self.delete([target.lstrip("/")])
+            log.info("百度网盘 已清理旧水印目录「%s」", name[:24])
+            return True
+        except NetdiskError as exc:
+            log.info("百度网盘 清理旧水印目录「%s」失败：%s", name[:24], exc)
+            return False
+
     def make_watermark(self, name: str, to_dir: str = "") -> str:
         """引流水印：在转存落点目录里建一个空目录，返回它的相对路径。
 

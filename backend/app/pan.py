@@ -238,12 +238,19 @@ def watermark_settings() -> dict:
     return {"name": str(_cfg.get("watermark_name") or "")}
 
 
+#: 改名时是否后台清理旧水印目录。测试里关掉，避免误删真实网盘内容。
+_WATERMARK_CLEANUP_ENABLED = True
+
+
 def save_watermark_settings(*, name: str) -> dict:
     """校验 + 落库 + **立即热更**，返回生效后的快照。
 
     这是要建在用户网盘里的文件夹名，校验比广告词更严：路径分隔符和控制字符
     一律拒绝，避免拼路径时被当成多级目录。空名字是有效值——表示关闭水印，
-    不产生任何额外请求。
+    不产生任何额外请求（但会触发旧水印目录的清理）。
+
+    水印是账号级常驻目录，不随转存回收。所以名字一变，旧名字那批目录就再
+    没人用了——后台异步遍历所有账号清掉，不阻塞保存接口。
     """
     value = str(name or "").strip()
     if value:
@@ -255,10 +262,48 @@ def save_watermark_settings(*, name: str) -> dict:
             raise ValueError("文件夹名不能是 . 或 ..")
         if len(value) > 60:
             raise ValueError(f"文件夹名太长（{len(value)} 字，最多 60）")
+    old = str(_cfg.get("watermark_name") or "").strip()
     _save_settings({"watermark_name": value})
     _cfg["watermark_name"] = value
     log.info("转存水印已更新：%s", value or "(关闭)")
+    if old and old != value and _WATERMARK_CLEANUP_ENABLED:
+        _queue_watermark_cleanup(old)
     return watermark_settings()
+
+
+def _queue_watermark_cleanup(old_name: str) -> None:
+    """改名后把旧水印目录清理丢到后台线程，立即返回。
+
+    遍历账号要建 client、列目录、删目录，慢且可能卡在某一个盘上，不能压在
+    后台保存接口的请求线程里。清理失败只脏不坏（旧水印多留一阵，占极小空间），
+    所以线程里一律吞异常。
+    """
+    threading.Thread(
+        target=_run_watermark_cleanup,
+        args=(old_name,),
+        name=f"watermark-cleanup-{old_name[:8]}",
+        daemon=True,
+    ).start()
+
+
+def _run_watermark_cleanup(old_name: str) -> None:
+    """后台线程本体：逐账号清旧水印目录。任何异常都只记日志。"""
+    for account in list_accounts():
+        if not account.enabled:
+            continue
+        client = None
+        try:
+            client = _client_for(account)
+            if client.delete_watermark(old_name, account.temp_dir):
+                log.info("账号 %s 已清理旧水印目录「%s」", account.id, old_name[:24])
+        except Exception as exc:  # noqa: BLE001 - 清理失败不影响其他账号
+            log.warning("账号 %s 清理旧水印目录失败：%s", account.id, exc)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def _connect() -> sqlite3.Connection:

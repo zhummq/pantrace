@@ -595,14 +595,40 @@ class QuarkClient(PanClient):
                 # 删除没等到完成不算失败：文件已经进回收站，用户看不到就够了
                 log.info("%s 删除任务未在时限内完成：%s", self.display, task_id)
 
+    def delete_watermark(self, name: str, to_dir: str = "") -> bool:
+        """改名时清理旧水印目录：在落点目录找同名文件夹，找到就删。"""
+        parent = self.ensure_dir(to_dir)
+        wfid = self.find_child_dir(parent, name)
+        if not wfid:
+            return False
+        try:
+            self.delete([wfid])
+            log.info("%s 已清理旧水印目录「%s」（fid=%s）", self.display, name[:24], wfid)
+            return True
+        except NetdiskError as exc:
+            log.info("%s 清理旧水印目录「%s」失败：%s", self.display, name[:24], exc)
+            return False
+
     def make_watermark(self, name: str, to_dir: str = "") -> str:
         """引流水印：在转存落点目录（和转存内容同级）建一个同名空文件夹。
 
         复用 ensure_dir 拿到 temp_dir 的 fid——它和 transfer 用的是同一个缓存，
         这里拿到的是同一层，水印文件夹才会和转存项一起出现在分享里。
+
+        夸克建目录**不幂等**：同名已存在直接回 400「file is doloading[同名冲突]」。
+        水印名全局固定，同账号 30 分钟内多次转存必然撞名，撞了就建不出水印、
+        fid 进不了 fids、分享里就没有水印（线上实测）。所以先列目录查同名复用，
+        建的时候万一并发撞上，再查一次捞已存在目录的 fid。
         """
         parent = self.ensure_dir(to_dir)
-        return self.mkdir(name, parent)
+        existing = self.find_child_dir(parent, name)
+        if existing:
+            return existing
+        try:
+            return self.mkdir(name, parent)
+        except NetdiskError:
+            # 查完到建之间被并发抢先建了：再列一次把已存在目录的 fid 捞回来
+            return self.find_child_dir(parent, name)
 
     def mkdir(self, name: str, parent_id: str = "0") -> str:
         resp = self.http.post(
