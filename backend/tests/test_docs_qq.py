@@ -189,21 +189,101 @@ class TestRangeClamp(unittest.TestCase):
         meta = dq.DocMeta(
             pad_id="X", title="t", tabs=[dq.Tab("t1", "表", max_row=300)]
         )
-        seen: list[int] = []
+        seen: list[tuple[int, int]] = []
 
         def fake_meta(_url: str) -> dq.DocMeta:
             return meta
 
-        def fake_block(_pad: str, _tab: str, start: int) -> list[list[str]]:
-            seen.append(start)
+        def fake_block(_pad: str, _tab: str, start: int, end: int = 0) -> list[list[str]]:
+            seen.append((start, end))
             return [["x", "https://pan.quark.cn/s/a"]]
 
         with mock.patch.object(dq, "fetch_meta", fake_meta), \
              mock.patch.object(dq, "read_block", fake_block):
             rows, _ = dq.read_tab("https://docs.qq.com/sheet/X", tab_id="t1", end_row=99999)
 
-        self.assertEqual(seen, [0, 256])   # 只读两块，第三块 512 已经超了
+        # 只读两块；第二块被夹到 299——但这里每块都只回 1 行，所以 512 那块不会再请求
+        self.assertEqual([s for s, _ in seen], [0, 256])
+        self.assertEqual(seen[1], (256, 299))   # end_row 夹到表长 300 的最后一行
         self.assertEqual(len(rows), 2)
+
+
+class TestRowAlignment(unittest.TestCase):
+    """块内对齐：文字格和链接格数量对不上时，不能按下标硬配。
+
+    接口返回的单元格是按**类型**分组的（纯文字一堆、带超链接一堆），不是按列。
+    只要某行多一格文字（作者的广告行）或少一格（空标题），两堆长度就不再相等，
+    按数组下标配就会整体错位——标题配上隔壁行的链接，而且不报错、点得开。
+    """
+
+    @staticmethod
+    def _sheet(rows):
+        """模拟接口：按行给数据，返回时按类型分组。"""
+        def fake(_pad, _tab, start, end):
+            texts, links = [], []
+            for row in rows[start:end + 1]:
+                for cell in row:
+                    if not cell:
+                        continue
+                    if cell.startswith("http"):
+                        links.append(("", [cell]))
+                    else:
+                        texts.append((cell, []))
+            return texts + links
+        return fake
+
+    def test_plain_block_pairs_by_index(self) -> None:
+        rows = [["甲", "https://pan.quark.cn/s/a"], ["乙", "https://pan.quark.cn/s/b"]]
+        got = dq._align_rows("P", "T", 0, 1, [dq.MAX_ALIGN_REQUESTS], self._sheet(rows)("P", "T", 0, 1))
+        self.assertEqual(got, rows)
+
+    def test_extra_text_cell_does_not_shift_rows(self) -> None:
+        """广告行有两个文字格、没有链接——这正是线上错位的起因。"""
+        from unittest import mock
+
+        rows = [
+            ["Ctel+F查询文件…", "找资源+v  zzgshr123"],
+            ["踢毽子视频教学", "https://pan.xunlei.com/s/VOfTG6"],
+            ["植物大战僵尸合集", "https://pan.xunlei.com/s/VOfTG7L"],
+        ]
+        fake = self._sheet(rows)
+        with mock.patch.object(dq, "_window_cells", fake):
+            got = dq._align_rows("P", "T", 0, 2, [dq.MAX_ALIGN_REQUESTS])
+
+        self.assertEqual(len(got), 3)
+        self.assertEqual(got[0], ["Ctel+F查询文件…", "找资源+v  zzgshr123"])
+        self.assertEqual(got[1], ["踢毽子视频教学", "https://pan.xunlei.com/s/VOfTG6"])
+        self.assertEqual(got[2], ["植物大战僵尸合集", "https://pan.xunlei.com/s/VOfTG7L"])
+
+    def test_empty_title_keeps_link_on_its_own_row(self) -> None:
+        from unittest import mock
+
+        rows = [
+            ["甲", "https://pan.quark.cn/s/a"],
+            ["", "https://pan.quark.cn/s/b"],
+            ["丙", "https://pan.quark.cn/s/c"],
+        ]
+        with mock.patch.object(dq, "_window_cells", self._sheet(rows)):
+            got = dq._align_rows("P", "T", 0, 2, [dq.MAX_ALIGN_REQUESTS])
+
+        self.assertEqual([r[1] for r in got],
+                         ["https://pan.quark.cn/s/a", "https://pan.quark.cn/s/b",
+                          "https://pan.quark.cn/s/c"])
+        self.assertEqual(got[1][0], "")      # 空标题就留空，不去抢别人的
+
+    def test_single_row_cells_keep_column_order(self) -> None:
+        cells = [("标题", []), ("https://pan.quark.cn/s/x", ["https://pan.quark.cn/s/x"])]
+        self.assertEqual(dq._cells_to_row(cells), ["标题", "https://pan.quark.cn/s/x"])
+
+    def test_budget_exhausted_still_returns_rows(self) -> None:
+        """预算用完要退回硬配，不能抛异常、也不能少行——少行等于丢数据。"""
+        from unittest import mock
+
+        rows = [["", "https://pan.quark.cn/s/%d" % i] for i in range(8)]
+        with mock.patch.object(dq, "_window_cells", self._sheet(rows)):
+            got = dq._align_rows("P", "T", 0, 7, [1])
+
+        self.assertEqual(len(got), 8)
 
 
 if __name__ == "__main__":

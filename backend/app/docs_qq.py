@@ -11,9 +11,19 @@
    `workbook` 和 `block_datas[].related_sheet` 都是 **base64 + zlib 的 protobuf**。
    不带 `wb=1&nowb=0` 和 `needSheetState=1&sliceStates=1` 时，接口只回壳子。
 
-2. **表格是列式存储，不是行式。** block 顶层 field N 就是第 N-1 列的**全部单元格**，
-   行号 = 数组下标。所以"标题列 257 个、链接列 255 个"不是错位，是链接列尾巴上
-   两行是空的——空单元格不占位。按索引对齐即可，别去猜。
+2. **单元格是按「类型」分组的，不是按列。** 顶层 field 1 = 纯文字格，field 2 =
+   带超链接的格。之所以看起来"像列"，是因为这份表的标题都是纯文字、链接都是超链接，
+   两堆刚好一一对应。**一旦某行多一个文字格（作者的广告行）或少一格（空标题），
+   两堆长度就不再相等，从那个位置往后整体错位**——标题会配到隔壁行的链接上，
+   而表面上一切正常，搜得到、点得开，只是内容对不上。
+   实测：抽查 40 块，6 块有这种错位。
+   所以对齐不能按下标硬配，必须靠"文字格数 = 链接格数"这个条件判定（整行空白
+   在两边都不占格子，所以这个条件比"等于行数"更宽松、也更对）；不成立就把窗口
+   二分继续缩，缩到一行时格子的顺序就是列的先后（`_align_rows`）。
+
+   这条是 2026-11-20 用作者自己的 Excel 截图核对出来的：表里「踢毽子视频教学」右边
+   是 `…dQwA1`，而我们配成了 `…DxRA1`（错两行）。之前那句"field N 就是第 N-1 列"
+   是错的，别按它改代码。
 
 3. **一次只给 256 行。** 靠 `block_start_row` / `block_end_row` 翻页，
    38 万行的表要 1400+ 次请求。所以增量只能靠 `max_row` 变化判断，
@@ -55,6 +65,9 @@ UA = (
 )
 # 官方前端一次请求的上限。给多了也只回一块，别浪费往返
 BLOCK_ROWS = 256
+# 块内单元格数量对不齐时，最多再花多少次请求去逐层二分。正常块一次都不用；
+# 一块里十几个空标题也就是几十次。设上限是防病态数据把一次同步拖成几小时。
+MAX_ALIGN_REQUESTS = 256
 TIMEOUT = 30.0
 
 _PAD_ID = re.compile(r"docs\.qq\.com/(?:sheet|smartsheet)/([A-Za-z0-9]+)")
@@ -503,32 +516,140 @@ def _header_fingerprint(pad_id: str, tab_id: str) -> str:
     """
     key = (pad_id, tab_id)
     if key not in _header_cache:
-        payload = _opendoc(pad_id, tab_id, 0, BLOCK_ROWS - 1)
-        rows: list[list[str]] = []
-        for _end_row, blob in _block_offsets(payload):
-            rows.extend(parse_block(blob))
-        _header_cache[key] = "".join(rows[0]) if rows else ""
+        cells = _window_cells(pad_id, tab_id, 0, BLOCK_ROWS - 1)
+        _header_cache[key] = cells[0][0] if cells else ""
     return _header_cache[key]
 
 
-def read_block(pad_id: str, tab_id: str, start_row: int) -> list[list[str]]:
+def _window_cells(
+    pad_id: str, tab_id: str, start_row: int, end_row: int
+) -> list[tuple[str, list[str]]]:
+    """一次请求，按返回顺序取出单元格：(文本, 链接列表)。"""
+    payload = _opendoc(pad_id, tab_id, start_row, end_row)
+    out: list[tuple[str, list[str]]] = []
+    for _end_row, blob in _block_offsets(payload):
+        for _fn, val in _column_payloads(blob):
+            out.append((_text_of(val), urls_in_cell(val)))
+        break                     # 一个请求只带一块
+    return out
+
+
+def _cells_to_row(cells: list[tuple[str, list[str]]]) -> list[str]:
+    """单独一行的单元格 → [标题, 链接]。
+
+    缩到一行时，格子的先后就是列的先后；类型信息也还在：带链接的归链接列、
+    纯文字归标题列。两格都是文字（作者写的广告行）就按顺序占位——这种行没有
+    链接，上层本来就会丢掉。
+    """
+    row = ["", ""]
+    for text, urls in cells:
+        value = text or " ".join(urls)
+        if not value:
+            continue
+        slot = 1 if urls else 0
+        if row[slot]:             # 该列已有值，占另一列
+            slot = 1 - slot
+        if not row[slot]:
+            row[slot] = value
+    return row
+
+
+def _naive_rows(
+    cells: list[tuple[str, list[str]]], n: int
+) -> list[list[str]]:
+    """兜底：按下标硬配。只在预算耗尽时用，宁可错也不让同步卡死。"""
+    texts = [c for c in cells if not c[1] and c[0].strip()]
+    links = [c for c in cells if c[1]]
+    return [
+        [
+            texts[i][0] if i < len(texts) else "",
+            " ".join(links[i][1]) if i < len(links) else "",
+        ]
+        for i in range(n)
+    ]
+
+
+def _align_rows(
+    pad_id: str,
+    tab_id: str,
+    start_row: int,
+    end_row: int,
+    budget: list[int],
+    cells: list[tuple[str, list[str]]] | None = None,
+) -> list[list[str]]:
+    """把 [start_row, end_row] 还原成逐行单元格。
+
+    **为什么不能按下标硬配。** 接口把单元格按类型分组返回：纯文字一堆、带超链接
+    一堆（见模块头第 2 条）。只有两堆数量相等时，按下标配才等价于按行配；一旦
+    某行多一个文字格（广告行）或少一格（空标题），从那里往后就整体错位，标题会
+    配上隔壁行的链接——而且不报错，搜得到、点得开。
+
+    数量对不上就把窗口二分继续缩，缩到只剩一行时，格子顺序就是列顺序，不用再猜。
+    正常块仍然是 1 次请求，只有出问题的块才付这个代价。
+    """
+    n = end_row - start_row + 1
+    if cells is None:
+        cells = _window_cells(pad_id, tab_id, start_row, end_row)
+        budget[0] -= 1
+    if not cells:
+        return []
+
+    # 空格子不参与计数：表尾那段每行都多带一个空占位格（第 3 列没填），
+    # 把它算成文字格的话，每一块都会被判成"对不齐"，然后一路二分到单行，
+    # 一块烧掉几百次请求（实测 2 块 517 次）。它不携带任何信息。
+    texts = [c for c in cells if not c[1] and c[0].strip()]
+    links = [c for c in cells if c[1]]
+
+    # 判据是**两堆数量相等**，不是"等于行数"。整行空白在表里很常见（这一段
+    # 256 行里有 128 行是空的），空白行两边都不贡献格子，所以两堆一起变短
+    # 并不影响一一对应；只有一边短了才说明从某处起错位了。
+    if len(texts) == len(links):
+        return [[texts[i][0], " ".join(links[i][1])] for i in range(len(texts))]
+
+    if n <= 1:
+        return [_cells_to_row(cells)]
+
+    if budget[0] <= 0:
+        log.warning(
+            "第 %s~%s 行的单元格数量一直对不齐，预算用完，先按顺序硬配",
+            start_row,
+            end_row,
+        )
+        return _naive_rows(cells, n)
+
+    mid = (start_row + end_row) // 2
+    return _align_rows(pad_id, tab_id, start_row, mid, budget) + _align_rows(
+        pad_id, tab_id, mid + 1, end_row, budget
+    )
+
+
+def read_block(
+    pad_id: str, tab_id: str, start_row: int, end_row: int | None = None
+) -> list[list[str]]:
     """拉一块（最多 256 行）。空列表表示这块没数据。
+
+    `end_row` 给最后一块用（夹到表长），不给就是整块 256 行。
 
     **越界不报错，它把表头那块还给你。** `start_row >= max_row` 时接口照样返回
     257 行，内容从第 0 行开始。所以这里拿表头指纹比对，一旦撞上就当"没数据"
     处理——不这么判，上层会以为表比实际长几百上千倍（见模块头第 4 条）。
+
+    指纹比对放在对齐之前：越界时返回的是整块表头，对齐逻辑会以为"数量对不上"
+    而一层层二分，白烧几十次请求。
     """
     start_row = max(0, int(start_row))
-    end = start_row + BLOCK_ROWS - 1
-    payload = _opendoc(pad_id, tab_id, start_row, end)
-    for _end_row, blob in _block_offsets(payload):
-        rows = parse_block(blob)
-        if not rows:
-            continue
-        if start_row > 0 and "".join(rows[0]) == _header_fingerprint(pad_id, tab_id):
-            return []
-        return rows
-    return []
+    end = start_row + BLOCK_ROWS - 1 if end_row is None else int(end_row)
+    end = min(end, start_row + BLOCK_ROWS - 1)
+    if end < start_row:
+        return []
+    cells = _window_cells(pad_id, tab_id, start_row, end)
+    if not cells:
+        return []
+    if start_row > 0 and cells[0][0] == _header_fingerprint(pad_id, tab_id):
+        return []
+    return _align_rows(
+        pad_id, tab_id, start_row, end, [MAX_ALIGN_REQUESTS], cells=cells
+    )
 
 
 def read_tab(
@@ -564,7 +685,11 @@ def read_tab(
 
     def _one(offset: int) -> list[list[str]]:
         try:
-            return read_block(meta.pad_id, tab.tab_id, offset)
+            # 最后一块要夹到表长：`max_row` 不是 256 的整数倍，不夹的话窗口会越过
+            # 表尾一百多行，而越界部分返回的是**表头**内容——它会混进这一块，
+            # 让"文字格数 = 链接格数"的对齐判据失效，一路二分到单行（实测一块
+            # 烧掉 257 次请求）。夹住之后最后一块就是普通的短块。
+            return read_block(meta.pad_id, tab.tab_id, offset, min(offset + BLOCK_ROWS - 1, last - 1))
         except DocError as exc:
             log.warning("腾讯文档第 %s 行读失败：%s", offset, exc)
             return []
