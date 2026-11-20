@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -232,6 +233,133 @@ class TestMarkCheck(StoreTestBase):
             row = conn.execute("SELECT check_state, revive_count FROM resources").fetchone()
         self.assertEqual(row["check_state"], store.STATE_OK)
         self.assertEqual(row["revive_count"], 1)
+
+
+class TestHitsChannel(StoreTestBase):
+    """命中来源必须分开记。
+
+    混在一起就再也分不清「这条资源是上游给的」还是「库自己找得出来」——
+    前者说明库还没派上用场，后者说明库在兜上游给不了的东西。P1 上线后
+    这个区别就是判断本地检索到底有没有出力的唯一依据。
+    """
+
+    def _one(self) -> int:
+        result = store.upsert_many([_row("https://pan.quark.cn/s/a1", "三体 全集")])
+        return result["ids"]["quark:a1"]
+
+    def test_same_day_same_query_kept_apart(self):
+        rid = self._one()
+        store.record_hits([rid], "三体", channel=store.CHANNEL_UPSTREAM)
+        store.record_hits([rid], "三体", channel=store.CHANNEL_UPSTREAM)
+        store.record_hits([rid], "三体", channel=store.CHANNEL_LOCAL)
+
+        with store._session() as conn:
+            rows = {
+                r["channel"]: r["count"]
+                for r in conn.execute(
+                    "SELECT channel, count FROM resource_hits WHERE resource_id=?", (rid,)
+                )
+            }
+        self.assertEqual(rows, {"upstream": 2, "local": 1})
+
+    def test_stats_splits_by_channel(self):
+        rid = self._one()
+        store.record_hits([rid], "三体", channel=store.CHANNEL_UPSTREAM)
+        store.record_hits([rid], "三体", channel=store.CHANNEL_LOCAL)
+        store.record_hits([rid], "三体", channel=store.CHANNEL_LOCAL)
+
+        s = store.stats()
+        self.assertEqual(s["hits_7d"], 3)  # 总和，向后兼容
+        self.assertEqual(s["hits_7d_by_channel"], {"upstream": 1, "local": 2})
+
+    def test_unknown_channel_falls_back_to_upstream(self):
+        """白名单归一：脏值不许自己开出一条新口径。"""
+        rid = self._one()
+        store.record_hits([rid], "三体", channel="从浏览器插件来的")
+        store.record_hits([rid], "三体", channel="")
+
+        with store._session() as conn:
+            rows = conn.execute("SELECT DISTINCT channel FROM resource_hits").fetchall()
+        self.assertEqual([r["channel"] for r in rows], ["upstream"])
+
+    def test_ingest_passes_channel_through(self):
+        items = [{
+            "shareUrl": "https://pan.quark.cn/s/a1",
+            "title": "三体 全集",
+            "platform": "quark",
+            "sharePwd": "1234",
+            "fileCount": 12,
+            "sizeBytes": 1024,
+            "sourceName": "library",
+            "sourceKind": "library",
+        }]
+        store.ingest(items, "三体", channel=store.CHANNEL_LOCAL)
+        self.assertEqual(store.stats()["hits_7d_by_channel"], {"local": 1})
+
+
+class TestMigration(unittest.TestCase):
+    """老库升级：`resource_hits` 没有 channel 列时，init 必须把它迁过来。
+
+    线上已经有这种库了（113 条资源、若干命中）。迁移写错的后果是
+    "启动成功但历史热度全丢"——不会报错，只是数字归零。
+    """
+
+    OLD_SCHEMA = """
+        CREATE TABLE resource_hits (
+            resource_id INTEGER NOT NULL,
+            query       TEXT    NOT NULL,
+            day         INTEGER NOT NULL,
+            count       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (resource_id, query, day)
+        );
+        CREATE INDEX idx_hits_query ON resource_hits(query, day DESC);
+        INSERT INTO resource_hits(resource_id, query, day, count)
+            VALUES (1, '三体', 20261119, 7), (2, '三体', 20261119, 3);
+    """
+
+    def _make_old_db(self, path: Path) -> None:
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.executescript(self.OLD_SCHEMA)
+        finally:
+            conn.close()
+
+    def test_old_hits_migrated_to_upstream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "old.db"
+            self._make_old_db(db)
+
+            store.init(db)
+
+            with store._session() as conn:
+                cols = [r[1] for r in conn.execute("PRAGMA table_info(resource_hits)")]
+                self.assertIn("channel", cols)
+                rows = conn.execute(
+                    "SELECT resource_id, channel, count FROM resource_hits ORDER BY resource_id"
+                ).fetchall()
+                # 索引必须跟着重建：历史查询靠它，而且迁移后写入量的增长全靠它
+                idx = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_hits_query'"
+                ).fetchone()
+
+            self.assertEqual(
+                [(r["resource_id"], r["channel"], r["count"]) for r in rows],
+                [(1, "upstream", 7), (2, "upstream", 3)],
+            )
+            self.assertIsNotNone(idx, "迁移后索引丢了，查询会退化成全表扫")
+
+    def test_migration_is_idempotent(self):
+        """服务重启会再跑一次 init。第二次不许报错，更不许把数据搬第二遍。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "old.db"
+            self._make_old_db(db)
+
+            store.init(db)
+            store.init(db)
+
+            with store._session() as conn:
+                total = conn.execute("SELECT COUNT(*) FROM resource_hits").fetchone()[0]
+            self.assertEqual(total, 2)
 
 
 if __name__ == "__main__":

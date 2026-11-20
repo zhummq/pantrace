@@ -149,14 +149,72 @@ CREATE TABLE IF NOT EXISTS resource_hits (
     resource_id INTEGER NOT NULL,
     query       TEXT    NOT NULL,
     day         INTEGER NOT NULL,
+    channel     TEXT    NOT NULL DEFAULT 'upstream',
     count       INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (resource_id, query, day)
+    PRIMARY KEY (resource_id, query, day, channel)
 );
 CREATE INDEX IF NOT EXISTS idx_hits_query ON resource_hits(query, day DESC);
 """
 
 
 # ---------------------------------------------------------------- 初始化
+
+
+# 命中来源。不是自由字段：写错一个值就等于凭空多一条统计口径，所以
+# record_hits 里做白名单归一，只认这两个。
+CHANNEL_UPSTREAM = "upstream"  # 上游结果带出来的（现在唯一在用的）
+CHANNEL_LOCAL = "local"        # 本地库自己检索出来的（P1 起使用）
+
+
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """把老库升到当前结构。每次启动都跑，幂等，代价是一次 PRAGMA 查表。
+
+    必须在 executescript(_SCHEMA) **之前**调用：建表语句全是 IF NOT EXISTS，
+    先执行建表会让老结构的 resource_hits 蒙混过关，迁移从此再也不会发生。
+    """
+    if not _has_table(conn, "resource_hits"):
+        return
+    if _has_column(conn, "resource_hits", "channel"):
+        return
+
+    # 老库里的命中全部来自上游回填——那时本地检索还不存在，这是事实不是猜测。
+    conn.execute("ALTER TABLE resource_hits RENAME TO resource_hits_old")
+    conn.execute(
+        """
+        CREATE TABLE resource_hits (
+            resource_id INTEGER NOT NULL,
+            query       TEXT    NOT NULL,
+            day         INTEGER NOT NULL,
+            channel     TEXT    NOT NULL DEFAULT 'upstream',
+            count       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (resource_id, query, day, channel)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO resource_hits(resource_id, query, day, channel, count)
+        SELECT resource_id, query, day, 'upstream', count FROM resource_hits_old
+        """
+    )
+    moved = int(conn.execute("SELECT COUNT(*) FROM resource_hits").fetchone()[0])
+    # 索引跟着旧表走，DROP 之后索引才消失。所以 CREATE INDEX 必须排在 DROP 后面：
+    # 反过来写，同名索引还在，IF NOT EXISTS 会静默跳过，新表就永远没有索引。
+    conn.execute("DROP TABLE resource_hits_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hits_query ON resource_hits(query, day DESC)"
+    )
+    log.info("资源库迁移：resource_hits 加 channel 列，%d 行历史命中归为 upstream", moved)
 
 
 def init(db_path: str | Path) -> None:
@@ -167,6 +225,7 @@ def init(db_path: str | Path) -> None:
     with _session() as conn:
         # WAL 是持久化设置，设一次就够
         conn.execute("PRAGMA journal_mode=WAL")
+        _migrate(conn)
         conn.executescript(_SCHEMA)
     _inited = True
 
@@ -439,12 +498,22 @@ def _fts_put(conn: sqlite3.Connection, rid: int, title: str, aliases: list[str])
     )
 
 
-def record_hits(resource_ids: list[int], query: str, *, now: int | None = None) -> None:
+def record_hits(
+    resource_ids: list[int],
+    query: str,
+    *,
+    channel: str = CHANNEL_UPSTREAM,
+    now: int | None = None,
+) -> None:
     """记"这次查询带出了这些资源"。按天聚合，不是每出一条写一行流水。
 
     一天 5000 次搜索 × 20 条 = 10 万行/天，逐条记一年就是 3600 万行垃圾。
-    这里 (resource_id, query, day) 做主键，count 累加，一行代表"这个词今天
-    带出过这条资源 N 次"。
+    这里 (resource_id, query, day, channel) 做主键，count 累加，一行代表
+    "这个词今天从这条通道带出过这条资源 N 次"。
+
+    channel 必须分开算：一条资源被上游带来 50 次、被本地库带来 0 次，和
+    反过来，是两种完全不同的状态——前者说明库还没用上，后者说明库在兜住
+    上游给不了的东西。混在一个 count 里就再也分不出来了。
     """
     if not resource_ids or not query:
         return
@@ -453,13 +522,16 @@ def record_hits(resource_ids: list[int], query: str, *, now: int | None = None) 
     if not q:
         return
     day = int(time.strftime("%Y%m%d", time.localtime(stamp)))
+    # 白名单归一。传了别的值一律按上游算，宁可少一个口径，不要多一条脏数据。
+    ch = CHANNEL_LOCAL if channel == CHANNEL_LOCAL else CHANNEL_UPSTREAM
 
     try:
         with _write_lock, _session() as conn:
             conn.executemany(
-                "INSERT INTO resource_hits(resource_id, query, day, count) VALUES (?,?,?,1) "
-                "ON CONFLICT(resource_id, query, day) DO UPDATE SET count = count + 1",
-                [(rid, q, day) for rid in resource_ids],
+                "INSERT INTO resource_hits(resource_id, query, day, channel, count) "
+                "VALUES (?,?,?,?,1) "
+                "ON CONFLICT(resource_id, query, day, channel) DO UPDATE SET count = count + 1",
+                [(rid, q, day, ch) for rid in resource_ids],
             )
             conn.executemany(
                 "UPDATE resources SET hit_count = hit_count + 1 WHERE id = ?",
@@ -612,7 +684,13 @@ def _to_item(row: sqlite3.Row) -> dict:
 # ---------------------------------------------------------------- 回填
 
 
-def ingest(items: list[dict], query: str = "", *, now: int | None = None) -> dict:
+def ingest(
+    items: list[dict],
+    query: str = "",
+    *,
+    channel: str = CHANNEL_UPSTREAM,
+    now: int | None = None,
+) -> dict:
     """影子回填：把一次搜索已经拿到的结果顺手落库。
 
     **绝不允许抛异常给调用方。** 这是纯旁路：回填失败最多是库不涨，
@@ -637,7 +715,9 @@ def ingest(items: list[dict], query: str = "", *, now: int | None = None) -> dic
 
         result = upsert_many(rows, now=now)
         if query and result["ids"]:
-            record_hits(list(result["ids"].values()), query, now=now)
+            record_hits(
+                list(result["ids"].values()), query, channel=channel, now=now
+            )
         return result
     except Exception as exc:  # noqa: BLE001
         log.error("影子回填失败（不影响搜索）：%s", exc, exc_info=True)
@@ -649,7 +729,14 @@ def ingest(items: list[dict], query: str = "", *, now: int | None = None) -> dic
 
 def stats() -> dict:
     """给 /api/health 和管理端用。库不涨、某状态暴涨，都该在这里被发现。"""
-    out: dict = {"total": 0, "by_state": {}, "by_platform": {}, "new_7d": 0, "hits_7d": 0}
+    out: dict = {
+        "total": 0,
+        "by_state": {},
+        "by_platform": {},
+        "new_7d": 0,
+        "hits_7d": 0,
+        "hits_7d_by_channel": {},
+    }
     if not _inited:
         return out
     now = int(time.time())
@@ -668,12 +755,16 @@ def stats() -> dict:
                 "SELECT COUNT(*) FROM resources WHERE first_seen_at >= ?", (now - 7 * 86400,)
             ).fetchone()[0]
         )
-        out["hits_7d"] = int(
-            conn.execute(
-                "SELECT COALESCE(SUM(count), 0) FROM resource_hits WHERE day >= ?",
-                (int(time.strftime("%Y%m%d", time.localtime(now - 7 * 86400))),),
-            ).fetchone()[0]
-        )
+        # 一条 SQL 同时拿总和与分解，不查两遍。hits_7d 保留为总和是为了让
+        # 现有消费方（health 看板）不改就能继续读；分解看 by_channel。
+        since = int(time.strftime("%Y%m%d", time.localtime(now - 7 * 86400)))
+        for row in conn.execute(
+            "SELECT channel, COALESCE(SUM(count), 0) c FROM resource_hits "
+            "WHERE day >= ? GROUP BY channel",
+            (since,),
+        ):
+            out["hits_7d_by_channel"][row["channel"]] = int(row["c"])
+        out["hits_7d"] = sum(out["hits_7d_by_channel"].values())
     return out
 
 
