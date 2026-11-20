@@ -29,14 +29,19 @@
    代价是每块发 `ncols` 次请求而不是 1 次，换来请求数可预测、不用二分、
    不用锚点复核——总数反而比旧方案少，全量 38 万行约 19 分钟。
 
-3. **窗口尾部的第 0 列会被裁掉。** 这是同一个坑的第二个形状，比错位更隐蔽：
+3. **窗口尾部的格子会被裁掉。** 这是同一个坑的第二个形状，比错位更隐蔽：
    请求 0~1023 只回来 1013 个标题（1013~1023 行是空的），可单行窗口读第 1015 行
    明明有「12782-剑影江湖（60集）」；把窗口挪到 1000 起再读，同一段 1024 个全在。
    **只丢标题、不丢链接**，所以那一行变成"标题空、链接有"，入库后是个没有名字
    的资源，而表面上一切正常。
-   规律是**头部永远完整、尾部不可信**。对策：相邻两块重叠 `COLUMN_OVERLAP` 行，
-   让后一块的头部覆盖前一块的尾部；整表最后那十几行没有下一块可覆盖，逐行补读
-   （内容本来就齐的行跳过，否则一张 1100 行的小表要白烧 48 次请求）。
+   规律是**头部永远完整、尾部不可信**，裁剪幅度跟窗口大小走（1024 行少 11 格、
+   512 少 10、40 少 1，而 1040 行一格不少）。
+   对策：每块向接口多要 `COLUMN_OVERLAP` 行当盾牌，只取前面正文那一段；表尾
+   那块没有余量可要，`read_block` 把各列实际回来的格数填进 `stats`，上层拿它
+   算出缺哪几行哪几列，只补那几格（`_repair`）。
+   **判据必须是"实际格数"，不能是"这行有几个非空格子"**——只有一列有数据的表
+   每行本来就只有一格，按"少于两个非空格就补"会整段无条件补读：40 行的表烧
+   51 次请求、61 秒，前端等满 60 秒拿 504（2026-11-20 线上踩到）。
 
 4. **越过表尾的请求不会报错，它会把表头那一块给你。**
    这条最阴。`start_row >= max_row` 时接口照样返回完整数据，
@@ -95,12 +100,20 @@ BLOCK_ROWS = 256
 # 不受：实测一次请求 1024 行，回来正好一个 block、1024 个格子。取 1024 是
 # 实测过的整块边界，再往上没验过。
 COLUMN_ROWS = 1024
-# **窗口尾部的第 0 列会被接口裁掉，头部不会。** 实测表 2：请求 0~1023 只回来
+# **窗口尾部的格子会被接口裁掉，头部不会。** 实测表 2：请求 0~1023 只回来
 # 1013 个标题（1013~1023 行是空的），可单行窗口读第 1015 行明明有标题
 # 「12782-剑影江湖（60集）」；把窗口挪到 1000 起再读一遍，同一段 1024 个全在。
 # 只丢标题、不丢链接，所以错得极其隐蔽——那一行的标题变成空字符串。
-# 对策不是加大窗口，而是让相邻两块重叠：后一块的头部覆盖前一块的尾部。
+# 裁剪幅度跟窗口大小走，不是固定的：1024 行少 11 格、512 行少 10 格、40 行少 1 格，
+# 而 1040 行的窗口（实测两次）一格不少。
+# 所以对策不是"让相邻块重叠"（那要额外一次读表尾、代价随块数线性涨），而是
+# **每块多要 COLUMN_OVERLAP 行当盾牌，只取正文那一段**：被裁的永远是窗口最后
+# 几行，多要的这一截替正文挡刀。表尾那块没有余量可要，靠 `read_block` 回填的
+# 实际格数（stats）算出缺几行，只补那几行。
 COLUMN_OVERLAP = 16
+# 补读格子的次数上限。正常全表只会在最后一块触发一次（1024 行窗口少 11 格
+# → 11 次），设大一点的封顶是防病态数据把一次同步拖成几小时。
+MAX_REPAIR = 96
 # 一次读几列。表头 `max_col` 不能信——文档里每张表都报 26（模板默认值），
 # 实际用到的只有 2~3 列。少读一列就丢数据，多读一列只是多花 1/3 的请求，
 # 所以往多了取 3。
@@ -703,10 +716,18 @@ def read_block(
     end_row: int | None = None,
     *,
     ncols: int = COLUMN_SCAN,
+    stats: dict | None = None,
 ) -> list[list[str]]:
     """拉一块（最多 `COLUMN_ROWS` 行）。空列表表示这块没数据。
 
-    `end_row` 给最后一块用（夹到表长），不给就是整块。
+    `end_row` 给最后一块用（夹到表长），不给就是整块。允许比 `COLUMN_ROWS` 多
+    `COLUMN_OVERLAP` 行——多要的那一截是给尾部裁剪挡刀用的（见常量注释）。
+
+    `stats` 传一个 dict 进来，会被填上 `want`（请求了几行）和 `got`（各列实际
+    回来几格）。上层据此算"这一块的尾部被裁掉了几行、是哪几列"，只补那几格。
+    **这是判断要不要补读的唯一依据**：不能看"这行有几个非空格子"——只有一列
+    有数据的表，每行本来就只有一格，那个判据会让整张表逐行补读（实测 40 行的
+    表烧了 51 次请求、61 秒，前端直接 504）。
 
     **按列读，不按整块读。** 每一列单独发一次请求，拿回来就是该列的逐行序列
     （`_column_cells` 里有实测证据），第 i 个格子就是第 `start_row+i` 行。
@@ -721,18 +742,25 @@ def read_block(
     撞上就当"没数据"。
     """
     start_row = max(0, int(start_row))
-    end = start_row + COLUMN_ROWS - 1 if end_row is None else int(end_row)
-    end = min(end, start_row + COLUMN_ROWS - 1)
+    hard = COLUMN_ROWS + COLUMN_OVERLAP
+    end = start_row + hard - 1 if end_row is None else int(end_row)
+    end = min(end, start_row + hard - 1)
     if end < start_row:
         return []
 
     cols = [_column_cells(pad_id, tab_id, c, start_row, end) for c in range(max(1, ncols))]
+    if stats is not None:
+        stats["want"] = end - start_row + 1
+        stats["got"] = [len(c) for c in cols]
     if not any(cols):
         return []
-    fp = _header_fingerprint(pad_id, tab_id)
-    head = _head_signature(cols[0])
-    if start_row > 0 and fp and head and head == fp:
-        return []
+    # 指纹只在非首块才需要：第 0 行开始的那块本来就该是表头，比它没有意义。
+    # 这一句省掉的是**每块一次请求**——38 万行 372 块，白读 372 次表头。
+    if start_row > 0:
+        fp = _header_fingerprint(pad_id, tab_id)
+        head = _head_signature(cols[0])
+        if fp and head and head == fp:
+            return []
 
     # 行数取最长的那一列：列尾连续空白会被裁掉，裁出来的空洞都是空值，
     # 补空即可。不能取最短的，否则每个块都会从尾部丢掉几行。
@@ -752,11 +780,16 @@ def read_tab(
     workers: int = 3,
     ncols: int = COLUMN_SCAN,
     on_progress=None,
+    repair: bool = True,
 ) -> tuple[list[list[str]], DocMeta]:
     """把一个工作表读成二维表。
 
     `start_row` 给增量用：只拉这之后的行。`end_row` 默认按元信息里的 max_row。
     `ncols` 是读几列（见 `COLUMN_SCAN`）。
+
+    `repair=False` 不补尾部被裁的格子。只有 `probe` 用：那边只是给人看列样本
+    和前几行，表尾少几个标题不影响判断，而一次探测要跑完文档里全部工作表，
+    每张多补几十次请求会把前端拖到网关超时（线上 504 就是这么来的）。
 
     **瓶颈是节流，不是并发。** `_throttle` 把总速率钉在 1 次/秒，`workers`
     再大也只是让几个线程排队领号，不会真的同时压出去。默认 3 是够用的：
@@ -776,19 +809,52 @@ def read_tab(
     if start >= last:
         return [], meta
 
-    # 步长比窗口短 COLUMN_OVERLAP 行：后一块的头部会盖住前一块被裁掉的尾部
-    step = max(1, COLUMN_ROWS - COLUMN_OVERLAP)
+    # 步长就是正文长度：每块向接口多要 COLUMN_OVERLAP 行，只取前面正文那一段，
+    # 多要的被裁了也不要。所以块与块之间**不需要重叠**。
+    step = COLUMN_ROWS
     starts = list(range(start, last, step))
     rows: list[list[str]] = []
     req_before = request_count()
     t0 = time.monotonic()
+    repaired = 0
+
+    def _repair(offset: int, body_rows: int, chunk: list[list[str]], got: list[int]) -> None:
+        """正文尾部被裁掉的格子，逐格补回来。
+
+        `got` 是各列实际回来的格数（`read_block` 填的）。第 `got[ci]` 行往后
+        到正文末尾的这几行，该列就是被裁掉的，单行窗读一下能拿到真值。
+        `got[ci] == 0` 跳过——那是整列没填，补也补不出东西。
+        """
+        nonlocal repaired
+        for ci, n in enumerate(got):
+            if n == 0 or n >= body_rows:
+                continue
+            for i in range(n, min(body_rows, len(chunk))):
+                if repaired >= MAX_REPAIR:
+                    log.warning(
+                        "第 %s 行起的尾部缺格补到上限 %s 次，剩下的留空", offset, MAX_REPAIR
+                    )
+                    return
+                cell = _column_cells(meta.pad_id, tab.tab_id, ci, offset + i, offset + i)
+                repaired += 1
+                if cell and not chunk[i][ci].strip():
+                    chunk[i][ci] = _cell_value(cell[0])
 
     def _one(offset: int) -> tuple[int, list[list[str]]]:
-        # 最后一块要夹到表长：`max_row` 不是块长的整数倍，不夹的话窗口会越过
-        # 表尾，而越界部分返回的是**表头**内容，会混进这一块。
-        end = min(offset + COLUMN_ROWS - 1, last - 1)
-        chunk = read_block(meta.pad_id, tab.tab_id, offset, end, ncols=ncols)
-        if chunk or end >= last - 1:
+        # `body_end` 是这一块对外的正文范围，`read_end` 是真正请求到的行号——
+        # 多出来的 COLUMN_OVERLAP 行只用来挡尾部裁剪，不参与输出。
+        # 两者都不能越过表尾：越界请求返回的是**表头**，会把这一块污染掉。
+        body_end = min(offset + COLUMN_ROWS - 1, last - 1)
+        body_rows = body_end - offset + 1
+        read_end = min(body_end + COLUMN_OVERLAP, last - 1)
+        stats: dict = {}
+        chunk = read_block(
+            meta.pad_id, tab.tab_id, offset, read_end, ncols=ncols, stats=stats
+        )
+        if chunk or body_end >= last - 1:
+            chunk = chunk[:body_rows]
+            if repair:
+                _repair(offset, body_rows, chunk, list(stats.get("got") or []))
             return offset, chunk
         # 整块读空但还没到表尾：正常表里不会出现。拿单行复核一次——单行有格子
         # 就说明是限流把整块吞了。这时候必须抛错让整次同步失败，因为上层一旦
@@ -800,7 +866,7 @@ def read_tab(
         return offset, []
 
     def _merge(offset: int, chunk: list[list[str]]) -> None:
-        """按绝对行号落位，后到的覆盖先到的（重叠区就是这么修的）。"""
+        """按绝对行号落位。块之间不再重叠，落位只是为了保证顺序不乱。"""
         for i, row in enumerate(chunk):
             idx = offset + i - start
             if idx < 0:
@@ -825,16 +891,10 @@ def read_tab(
                 if on_progress and idx % 20 == 0:
                     on_progress(starts[idx - 1], last)
 
-    # 整表最后 COLUMN_OVERLAP 行没有下一块可以覆盖，只能一行一行补。
-    # 单行窗口不受尾部裁剪影响（实测第 1015 行的标题在单行窗里是完整的）。
-    # 内容本来就齐的行不补——表的最后十几行通常都是正常资源，无条件补读会让
-    # 一张 1100 行的小表烧掉 48 次请求（实测）。
-    need = min(2, ncols)
-    for r in range(max(start, last - COLUMN_OVERLAP), last):
-        idx = r - start
-        if idx < len(rows) and sum(1 for v in rows[idx] if v.strip()) >= need:
-            continue
-        _merge(r, read_block(meta.pad_id, tab.tab_id, r, r, ncols=ncols))
+    # 尾部被裁的格子已经在 `_one` 里补完了（`_repair`），这里只负责把长度拉齐。
+    # 原来这里有一段"最后 COLUMN_OVERLAP 行逐行补读"，判据是"这一行少于两个
+    # 非空格子就补"——只有一列有数据的表每行本来就只有一格，于是整段无条件
+    # 补读：40 行的表烧 51 次请求、61 秒，前端等了 60 秒拿 504。已经删掉。
 
     rows = rows[: last - start]
     while len(rows) < last - start:

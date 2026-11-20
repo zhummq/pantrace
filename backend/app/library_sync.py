@@ -251,7 +251,12 @@ def probe(url: str, tab_id: str = "", *, sample_rows: int = 40) -> dict:
             "error": "",
         }
         try:
-            rows, _ = docs_qq.read_tab(url, tab_id=tab.tab_id, end_row=sample_rows)
+            # repair=False：探测只看列样本和前几行，表尾少几个标题不影响判断。
+            # 一次探测要跑完文档里全部工作表（这份文档 7 张），每张多补几十次
+            # 请求会把前端拖过网关的 60 秒超时——线上就是这么拿到 504 的。
+            rows, _ = docs_qq.read_tab(
+                url, tab_id=tab.tab_id, end_row=sample_rows, repair=False
+            )
             item["columns"] = intake.probe_columns(rows)
             item["sample_rows"] = min(len(rows), sample_rows)
             # 前几行原文，带 1 起的行号。列样本只能回答"哪列是链接"，

@@ -286,34 +286,78 @@ class TestColumnRead(unittest.TestCase):
         dq._header_cache.clear()
 
 
-class TestColumnOverlap(unittest.TestCase):
-    """窗口尾部的第 0 列会被接口裁掉，靠相邻块重叠补回来。
+class TestTailTrim(unittest.TestCase):
+    """窗口尾部的格子会被接口裁掉，靠"多要一截"和"按实读格数补读"修回来。
 
     实测：请求 0~1023 只回 1013 个标题，可单行窗读第 1015 行明明有内容；
     窗口挪到 1000 起再读，同一段 1024 个全在。头部完整、尾部不可信。
     """
 
-    def test_tail_trimmed_rows_are_restored(self) -> None:
+    def test_tail_cut_rows_are_repaired(self) -> None:
         from unittest import mock
 
         total = 1100
         records = [[f"标题{i}", f"https://pan.xunlei.com/s/{i:04d}"] for i in range(total)]
 
-        def fake_block(_pad, _tab, start, end, ncols=3):
+        def fake_block(_pad, _tab, start, end, ncols=3, stats=None):
             chunk = [list(r) for r in records[start:end + 1]]
-            if end - start >= 1000:              # 只裁大窗口的尾部，单行窗是完整的
-                for r in chunk[-16:]:
-                    r[0] = ""
+            got = [len(chunk), len(chunk)]
+            for r in chunk[-16:]:                # 尾部 16 行的标题一律丢
+                r[0] = ""
+            got[0] -= min(16, len(chunk))
+            if stats is not None:
+                stats["want"] = end - start + 1
+                stats["got"] = got
+            return chunk
+
+        def fake_col(_pad, _tab, col, start, _end):
+            v = records[start][col] if start < total and col < len(records[0]) else ""
+            return [("", [v])] if v.startswith("http") else [(v, [])]
+
+        meta = dq.DocMeta(pad_id="X", tabs=[dq.Tab("t1", "表", max_row=total)])
+        with mock.patch.object(dq, "fetch_meta", lambda _u: meta), \
+             mock.patch.object(dq, "read_block", fake_block), \
+             mock.patch.object(dq, "_column_cells", fake_col):
+            rows, _ = dq.read_tab("https://docs.qq.com/sheet/X", tab_id="t1")
+
+        self.assertEqual(len(rows), total)
+        # 第一块靠多要的 16 行挡刀，被裁的正好落在多余的尾巴上
+        self.assertEqual(rows[1015][0], "标题1015")
+        # 第二块贴到表尾、没有余量，靠 stats 算出缺 16 行后逐行补
+        self.assertEqual(rows[1080][0], "标题1080")
+        self.assertEqual(rows[1099][0], "标题1099")
+
+    def test_single_column_table_is_not_repaired_row_by_row(self) -> None:
+        """只有一列有数据的表，不许逐行补读。
+
+        线上那张 40 行的表（vrv6h6）就是这样：每行只有一格有内容，旧判据
+        "少于两个非空格子就补"于是整段无条件补读——51 次请求、61 秒，
+        前端等满 60 秒拿 504。
+        """
+        from unittest import mock
+
+        total = 40
+        records = [[f"标题{i}", "", ""] for i in range(total)]
+        calls: list[int] = []
+
+        def fake_block(_pad, _tab, start, end, ncols=3, stats=None):
+            calls.append(start)
+            chunk = [list(r) for r in records[start:end + 1]]
+            if stats is not None:
+                stats["want"] = end - start + 1
+                stats["got"] = [len(chunk), 0, 0]    # 后两列整列没填
             return chunk
 
         meta = dq.DocMeta(pad_id="X", tabs=[dq.Tab("t1", "表", max_row=total)])
         with mock.patch.object(dq, "fetch_meta", lambda _u: meta), \
-             mock.patch.object(dq, "read_block", fake_block):
+             mock.patch.object(dq, "read_block", fake_block), \
+             mock.patch.object(dq, "_column_cells", side_effect=AssertionError("不该补读")):
             rows, _ = dq.read_tab("https://docs.qq.com/sheet/X", tab_id="t1")
 
+        self.assertEqual(calls, [0])                 # 只读了一块
         self.assertEqual(len(rows), total)
-        self.assertEqual(rows[1015][0], "标题1015")   # 被裁的那批靠下一块补回来
-        self.assertEqual(rows[1080][0], "标题1080")
+        self.assertEqual(rows[0][0], "标题0")
+        self.assertEqual(rows[-1][0], "标题39")
 
 
 class TestEmptyBlockIsNotData(unittest.TestCase):
