@@ -194,7 +194,9 @@ class TestRangeClamp(unittest.TestCase):
         def fake_meta(_url: str) -> dq.DocMeta:
             return meta
 
-        def fake_block(_pad: str, _tab: str, start: int, end: int = 0) -> list[list[str]]:
+        def fake_block(
+            _pad: str, _tab: str, start: int, end: int = 0, **_kw
+        ) -> list[list[str]]:
             seen.append((start, end))
             return [["x", "https://pan.quark.cn/s/a"]]
 
@@ -202,92 +204,116 @@ class TestRangeClamp(unittest.TestCase):
              mock.patch.object(dq, "read_block", fake_block):
             rows, _ = dq.read_tab("https://docs.qq.com/sheet/X", tab_id="t1", end_row=99999)
 
-        # 只读两块；第二块被夹到 299——但这里每块都只回 1 行，所以 512 那块不会再请求
-        self.assertEqual([s for s, _ in seen], [0, 256])
-        self.assertEqual(seen[1], (256, 299))   # end_row 夹到表长 300 的最后一行
-        self.assertEqual(len(rows), 2)
+        # 块长 1024 > 表长 300，所以整块请求只有一次，且被夹到 299；
+        # 之后的 (n, n) 是表尾那 16 行的逐行补读，不参与夹取。
+        full = [(s, e) for s, e in seen if s != e]
+        self.assertEqual(full, [(0, 299)])
+        self.assertEqual(len(rows), 300)
 
 
-class TestRowAlignment(unittest.TestCase):
-    """块内对齐：文字格和链接格数量对不上时，不能按下标硬配。
+class TestColumnRead(unittest.TestCase):
+    """按列读：行号是数出来的，不是配出来的。
 
-    接口返回的单元格是按**类型**分组的（纯文字一堆、带超链接一堆），不是按列。
-    只要某行多一格文字（作者的广告行）或少一格（空标题），两堆长度就不再相等，
-    按数组下标配就会整体错位——标题配上隔壁行的链接，而且不报错、点得开。
+    以前整块请求拿到的是"按类型分组的格子流"，靠数量关系猜谁配谁，翻过两次车：
+    广告行让文字格多一个、某格写俩链接让链接格多一个，总数一持平就整体错位。
+    现在只请求一列——没有第二堆可以混淆，返回顺序就是行顺序。
     """
 
     @staticmethod
-    def _sheet(rows):
-        """模拟接口：按行给数据，返回时按类型分组。"""
-        def fake(_pad, _tab, start, end):
-            texts, links = [], []
-            for row in rows[start:end + 1]:
-                for cell in row:
-                    if not cell:
-                        continue
-                    if cell.startswith("http"):
-                        links.append(("", [cell]))
-                    else:
-                        texts.append((cell, []))
-            return texts + links
+    def _fake(rows, trim=None):
+        """把二维表模拟成"按列请求"的返回。trim={列号: 尾部裁掉几行}。"""
+        trim = trim or {}
+
+        def fake(_pad, _tab, col, start, end):
+            # 越过表尾时接口返回表头那一段，这里照样模拟出来
+            chunk = rows if start >= len(rows) else rows[start:end + 1]
+            out = []
+            for r in chunk:
+                v = r[col] if col < len(r) else ""
+                out.append(("", [v]) if v.startswith("http") else (v, []))
+            cut = trim.get(col, 0)
+            if cut and start < len(rows):
+                out = out[:max(0, len(out) - cut)]
+            return out
+
         return fake
 
-    def test_plain_block_pairs_by_index(self) -> None:
-        from unittest import mock
-
-        rows = [["甲", "https://pan.quark.cn/s/a"], ["乙", "https://pan.quark.cn/s/b"]]
-        # 锚点那一发也要落到 mock 上，否则会去请求真接口
-        with mock.patch.object(dq, "_window_cells", self._sheet(rows)):
-            got = dq._align_rows("P", "T", 0, 1, [dq.MAX_ALIGN_REQUESTS])
-        self.assertEqual(got, rows)
-
-    def test_extra_text_cell_does_not_shift_rows(self) -> None:
-        """广告行有两个文字格、没有链接——这正是线上错位的起因。"""
+    def test_ad_rows_do_not_shift_anything(self) -> None:
+        """广告行有两个文字格——旧逻辑正是从这里开始整体错位。"""
         from unittest import mock
 
         rows = [
-            ["Ctel+F查询文件…", "找资源+v  zzgshr123"],
-            ["踢毽子视频教学", "https://pan.xunlei.com/s/VOfTG6"],
-            ["植物大战僵尸合集", "https://pan.xunlei.com/s/VOfTG7L"],
+            ["Ctel+F查询文件…", "找资源+v  zzgshr123", ""],
+            ["踢毽子视频教学", "https://pan.xunlei.com/s/VOfTG6GRKY0mPa9Ukncg2dQwA1", ""],
+            ["植物大战僵尸合集", "https://pan.xunlei.com/s/VOfTG7LcejPiLKoUAqTmeDglA1", ""],
         ]
-        fake = self._sheet(rows)
-        with mock.patch.object(dq, "_window_cells", fake):
-            got = dq._align_rows("P", "T", 0, 2, [dq.MAX_ALIGN_REQUESTS])
+        with mock.patch.object(dq, "_column_cells", self._fake(rows)):
+            got = dq.read_block("P", "T", 0, 2)
 
-        self.assertEqual(len(got), 3)
-        self.assertEqual(got[0], ["Ctel+F查询文件…", "找资源+v  zzgshr123"])
-        self.assertEqual(got[1], ["踢毽子视频教学", "https://pan.xunlei.com/s/VOfTG6"])
-        self.assertEqual(got[2], ["植物大战僵尸合集", "https://pan.xunlei.com/s/VOfTG7L"])
+        self.assertEqual(got, rows)
+        self.assertIn("2dQwA1", got[1][1])       # 踢毽子配的是它自己那一行的链接
+        self.assertNotIn("DxRA1", got[1][1])     # 不是第 3 行的那条
 
-    def test_empty_title_keeps_link_on_its_own_row(self) -> None:
+    def test_short_column_is_padded_not_shifted(self) -> None:
+        """某列尾部被裁时，缺的行补空，不能让后面的行整体上移。"""
         from unittest import mock
 
         rows = [
             ["甲", "https://pan.quark.cn/s/a"],
-            ["", "https://pan.quark.cn/s/b"],
+            ["乙", "https://pan.quark.cn/s/b"],
             ["丙", "https://pan.quark.cn/s/c"],
         ]
-        with mock.patch.object(dq, "_window_cells", self._sheet(rows)):
-            got = dq._align_rows("P", "T", 0, 2, [dq.MAX_ALIGN_REQUESTS])
+        with mock.patch.object(dq, "_column_cells", self._fake(rows, trim={0: 2})):
+            got = dq.read_block("P", "T", 0, 2)
 
-        self.assertEqual([r[1] for r in got],
-                         ["https://pan.quark.cn/s/a", "https://pan.quark.cn/s/b",
-                          "https://pan.quark.cn/s/c"])
-        self.assertEqual(got[1][0], "")      # 空标题就留空，不去抢别人的
+        self.assertEqual(len(got), 3)
+        self.assertEqual(
+            [r[1] for r in got],
+            ["https://pan.quark.cn/s/a", "https://pan.quark.cn/s/b",
+             "https://pan.quark.cn/s/c"],
+        )
+        self.assertEqual(got[0][0], "甲")
+        self.assertEqual(got[1][0], "")          # 被裁的两行留空，不去抢上一行的
 
-    def test_single_row_cells_keep_column_order(self) -> None:
-        cells = [("标题", []), ("https://pan.quark.cn/s/x", ["https://pan.quark.cn/s/x"])]
-        self.assertEqual(dq._cells_to_row(cells), ["标题", "https://pan.quark.cn/s/x"])
-
-    def test_budget_exhausted_still_returns_rows(self) -> None:
-        """预算用完要退回硬配，不能抛异常、也不能少行——少行等于丢数据。"""
+    def test_overflow_header_is_treated_as_no_data(self) -> None:
+        """越过表尾时接口返回的是表头那一段，必须识别成"没数据"。"""
         from unittest import mock
 
-        rows = [["", "https://pan.quark.cn/s/%d" % i] for i in range(8)]
-        with mock.patch.object(dq, "_window_cells", self._sheet(rows)):
-            got = dq._align_rows("P", "T", 0, 7, [1])
+        rows = [["Ctel+F查询文件", "找资源+v"], ["甲", "https://pan.quark.cn/s/a"]]
+        dq._header_cache.clear()
+        with mock.patch.object(dq, "_column_cells", self._fake(rows)):
+            self.assertEqual(dq.read_block("P", "T", 5000, 6000), [])
+        dq._header_cache.clear()
 
-        self.assertEqual(len(got), 8)
+
+class TestColumnOverlap(unittest.TestCase):
+    """窗口尾部的第 0 列会被接口裁掉，靠相邻块重叠补回来。
+
+    实测：请求 0~1023 只回 1013 个标题，可单行窗读第 1015 行明明有内容；
+    窗口挪到 1000 起再读，同一段 1024 个全在。头部完整、尾部不可信。
+    """
+
+    def test_tail_trimmed_rows_are_restored(self) -> None:
+        from unittest import mock
+
+        total = 1100
+        records = [[f"标题{i}", f"https://pan.xunlei.com/s/{i:04d}"] for i in range(total)]
+
+        def fake_block(_pad, _tab, start, end, ncols=3):
+            chunk = [list(r) for r in records[start:end + 1]]
+            if end - start >= 1000:              # 只裁大窗口的尾部，单行窗是完整的
+                for r in chunk[-16:]:
+                    r[0] = ""
+            return chunk
+
+        meta = dq.DocMeta(pad_id="X", tabs=[dq.Tab("t1", "表", max_row=total)])
+        with mock.patch.object(dq, "fetch_meta", lambda _u: meta), \
+             mock.patch.object(dq, "read_block", fake_block):
+            rows, _ = dq.read_tab("https://docs.qq.com/sheet/X", tab_id="t1")
+
+        self.assertEqual(len(rows), total)
+        self.assertEqual(rows[1015][0], "标题1015")   # 被裁的那批靠下一块补回来
+        self.assertEqual(rows[1080][0], "标题1080")
 
 
 class TestEmptyBlockIsNotData(unittest.TestCase):
@@ -352,7 +378,7 @@ class TestEmptyBlockIsNotData(unittest.TestCase):
         """整块读空、单行却有数据 → 限流，必须让这轮同步失败而不是写进度。"""
         from unittest import mock
 
-        meta = dq.DocMeta(pad_id="X", title="t", tabs=[dq.Tab("t1", "表", max_row=600)])
+        meta = dq.DocMeta(pad_id="X", title="t", tabs=[dq.Tab("t1", "表", max_row=3000)])
         with mock.patch.object(dq, "fetch_meta", lambda _u: meta), \
              mock.patch.object(dq, "read_block", lambda *_a, **_k: []), \
              mock.patch.object(dq, "_window_cells", lambda *_a, **_k: [("有数据", [])]):
@@ -364,7 +390,7 @@ class TestEmptyBlockIsNotData(unittest.TestCase):
         from unittest import mock
 
         with mock.patch.object(
-            dq, "_window_cells", side_effect=[[], [("表头文字", [])]]
+            dq, "_column_cells", side_effect=[[], [("表头文字", [])]]
         ):
             dq._header_cache.clear()
             self.assertEqual(dq._header_fingerprint("P", "T"), "")
@@ -391,66 +417,6 @@ class TestThrottle(unittest.TestCase):
     def test_rate_constant_is_conservative(self) -> None:
         """这个数被谁改大都会重演 2026-11-20 那次 WAF 封禁，钉死上限。"""
         self.assertLessEqual(dq.REQ_PER_SEC, 1.5)
-
-
-class TestAlignmentAnchor(unittest.TestCase):
-    """数量相等不等于一一对应。
-
-    一行多一个文字格（广告行）、另一行多一个链接格，两堆总数刚好持平，旧判据
-    就被骗过去，整块从第一行起错位——B1 的「找资源+v」被当成第二行标题，抢走
-    了第三行的链接。2026-11-20「热门综艺电势剧哏漫」就是这么错的。
-    """
-
-    def test_equal_counts_are_verified_by_anchor(self) -> None:
-        from unittest import mock
-
-        real = [
-            ["最新日期资源在下方【最新资源2】可见", "找资源+v zzgshr123"],
-            ["甲", "https://pan.quark.cn/s/a"],
-            ["乙", "https://pan.quark.cn/s/b"],
-        ]
-        # 整块：4 个文字格 + 4 个链接格，数量持平但内容错位
-        block = [
-            ("最新日期资源在下方【最新资源2】可见", []),
-            ("找资源+v zzgshr123", []),
-            ("甲", []),
-            ("乙", []),
-            ("", ["https://pan.quark.cn/s/a"]),
-            ("", ["https://pan.quark.cn/s/b"]),
-            ("", ["https://pan.quark.cn/s/c"]),
-            ("", ["https://pan.quark.cn/s/d"]),
-        ]
-
-        def fake(_pad, _tab, start, end):
-            if end > start:                     # 整块
-                return block
-            return [                          # 单行：格子顺序即列序
-                ("", [c]) if c.startswith("http") else (c, []) for c in real[start]
-            ]
-
-        with mock.patch.object(dq, "_window_cells", fake):
-            got = dq._align_rows("P", "T", 0, 2, [dq.MAX_ALIGN_REQUESTS])
-
-        self.assertEqual(got, real)
-
-    def test_normal_block_keeps_single_request(self) -> None:
-        """正常块只多花 1 次锚点请求，不能退化成整块二分。"""
-        from unittest import mock
-
-        rows = [["甲", "https://pan.quark.cn/s/a"], ["乙", "https://pan.quark.cn/s/b"]]
-        calls = {"n": 0}
-
-        def fake(_pad, _tab, start, end):
-            calls["n"] += 1
-            texts = [(r[0], []) for r in rows[start:end + 1]]
-            links = [("", [r[1]]) for r in rows[start:end + 1]]
-            return texts + links
-
-        with mock.patch.object(dq, "_window_cells", fake):
-            got = dq._align_rows("P", "T", 0, 1, [dq.MAX_ALIGN_REQUESTS])
-
-        self.assertEqual(got, rows)
-        self.assertEqual(calls["n"], 2)         # 整块 1 次 + 锚点 1 次
 
 
 if __name__ == "__main__":
