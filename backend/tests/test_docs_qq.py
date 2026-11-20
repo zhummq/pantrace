@@ -286,5 +286,88 @@ class TestRowAlignment(unittest.TestCase):
         self.assertEqual(len(got), 8)
 
 
+class TestEmptyBlockIsNotData(unittest.TestCase):
+    """空 block 不等于"这一段没数据"。
+
+    请求太密时接口回 200、结构也完整，只是 `block_datas` 空着，几十秒后自己
+    恢复。把它当空块放过去就等于整块 256 行静默消失——而且 `read_tab` 正常
+    返回，`last_row` 会被推到表尾，下一轮增量只回看 512 行，永远补不回来。
+    2026-11-20 全量重跑因此丢过 35 万行。
+    """
+
+    def test_empty_then_data_is_retried(self) -> None:
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def fake_opendoc(*_a, **_k):
+            calls["n"] += 1
+            return {"n": calls["n"]}
+
+        def fake_offsets(payload):
+            return [] if payload["n"] == 1 else [(0, b"")]
+
+        with mock.patch.object(dq, "_opendoc", fake_opendoc), \
+             mock.patch.object(dq, "_block_offsets", fake_offsets), \
+             mock.patch.object(dq, "_column_payloads", lambda _b: [(2, b"c")]), \
+             mock.patch.object(dq, "_text_of", lambda _v: "标题"), \
+             mock.patch.object(dq, "urls_in_cell", lambda _v: []), \
+             mock.patch.object(dq.time, "sleep", lambda _s: None):
+            cells = dq._window_cells("P", "T", 0, 255)
+
+        self.assertEqual(cells, [("标题", [])])
+        self.assertEqual(calls["n"], 2)     # 空了一次就重试，第二次拿回来
+
+    def test_always_empty_raises(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(dq, "_opendoc", lambda *_a, **_k: {}), \
+             mock.patch.object(dq, "_block_offsets", lambda _p: []), \
+             mock.patch.object(dq.time, "sleep", lambda _s: None):
+            with self.assertRaises(dq.DocError):
+                dq._window_cells("P", "T", 256, 511)
+
+    def test_single_row_window_empty_is_fine(self) -> None:
+        """单行窗口空是常态（空白行本来就没有格子），不能重试也不能抛。"""
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def fake_opendoc(*_a, **_k):
+            calls["n"] += 1
+            return {}
+
+        with mock.patch.object(dq, "_opendoc", fake_opendoc), \
+             mock.patch.object(dq, "_block_offsets", lambda _p: []):
+            got = dq._window_cells("P", "T", 700, 700)
+
+        self.assertEqual(got, [])
+        self.assertEqual(calls["n"], 1)
+
+    def test_block_empty_but_single_row_has_data_fails(self) -> None:
+        """整块读空、单行却有数据 → 限流，必须让这轮同步失败而不是写进度。"""
+        from unittest import mock
+
+        meta = dq.DocMeta(pad_id="X", title="t", tabs=[dq.Tab("t1", "表", max_row=600)])
+        with mock.patch.object(dq, "fetch_meta", lambda _u: meta), \
+             mock.patch.object(dq, "read_block", lambda *_a, **_k: []), \
+             mock.patch.object(dq, "_window_cells", lambda *_a, **_k: [("有数据", [])]):
+            with self.assertRaises(dq.DocError):
+                dq.read_tab("https://docs.qq.com/sheet/X", tab_id="t1")
+
+    def test_empty_fingerprint_is_not_cached(self) -> None:
+        """指纹读空时不能进缓存：缓存成空串，之后每块都会被判越界。"""
+        from unittest import mock
+
+        with mock.patch.object(
+            dq, "_window_cells", side_effect=[[], [("表头文字", [])]]
+        ):
+            dq._header_cache.clear()
+            self.assertEqual(dq._header_fingerprint("P", "T"), "")
+            self.assertEqual(dq._header_fingerprint("P", "T"), "表头文字")
+            self.assertEqual(dq._header_fingerprint("P", "T"), "表头文字")
+        dq._header_cache.clear()
+
+
 if __name__ == "__main__":
     unittest.main()

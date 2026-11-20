@@ -38,8 +38,22 @@
    判别方法：把返回的首行和 `read_block(..., 0)` 的首行比一下，一样就是越界了。
    `read_block` 里已经加了这层判断，别绕过它直接调 `_opendoc`。
 
-**只支持"任何人可查看"的文档。** 需要登录的会返回空 block，`block_datas` 为空，
-这里不抛异常而是返回空——上层据此报"文档没权限"，比抛栈更容易让人看懂。
+5. **请求太密不报错，只回空 block。** 2026-11-20 全量重跑时踩到：84 秒内发了
+   一千多次请求，之后服务端开始返回空 `block_datas`，几十秒后自己恢复。
+   这比限流码危险得多——空块长得跟"这一段没数据"一模一样，上层当成功处理，
+   还把 `last_row` 推到表尾，35 万行就这么静默没了；而下一轮增量只回看 512 行，
+   永远补不回来。
+   现在的处理：请求走全局节流（`_throttle`，2.5 次/秒）；空响应重试三次；
+   仍然空就抛 `DocError` 让整次同步失败，宁可这一轮不更新，也不写错进度。
+   单行窗口例外（空行本来就没有格子）。
+
+   压太狠还会升级成 WAF 人机验证：返回 501 + 一个跳
+   `waf-captcha.cloud.tencent.com` 的 HTML 页，封十几分钟。这种情况**不要重试**，
+   `_opendoc` 直接把"被拦了、等会儿再跑"抛到面板上。
+
+**只支持"任何人可查看"的文档。** 需要登录的同样回空 block。但现在空块会和
+"被限流"混在一起，所以不能一律返回空——`read_tab` 会在整块读空时拿单行复核，
+单行有数据就说明是限流/权限问题，直接抛错让人看见。
 """
 
 from __future__ import annotations
@@ -48,6 +62,7 @@ import base64
 import logging
 import re
 import threading
+import time
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -68,6 +83,13 @@ BLOCK_ROWS = 256
 # 块内单元格数量对不齐时，最多再花多少次请求去逐层二分。正常块一次都不用；
 # 一块里十几个空标题也就是几十次。设上限是防病态数据把一次同步拖成几小时。
 MAX_ALIGN_REQUESTS = 256
+# 全局请求速率（次/秒）。上限不是带宽而是"会不会被判成爬虫"：实测 3.5 次/秒
+# 连续压满整张 38 万行的表也不掉块；但一天里反复全量跑仍会撞上 WAF 的
+# 人机验证（501 验证码页），所以再降一档留余量。全量 38 万行约 10 分钟。
+REQ_PER_SEC = 2.5
+# 空响应的重试节奏。第一轮先短等（大概率是瞬时抖动），后面成倍拉长。
+EMPTY_RETRIES = 3
+EMPTY_BACKOFF = (0.4, 1.2, 3.0)
 TIMEOUT = 30.0
 
 _PAD_ID = re.compile(r"docs\.qq\.com/(?:sheet|smartsheet)/([A-Za-z0-9]+)")
@@ -408,6 +430,31 @@ def parse_block(blob: bytes) -> list[list[str]]:
 
 _local = threading.local()
 
+# 节流状态。`_next_slot` 是"下一个可以发请求的时刻"（monotonic 秒），
+# 多线程一起排队领号——在锁里 sleep 看着粗暴，但它保证了严格速率上限，
+# 而且 sleep 期间请求本身已经在锁外发出去了，并发度并没有被压成串行。
+_rate_lock = threading.Lock()
+_next_slot = 0.0
+_req_total = 0
+
+
+def _throttle() -> None:
+    """领一个请求名额，必要时等到轮到自己。"""
+    global _next_slot, _req_total
+    with _rate_lock:
+        now = time.monotonic()
+        if _next_slot > now:
+            time.sleep(_next_slot - now)
+            now = _next_slot
+        _next_slot = now + 1.0 / REQ_PER_SEC
+        _req_total += 1
+
+
+def request_count() -> int:
+    """累计发出的请求数。上层拿它算"这一轮花了多少次"写进日志。"""
+    with _rate_lock:
+        return _req_total
+
 
 def _session() -> requests.Session:
     session = getattr(_local, "s", None)
@@ -445,6 +492,7 @@ def _opendoc(pad_id: str, tab_id: str = "", start_row: int = 0, end_row: int = 2
         "block_end_col": "63",
     }
     try:
+        _throttle()
         resp = _session().get(
             OPENDOC,
             params=params,
@@ -454,6 +502,15 @@ def _opendoc(pad_id: str, tab_id: str = "", start_row: int = 0, end_row: int = 2
     except requests.RequestException as exc:
         raise DocError(f"连不上腾讯文档：{exc.__class__.__name__}") from exc
     if resp.status_code != 200:
+        # 501 不是"没实现"，是腾讯 WAF 的人机验证页
+        # （跳到 waf-captcha.cloud.tencent.com）。请求太密会被拦一段时间，
+        # 期间每个请求都失败——这时候重试只会把封禁时间拖得更长，所以直接
+        # 抛出去让整轮同步失败、进度停在原地，等人过一阵再跑。
+        if resp.status_code in (403, 429, 501, 502, 503):
+            raise DocError(
+                f"被腾讯文档拦了（HTTP {resp.status_code}，疑似请求太密触发人机验证），"
+                "等十几分钟再跑，别连着点"
+            )
         raise DocError(f"腾讯文档返回 {resp.status_code}")
     try:
         return resp.json()
@@ -515,23 +572,51 @@ def _header_fingerprint(pad_id: str, tab_id: str) -> str:
     是新表头，指纹跟着变，仍然对得上。
     """
     key = (pad_id, tab_id)
-    if key not in _header_cache:
-        cells = _window_cells(pad_id, tab_id, 0, BLOCK_ROWS - 1)
-        _header_cache[key] = cells[0][0] if cells else ""
-    return _header_cache[key]
+    fp = _header_cache.get(key, "")
+    if fp:
+        return fp
+    cells = _window_cells(pad_id, tab_id, 0, BLOCK_ROWS - 1)
+    # 首格可能是空串（作者在第一行前面留了空列），那就退而取第一个有字的格子。
+    # **空串绝不能进缓存**：一旦缓存成空，`read_block` 里 `cells[0][0] == ""`
+    # 会把后面每一块都判成越界，整张表只剩前几百行——而且不报任何错。
+    fp = cells[0][0] if cells and cells[0][0].strip() else next(
+        (t for t, _u in cells if t.strip()), ""
+    )
+    if fp:
+        _header_cache[key] = fp
+    return fp
 
 
 def _window_cells(
-    pad_id: str, tab_id: str, start_row: int, end_row: int
+    pad_id: str, tab_id: str, start_row: int, end_row: int, *, attempts: int = EMPTY_RETRIES
 ) -> list[tuple[str, list[str]]]:
-    """一次请求，按返回顺序取出单元格：(文本, 链接列表)。"""
-    payload = _opendoc(pad_id, tab_id, start_row, end_row)
-    out: list[tuple[str, list[str]]] = []
-    for _end_row, blob in _block_offsets(payload):
-        for _fn, val in _column_payloads(blob):
-            out.append((_text_of(val), urls_in_cell(val)))
-        break                     # 一个请求只带一块
-    return out
+    """一次请求，按返回顺序取出单元格：(文本, 链接列表)。
+
+    **空响应不等于"这段没数据"。** 请求过密时接口照样返回 200、结构也完整，
+    只是 `block_datas` 是空的，几十秒后自己恢复（模块头第 5 条）。所以这里
+    空一次就重试，三次都空才抛错——把它当空块放过去，等于整块 256 行静默消失。
+
+    单行窗口是例外：那一行本来就可以是空行（表里空白行很常见），空就是空。
+    """
+    single = end_row - start_row <= 0
+    tries = 1 if single else max(1, attempts)
+    for i in range(tries):
+        payload = _opendoc(pad_id, tab_id, start_row, end_row)
+        out: list[tuple[str, list[str]]] = []
+        for _end_row, blob in _block_offsets(payload):
+            for _fn, val in _column_payloads(blob):
+                out.append((_text_of(val), urls_in_cell(val)))
+            break                     # 一个请求只带一块
+        if out:
+            return out
+        if i + 1 < tries:
+            time.sleep(EMPTY_BACKOFF[min(i, len(EMPTY_BACKOFF) - 1)])
+    if single:
+        return []
+    raise DocError(
+        f"腾讯文档第 {start_row}~{end_row} 行连续 {tries} 次返回空块，"
+        "多半是请求太密被限流了，稍后重试"
+    )
 
 
 def _cells_to_row(cells: list[tuple[str, list[str]]]) -> list[str]:
@@ -645,7 +730,8 @@ def read_block(
     cells = _window_cells(pad_id, tab_id, start_row, end)
     if not cells:
         return []
-    if start_row > 0 and cells[0][0] == _header_fingerprint(pad_id, tab_id):
+    fp = _header_fingerprint(pad_id, tab_id)
+    if start_row > 0 and fp and cells[0][0] == fp:
         return []
     return _align_rows(
         pad_id, tab_id, start_row, end, [MAX_ALIGN_REQUESTS], cells=cells
@@ -682,17 +768,26 @@ def read_tab(
 
     starts = list(range(start, last, BLOCK_ROWS))
     rows: list[list[str]] = []
+    req_before = request_count()
+    t0 = time.monotonic()
 
     def _one(offset: int) -> list[list[str]]:
-        try:
-            # 最后一块要夹到表长：`max_row` 不是 256 的整数倍，不夹的话窗口会越过
-            # 表尾一百多行，而越界部分返回的是**表头**内容——它会混进这一块，
-            # 让"文字格数 = 链接格数"的对齐判据失效，一路二分到单行（实测一块
-            # 烧掉 257 次请求）。夹住之后最后一块就是普通的短块。
-            return read_block(meta.pad_id, tab.tab_id, offset, min(offset + BLOCK_ROWS - 1, last - 1))
-        except DocError as exc:
-            log.warning("腾讯文档第 %s 行读失败：%s", offset, exc)
-            return []
+        # 最后一块要夹到表长：`max_row` 不是 256 的整数倍，不夹的话窗口会越过
+        # 表尾一百多行，而越界部分返回的是**表头**内容——它会混进这一块，
+        # 让"文字格数 = 链接格数"的对齐判据失效，一路二分到单行（实测一块
+        # 烧掉 257 次请求）。夹住之后最后一块就是普通的短块。
+        end = min(offset + BLOCK_ROWS - 1, last - 1)
+        chunk = read_block(meta.pad_id, tab.tab_id, offset, end)
+        if chunk or end >= last - 1:
+            return chunk
+        # 整块读空但还没到表尾：正常表里不会出现。拿单行复核一次——单行有格子
+        # 就说明是限流把整块吞了。这时候必须抛错让整次同步失败，因为上层一旦
+        # 认为"读完了"，就会把 last_row 推到表尾，这一块永远补不回来。
+        if _window_cells(meta.pad_id, tab.tab_id, offset, offset):
+            raise DocError(
+                f"第 {offset} 行整块读空、单行却有数据，疑似被限流；这一轮不写进度"
+            )
+        return []
 
     if workers <= 1:
         for offset in starts:
@@ -709,4 +804,9 @@ def read_tab(
 
     if on_progress:
         on_progress(last, last)
+    log.info(
+        "读表 %s[%s~%s]：%s 块 / %s 次请求 / %s 行（%.1f 秒）",
+        tab.tab_id, start, last - 1, len(starts), request_count() - req_before,
+        len(rows), time.monotonic() - t0,
+    )
     return rows, meta
