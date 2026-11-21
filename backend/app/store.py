@@ -850,7 +850,11 @@ def ingest(
                 "file_count": item.get("fileCount") or 0,
                 "size_bytes": item.get("sizeBytes") or 0,
                 "source_name": item.get("sourceName") or "",
-                "source_level": 1 if item.get("sourceKind") == "tg" else 2,
+                # 来源等级允许调用方显式指定：QQ 群主/管理员手动发的链接是人工
+                # 筛过的，给 1（与 TG 自建频道同级），比上游爬取的 2/3 更可信。
+                # 不指定时沿用老规则，保证已接入的通道行为不变。
+                "source_level": _int(item.get("sourceLevel"))
+                or (1 if item.get("sourceKind") == "tg" else 2),
             })
 
         result = upsert_many(rows, now=now)

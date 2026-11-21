@@ -79,6 +79,7 @@ npm run dev
 | POST | `/api/resolve` | token → 可用地址（我们的分享链接，失败则回退原链接），body `{"t":"..."}` |
 | POST | `/api/track` | 前端行为上报（内部用，见下节） |
 | POST | `/api/feedback` | 提交反馈 / 求资源 |
+| POST | `/api/ingest/qq` | QQ 群消息入库（AstrBot 插件调，需 `X-Ingest-Token`，见下节） |
 | GET | `/api/group` | 群入口配置（进站/获取链接弹窗用，公开） |
 | GET | `/api/admin/group` | 读群入口配置，需 `X-Admin-Token` |
 | POST | `/api/admin/group` | 保存群入口配置（整包提交），需 `X-Admin-Token` |
@@ -106,6 +107,33 @@ npm run dev
 `refresh=1`（或 pansou 叫法 `force_refresh=true`）绕过**两层**缓存（响应缓存 + 插件缓存）强制回源。两个细节别改坏：它不能被拼进缓存键（否则刷新和普通查询各留一份，用户刷完再搜还是旧的），它按 3 份限流配额计（30 次/分钟时最多刷 10 次，因为每一次都是真金白银）。
 
 **前端结果头把这些字段摊开给用户看**（`frontend/src/App.vue`）：`cached` + `shared` 翻成「实时结果 / 缓存结果 / 并发合并」，`tier` 翻成「TG 免费通道 / 已切换备用源」；`shared=true` 时耗时显示「复用」而不是那个会让人误以为超快的 `0ms`。右侧「强制刷新」按钮是**唯一**会带 `refresh=1` 的入口——翻页、换平台、检测结论补拉一律走缓存。刷新走独立的 `refreshing` 状态、不进骨架屏：面板原地更新，撞到 429 也只出一条就地提示，不清空用户已经看到的 20 条结果。前端另记一条 `refresh` 埋点，用来区分「首搜」和「用户主动要更新」——后端的 `search` 事件只能看到 `cached=0`，分不出这两者。
+
+### QQ 群采集（AstrBot + NapCat）
+
+资源库的第三个入口：群主/管理员在群里发的分享，自动进库。和表格订阅、影子回填并列，写的是同一个 `library.db`。
+
+链路是 **NapCat → AstrBot 插件 → `POST /api/ingest/qq` → `qq_intake.py` → `store.ingest()`**。插件只判「哪个群、谁发的、有没有网盘链接」，**链接解析只在后端存在一份**（`qq_intake.py` 复用 `search/clean.py` 的正则）。插件侧如果另写一套正则，两边迟早对不上，而且是那种"群里能认、表格导入认不出"的隐蔽偏差。
+
+标题可以交给 AI：插件会先让 AstrBot 已配置的大模型把消息整理成 `{title, shareUrl, sharePwd}`，随消息一起 POST 上来（`messages[].items`）。但**服务器不信任模型**——
+
+- `shareUrl` 必须能在原文里对出同一个 `platform:pwd_id`，否则整条丢弃（模型补全短链、记错分享 id 是常态，落库就是死链）；
+- `sharePwd` 必须在原文里出现过，否则用正则解析的码（模型会照着"4 位码"的规律瞎猜）；
+- 模型漏掉的链接由正则补回来，**只改善标题，不减少入库数量**。
+
+不带 `items` 的消息走纯正则，老版本插件不用升级。AI 失败/超时/没配模型全部静默降级。
+
+```ini
+# backend/.env
+QQ_INGEST_ENABLED=true
+QQ_INGEST_TOKEN=<随机串>
+QQ_INGEST_MAX_BATCH=50
+```
+
+- 令牌**必须单独设**，不要复用 `ADMIN_TOKEN`：AstrBot 可能跑在另一台机器或别人的容器里，不该让它拿着能改后台配置的口令。留空会回退到 `ADMIN_TOKEN`，两个都空只允许本机。
+- 采集进来的资源 `source_level = 1`（和自建 TG 频道同级），排序比上游爬取的靠前。`store.ingest()` 现在认调用方显式传的 `sourceLevel`，不传则维持原规则——已接入的通道行为不变。
+- 解析器认「标题独占一行 + 链接一行 + 提取码一行」这类群聊排版，空行分段、元信息行不抢标题、一码只配一链。回归点见 `tests/test_qq_intake.py`（规则解析）和 `tests/test_qq_ai_merge.py`（AI 结果校验）。
+
+插件在 `astrbot-plugin-pantrace/`，配置和排查步骤见该目录的 README。
 
 ### 启用 TG 通道（只在能直连 t.me 的机器上）
 

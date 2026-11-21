@@ -3,20 +3,28 @@
     "description": "PanTrace 服务地址",
     "type": "string",
     "default": "https://你的域名",
-    "hint": "后端根地址，不含结尾斜杠，例如 https://pan.example.com。插件会请求它的 /api/search。"
+    "hint": "后端根地址，不含结尾斜杠，例如 https://pan.example.com。搜索请求 /api/search，采集上报 /api/ingest/qq。"
   },
   "result_limit": {
     "description": "每次显示条数",
     "type": "int",
     "default": 6,
-    "slider": { "min": 1, "max": 10, "step": 1 },
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    },
     "hint": "QQ 单条消息不宜太长，建议 5-8 条。"
   },
   "timeout": {
     "description": "搜索超时（秒）",
     "type": "int",
     "default": 80,
-    "slider": { "min": 10, "max": 120, "step": 5 },
+    "slider": {
+      "min": 10,
+      "max": 120,
+      "step": 5
+    },
     "hint": "上游慢的时候接近 60 秒，默认 80 秒留余量，别调太低。"
   },
   "cache_ttl": {
@@ -30,5 +38,62 @@
     "type": "int",
     "default": 200,
     "hint": "超过后按最久未使用淘汰。默认 200 足够。"
+  },
+  "capture_enabled": {
+    "description": "群消息采集",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后静默监听群消息，把群主/管理员发的网盘分享提取后发给后端入库。关掉后 /搜 照常可用。"
+  },
+  "capture_groups": {
+    "description": "监听的群号",
+    "type": "list",
+    "default": [],
+    "hint": "填群号（纯数字），可填多个。**留空 = 不采集任何群**——要采集必须显式写群号，避免测试配置误上线把无关群的链接也收进来。群号在 QQ 群资料里能看到。"
+  },
+  "capture_roles": {
+    "description": "采集哪些身份",
+    "type": "list",
+    "default": [
+      "owner",
+      "admin"
+    ],
+    "hint": "owner=群主，admin=管理员，member=普通成员。只填 owner 和 admin 可避免群友随手转发把库塞脏。"
+  },
+  "ingest_token": {
+    "description": "上报令牌",
+    "type": "string",
+    "default": "",
+    "secret": true,
+    "hint": "必须和后端 .env 里的 QQ_INGEST_TOKEN 完全一致。后端没配这一项时会回退用 ADMIN_TOKEN，那就填 ADMIN_TOKEN 的值。"
+  },
+  "capture_ack": {
+    "description": "采集后回执",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后每收到一条有效分享会在群里回一句「已收录」。调试期开着方便确认链路通，稳定后建议关掉——群里机器人老吭声会被嫌。"
+  },
+  "ai_structure": {
+    "description": "AI 结构化",
+    "type": "bool",
+    "default": true,
+    "hint": "用 AstrBot 已配置的大模型把群消息整理成「标题 + 链接 + 提取码」再入库，标题比规则解析准。模型不可用或超时会自动退回规则解析，不影响入库。关闭后完全走规则解析，不消耗模型额度。"
+  },
+  "ai_timeout": {
+    "description": "AI 结构化超时（秒）",
+    "type": "int",
+    "default": 20,
+    "slider": {
+      "min": 5,
+      "max": 60,
+      "step": 5
+    },
+    "hint": "一批消息的总预算。超时后剩下的消息退回规则解析，链接照样入库，只是标题糙一点。"
+  },
+  "ai_provider": {
+    "description": "指定模型提供商 ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空 = 用当前会话/全局默认的模型。填了就用该提供商（WebUI「模型提供商」里的 ID）。建议挑一个便宜且听话的小模型，别用主力对话模型。"
   }
 }

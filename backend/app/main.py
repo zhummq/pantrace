@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import analytics, check, feedback, group, guard, library_sync, pan, resolver, source_score, store
+from . import analytics, check, feedback, group, guard, library_sync, pan, qq_intake, resolver, source_score, store
 from .config import get_settings
 from .search import engine as search_engine
 from .search import library as library_layer
@@ -132,6 +132,13 @@ if LIBRARY_ON:
         log.error("资源库初始化失败，已关闭：%s", exc)
 else:
     log.info("资源库已关闭（LIBRARY_ENABLED=false）")
+
+# QQ 群采集的开关单独放。它写的是同一个库，但没有库就无处可写，
+# 所以库关掉时它也跟着失效——不在这里联动的话，接口会返回"成功 0 条"，
+# 看起来像在正常工作，实际一条都没进来。
+QQ_INGEST_ON = settings.qq_ingest_enabled and LIBRARY_ON
+if settings.qq_ingest_enabled and not LIBRARY_ON:
+    log.warning("QQ 采集已随资源库一起关闭（LIBRARY_ENABLED=false）")
 
 # ---- 来源贡献分 ----
 # 和埋点同一个 SQLite 文件，但独立建表、独立计时起点：历史点击不参与排行榜。
@@ -2178,6 +2185,115 @@ async def admin_library_jobs(request: Request):
     if not _admin_allowed(request):
         return _need_token()
     return {"code": 0, "data": library_sync.status()}
+
+
+# ---------------------------------------------------------------- QQ 群采集
+#
+# AstrBot + NapCat 把指定群里群主/管理员发的分享消息原样 POST 过来，这里解析
+# 入库。**解析只在后端做一份**：插件侧能拿到的只有文本，如果让它自己写一套
+# 链接正则，迟早和 `search/clean.py` 打架——今天群里能认出来的写法，明天表格
+# 导入认不出来，这种不一致查起来极费劲。
+#
+# 所以插件的职责被压到最小：判定「哪个群、谁发的、有没有链接」，然后转发。
+
+
+class QqItemIn(BaseModel):
+    """AstrBot 侧用大模型结构化出来的单条资源。
+
+    **只有 `title` 是真正被采纳的**：`shareUrl` 要能在原文里对上同一个
+    `platform:pwd_id`，`sharePwd` 要能在原文里找到，否则一律退回规则解析。
+    模型把短链补全、把 id 记错一个字符，落库就是死链，而用户点开只会看到
+    "分享已失效"，没人会回头怀疑是采集时写坏的。
+    """
+
+    title: str = ""
+    shareUrl: str = ""
+    sharePwd: str = ""
+
+
+class QqMessageIn(BaseModel):
+    id: str = ""             # 平台消息 id，只用于回执对账
+    groupId: str = ""
+    groupName: str = ""
+    senderId: str = ""
+    senderName: str = ""
+    role: str = ""           # owner / admin / member
+    text: str = ""
+    # 可选。带了这个字段就走「AI 定标题 + 正则兜底校验」，没带就纯正则解析，
+    # 老版本插件不升级也能继续上报。
+    items: list[QqItemIn] = Field(default_factory=list)
+
+
+class QqIngestIn(BaseModel):
+    messages: list[QqMessageIn] = Field(default_factory=list)
+
+
+def _ingest_allowed(request: Request) -> bool:
+    """采集口鉴权。
+
+    和看板口令分开一个 token：AstrBot 可能跑在另一台机器、另一个容器里，
+    不该让它拿着能改后台配置、能删订阅的那个口令。
+
+    `qq_ingest_token` 留空则回退 `admin_token`；两个都空就只允许本机——
+    跟看板同一套安全默认值，不会因为忘了配就裸奔。
+    """
+    token = settings.qq_ingest_token or settings.admin_token
+    if token:
+        got = request.headers.get("x-ingest-token") or ""
+        return hmac.compare_digest(got, token)
+    return client_ip(request) in ("127.0.0.1", "::1")
+
+
+@app.post("/api/ingest/qq", include_in_schema=False)
+async def ingest_qq(payload: QqIngestIn, request: Request):
+    """接收一批 QQ 群消息，解析出网盘链接入库。
+
+    成功只代表「收到并处理了」，不代表每条都进了库：`dropped` 里是没解析出
+    链接的原因，`links` 是实际提取到的条数。管理端对账看这两个数。
+    """
+    if not QQ_INGEST_ON:
+        return JSONResponse(status_code=503, content={"code": 503, "msg": "QQ 采集已关闭"})
+    if not _ingest_allowed(request):
+        return _need_token()
+
+    msgs = payload.messages
+    if not msgs:
+        return {"code": 0, "data": {"added": 0, "touched": 0, "links": 0, "dropped": []}}
+    if len(msgs) > settings.qq_ingest_max_batch:
+        # 超量几乎只有一个原因：配置写成了"上报所有消息"。拒掉比慢慢写库好，
+        # 否则半小时就能把库里塞满闲聊。
+        return JSONResponse(
+            status_code=413,
+            content={
+                "code": 413,
+                "msg": f"一次最多 {settings.qq_ingest_max_batch} 条消息，当前 {len(msgs)} 条",
+            },
+        )
+
+    items, dropped = qq_intake.parse_batch([m.model_dump() for m in msgs])
+    ai_msgs = sum(1 for m in msgs if m.items)
+    if not items:
+        return {"code": 0, "data": {
+            "added": 0, "touched": 0, "links": 0, "aiMessages": ai_msgs,
+            "dropped": dropped[:20],
+        }}
+
+    # store.ingest 自己吞异常（影子回填的约定：旁路不许拖垮主流程），这里不再包 try
+    got = store.ingest(items)
+    log.info(
+        "QQ 采集：%s 条消息（AI 结构化 %s 条）→ %s 条链接，新增 %s / 更新 %s",
+        len(msgs), ai_msgs, len(items), got.get("added", 0), got.get("touched", 0),
+    )
+    return {"code": 0, "data": {
+        "added": got.get("added", 0),
+        "touched": got.get("touched", 0),
+        "links": len(items),
+        "aiMessages": ai_msgs,
+        "dropped": dropped[:20],
+        # 回传前几条标题：管理端/日志里能立刻看出"标题抓对了没有"，
+        # 不用等入库再去搜
+        "titles": [it["title"] for it in items[:10]],
+    }}
 
 
 @app.get("/api/group", include_in_schema=False)

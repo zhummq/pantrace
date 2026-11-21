@@ -197,6 +197,19 @@ class Settings(BaseSettings):
     # 部署到公网必须设一个，否则看板打不开。
     admin_token: str = ""
 
+    # ---- QQ 群采集 ----
+    # AstrBot + NapCat 监听指定群的群主/管理员消息，提取网盘链接入库。
+    # 走 HTTP 上报，所以 AstrBot 和后端可以不在同一台机器上。
+    #
+    # token 留空会回退到 admin_token，两个都空则只允许本机调用。
+    # 单独开一个 token 的理由：AstrBot 可能在别人的机器/容器里，
+    # 不该让它拿着能改后台配置的那个口令。
+    qq_ingest_enabled: bool = True
+    qq_ingest_token: str = ""
+    # 单次上报的消息条数上限。插件是攒批发，正常几条到几十条；
+    # 超过这个量基本是配置写错成了"上报全部消息"，直接拒掉比慢慢写库好。
+    qq_ingest_max_batch: int = 50
+
     # ---- 服务 ----
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     serve_frontend: bool = True
