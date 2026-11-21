@@ -11,8 +11,9 @@
 
 但**链接的唯一可信来源永远是原文**：插件不写 URL 正则、不猜 share id，
 后端会拿 `search/clean.py` 的正则结果核对每一条 AI 条目，对不上
-`platform:pwd_id` 的直接丢弃，AI 漏掉的链接也会被补回来。所以模型只
-负责"标题写得更像人话"，不可能把死链、编造的链接带进库。
+`platform:pwd_id` 的直接丢弃。策略是**纯 AI 为准**——AI 给了有效条目就
+只入库这些，AI 没覆盖到的链接不入库；AI 一条都没给对，才整条退回规则解析。
+所以模型能把死链、编造的链接挡在库外，但它漏掉的链接也不会被补齐。
 """
 
 import asyncio
@@ -58,7 +59,7 @@ _STRUCT_SYSTEM = """你是 QQ 群分享消息的网盘资源抽取器。把一�
 {"items":[{"title":"资源名","shareUrl":"https://...","sharePwd":"abcd"}]}
 
 规则：
-1. shareUrl 必须逐字照抄原文里的链接，不得改写、补全、拼接，也不得凭印象写。原文有几个链接就输出几条。
+1. shareUrl 必须逐字照抄原文里的链接，不得改写、补全、拼接，也不得凭印象写。原文有几个链接就输出几条，不要因为条数多就只给前几条。
 2. title 是资源名：保留片名、季数、年份、清晰度（4K/1080P）、合集等信息；去掉「链接」「提取码」「下载地址」这类标签词，去掉网盘平台名（夸克/百度/阿里云盘/迅雷/UC 等），去掉广告和拉群话术（更多资源关注公众号、加群领取等）、表情和多余标点。
 3. 标题写在链接上一行时，它属于后面的那些链接；同一个资源备份在多个网盘时，几条共用同一个标题。
 4. 一条消息里有多个不同资源时必须拆成多条，各用自己的标题，不要用一个总标题套住全部。
@@ -67,9 +68,16 @@ _STRUCT_SYSTEM = """你是 QQ 群分享消息的网盘资源抽取器。把一�
 
 # 一次 flush 里最多给几条消息过模型。15 秒内批量进来几十条时多半是刷屏或
 # 广告轰炸，全部送模型既慢又费钱；超出的直接走正则，链接一样入库。
-_AI_MAX_PER_FLUSH = 6
+_AI_MAX_PER_FLUSH = 10
 # 并发上限。群里连发时几条消息同时结构化，但别把模型服务的限流打满。
 _AI_CONCURRENCY = 3
+# 单条消息送模型的字符上限。资源合集贴动辄两三千字，早先只给 2000 字会把
+# 后半段链接整段切掉——模型看不见就没法结构化，纯 AI 策略下这部分直接丢失。
+# 10000 字约等于一条超长合集贴的全文，正常分享根本碰不到。
+_AI_TEXT_MAX = 10000
+# 单条消息最多采纳多少条 AI 条目。这是「防模型发疯灌几百条」的护栏，
+# 不是「只处理前 N 个」的截断：100 个链接一条消息里已经极端罕见。
+_AI_MAX_ITEMS = 100
 
 
 async def _maybe_await(value):
@@ -371,14 +379,14 @@ class PanTraceCollector(Star):
         return await self._provider_chat(provider, prompt, system)
 
     def _ai_timeout(self) -> int:
-        return max(5, min(60, int(self.config.get("ai_timeout", 20))))
+        return max(5, min(60, int(self.config.get("ai_timeout", 60))))
 
     async def _structure_one(self, text: str) -> list[dict]:
         """一条消息 → `[{title, shareUrl, sharePwd}]`。失败返回空列表。"""
         text = str(text or "").strip()
         if not text:
             return []
-        prompt = f'群消息原文（其中可能夹着图片/卡片占位符，忽略即可）：\n"""\n{text[:2000]}\n"""'
+        prompt = f'群消息原文（其中可能夹着图片/卡片占位符，忽略即可）：\n"""\n{text[:_AI_TEXT_MAX]}\n"""'
         try:
             raw = await asyncio.wait_for(
                 self._llm_text(prompt, _STRUCT_SYSTEM), timeout=self._ai_timeout(),
@@ -417,7 +425,7 @@ class PanTraceCollector(Star):
             return []
 
         out: list[dict] = []
-        for row in rows[:10]:
+        for row in rows[:_AI_MAX_ITEMS]:
             if not isinstance(row, dict):
                 continue
             url = str(row.get("shareUrl") or row.get("url") or "").strip()
@@ -451,12 +459,16 @@ class PanTraceCollector(Star):
                     msg["items"] = got
 
         started = time.time()
+        # 外层预算是"整批"的，但内层并发只有 _AI_CONCURRENCY 条，超出并发的
+        # 消息得排队等前一轮。原来外层直接复用单条预算：批里凑够 4 条就必然
+        # 先撞外层——前半批明明已经拿到了结构化结果，却被整体判成超时丢掉。
+        # 现在按轮次给预算，外层只当"整批彻底卡死"的保险丝，单条闸门在内层。
+        rounds = max(1, (len(todo) + _AI_CONCURRENCY - 1) // _AI_CONCURRENCY)
+        budget = self._ai_timeout() * rounds + 5
         try:
-            # 整批一个总预算。模型服务卡住时，这一批剩下的直接退回正则解析
-            # ——链接照样入库，只是标题糙一点，总比后台任务挂死强。
             await asyncio.wait_for(
                 asyncio.gather(*(one(m) for m in todo), return_exceptions=True),
-                timeout=self._ai_timeout(),
+                timeout=budget,
             )
         except asyncio.TimeoutError:
             logger.warning("pantrace: AI 结构化整批超时，未完成的部分退回规则解析")
@@ -488,7 +500,10 @@ class PanTraceCollector(Star):
             return False, {"msg": "没配置 ingest_token（和后端 QQ_INGEST_TOKEN 要一致）"}
 
         try:
-            timeout = aiohttp.ClientTimeout(total=20)
+            # 一批可能几十上百条消息，合集贴能让 payload 上到几 MB，后端还要逐条
+            # 解析、核对、写库。按条数给超时（10 + N 秒，封顶 120），别用一个固定值
+            # 去赌——超时会整批重试一次，等于把同样的活干两遍。
+            timeout = aiohttp.ClientTimeout(total=max(30, min(120, 10 + len(messages))))
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
                     f"{base}/api/ingest/qq",
@@ -516,7 +531,9 @@ class PanTraceCollector(Star):
     async def _flush(self) -> None:
         if not self._pending:
             return
-        batch, self._pending = self._pending[:50], self._pending[50:]
+        # 后端已经不限制单批条数（QQ_INGEST_MAX_BATCH=0），这里把手上的全发走。
+        # 真正的上界是 _schedule_flush 里的 200 条内存保护，不是接口限制。
+        batch, self._pending = self._pending[:], []
         # 先让大模型把消息整理成结构化字段，再由后端核对入库。
         # 失败/超时/没配模型都不影响上报：没 items 的消息走后端正则解析。
         ai_done = await self._structure_batch(batch)
@@ -528,9 +545,17 @@ class PanTraceCollector(Star):
         if not ok:
             logger.warning("pantrace: 采集上报失败，丢弃 %s 条：%s", len(batch), data.get("msg"))
             return
+        # "AI 结构化 X 条"只说明模型跑通了，看不出最终入库多少。这里把
+        # 提交数和入库数一起打出来。两者不等有两个原因：模型把同一链接写两遍
+        # （后端折叠）、或者链接在原文里找不到（后端判编造）。明细看后端日志。
+        # AI 没覆盖到的链接会被直接丢弃，那个数插件侧看不到（插件不做正则），
+        # 只能去后端看「纯 AI 策略丢弃 N 条」。
+        links = int(data.get("links") or 0)
+        ai_items = sum(len(m.get("items") or []) for m in batch)
+        extra = "（AI 提交 %s）" % ai_items if ai_items else "（全部走规则解析）"
         logger.info(
-            "pantrace: 采集 %s 条消息（AI 结构化 %s 条）→ 链接 %s，新增 %s / 更新 %s",
-            len(batch), ai_done, data.get("links"), data.get("added"), data.get("touched"),
+            "pantrace: 采集 %s 条消息（AI 结构化 %s 条）→ 入库 %s 条%s，新增 %s / 更新 %s",
+            len(batch), ai_done, links, extra, data.get("added"), data.get("touched"),
         )
 
     async def _delayed_flush(self, delay: float = 1.5) -> None:

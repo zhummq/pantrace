@@ -261,10 +261,19 @@ def merge_ai_items(
     source_name: str = "",
     source_level: int = 1,
 ) -> MessageResult:
-    """把 AI 的结构化结果和规则解析的结果合并。
+    """AI 结果为主，规则只在 AI 不起作用时接管。
 
-    规则解析先跑一遍，不只是为了兜底，更是为了拿到"原文里到底有哪些链接"
-    这份证据——AI 的每一条都要对着它验。代价是一次纯正则，可以忽略。
+    这是**纯 AI 策略**，不是两边互补：
+
+    1. AI 给了通过校验的条目 → 只返回这些，规则解析的标题一条都不掺。
+       AI 没覆盖到的链接会被**主动丢弃**——这是显式取舍：宁可少收几条，
+       也不要同一条消息里一半标题是模型写的、一半是长度猜出来的。
+    2. AI 一条都没通过校验（编造 / 超时 / 没配模型 / 返回空）→ 整条消息
+       退回规则解析，否则这条消息等于白采。
+
+    规则解析在这里不是兜底主力，是**校验依据**：先拿到"原文里到底有哪些
+    链接"，AI 的每一条都要对着它验，`platform:pwd_id` 对不上的一律按编造
+    丢掉。代价只是一次纯正则，可以忽略。
     """
     base = parse_message(text, source_name=source_name, source_level=source_level)
     res = MessageResult()
@@ -303,17 +312,28 @@ def merge_ai_items(
             "sharePwd": _pick_pwd(one.get("sharePwd"), raw, str(origin.get("sharePwd") or "")),
         })
 
-    for key, item in by_key.items():
-        if key not in used:
-            res.items.append(dict(item))
-
     # AI 条目被拒必须留痕：不然"为什么这条标题没用模型结果"只能靠猜。
     # 只记链接本身被否的情况，标题为空属于正常降级，不刷日志。
     ai_rejected = [r for r in res.skipped if r.startswith("AI ")]
     if ai_rejected:
         log.info(
-            "QQ 采集：AI 条目被拒 %s 条（%s），已按规则解析入库",
+            "QQ 采集：AI 条目被拒 %s 条（%s）",
             len(ai_rejected), "；".join(dict.fromkeys(ai_rejected)),
+        )
+
+    if not res.items:
+        # 安全网：AI 这次一条都没给对（全被拒 / 全空）。整条回规则解析，
+        # 不能因为模型犯傻就把这条消息的资源全扔了。
+        log.info("QQ 采集：AI 没有可用条目，整条退回规则解析")
+        return base
+
+    uncovered = len(by_key) - len(used)
+    if uncovered > 0:
+        # 纯 AI 策略的代价，必须留痕。否则"这条为什么只入库 2 个、明明原文有 4 个"
+        # 只能靠猜，和丢数据没区别。
+        log.info(
+            "QQ 采集：纯 AI 策略丢弃 %s 条 AI 未覆盖的链接（AI 采纳 %s / 原文共 %s）",
+            uncovered, len(used), len(by_key),
         )
     return res
 
@@ -328,8 +348,8 @@ def parse_batch(
     `messages` 每项形如 `{text, groupName, groupId, senderName, role, id}`。
     `dropped` 保留消息 id 和原因，方便在管理端对账："这条为什么没进库"。
 
-    带 `items` 的消息（AstrBot 侧已经用大模型结构化过）走 `merge_ai_items`，
-    **仍然不跳过规则解析**——那份结果既是兜底，也是校验 AI 的依据。
+    带 `items` 的消息走 `merge_ai_items`：**规则解析照样跑，但只当校验依据**。
+    AI 有可用条目就以 AI 为准（没覆盖的链接直接丢弃），AI 全失败才整条回规则。
     """
     items: list[dict] = []
     dropped: list[dict] = []

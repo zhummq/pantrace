@@ -206,9 +206,11 @@ class Settings(BaseSettings):
     # 不该让它拿着能改后台配置的那个口令。
     qq_ingest_enabled: bool = True
     qq_ingest_token: str = ""
-    # 单次上报的消息条数上限。插件是攒批发，正常几条到几十条；
-    # 超过这个量基本是配置写错成了"上报全部消息"，直接拒掉比慢慢写库好。
-    qq_ingest_max_batch: int = 50
+    # 单次上报的消息条数上限。**0 = 不限（当前默认）**。
+    # 早先默认 50，防的是"插件配置写错成上报全部消息"。但真实群里一次 flush
+    # 很少过百条，而硬上限在插件补发积压时会整批拒掉、逼它重试同一批，
+    # 反而更容易堆积。现在靠插件侧的 200 条内存保护 + 这里逐条解析兜住。
+    qq_ingest_max_batch: int = 0
 
     # ---- 服务 ----
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

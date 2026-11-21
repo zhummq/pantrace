@@ -10,8 +10,9 @@
    资源，还得人工清理。
 3. 原文没写提取码，模型按常见规律猜一个 → 用户转存报"提取码错误"，
    比不给码更耽误事。
-4. 反过来，模型漏掉的链接**必须补回来**。结构化是为了标题更准，不是让它
-   决定哪条资源值得收；漏一条就是彻底搜不到，而日志里没有任何痕迹。
+4. 采信 AI 的代价是**覆盖不全会少收**：这是纯 AI 策略，AI 没给到的链接不入库。
+   所以丢弃条数必须写进日志，否则"原文有 4 个链接、为什么只入库 2 个"只能靠猜。
+   但 AI 一条都没给对时必须整条退回规则，不能因为模型犯傻就把资源丢光。
 
 跑法：``.venv/Scripts/python.exe -m unittest tests.test_qq_ai_merge -v``
 不打网络：AI 的返回是构造出来的。
@@ -63,22 +64,24 @@ class HallucinationTest(unittest.TestCase):
     """模型给的链接必须能在原文里对上，否则整条丢弃。"""
 
     def test_link_not_in_text_is_dropped(self):
-        """id 记错一个字符 = 原文里没有这条链接，绝不能入库。"""
+        """id 记错一个字符 = 原文里没有这条链接，绝不能入库。
+
+        AI 这次一条真的都没给 → 走安全网整条退回规则，原文两条都保留。
+        """
         fake = "https://pan.quark.cn/s/xxxxxx"
         got = merge([{"title": "漫长的季节", "shareUrl": fake, "sharePwd": "k9m2"}])
         urls = [i["shareUrl"] for i in got.items]
         self.assertNotIn(fake, urls)
-        # 原文里的两条链接仍然都在（AI 只给了假的，正则补回来）
         self.assertIn(Q, urls)
         self.assertIn(B, urls)
 
-    def test_fake_link_does_not_drop_real_ones(self):
-        """模型编了一条，不代表这条消息作废。"""
+    def test_fake_link_dropped_real_kept(self):
+        """模型编了一条 + 给了一条真的：假的丢弃，真的照用（纯 AI 不铺底）。"""
         got = merge([
             {"title": "漫长的季节", "shareUrl": "https://pan.quark.cn/s/000000", "sharePwd": ""},
             {"title": "漫长的季节", "shareUrl": Q, "sharePwd": "k9m2"},
         ])
-        self.assertEqual(len(got.items), 2)
+        self.assertEqual([i["shareUrl"] for i in got.items], [Q])
 
     def test_malformed_url_ignored(self):
         got = merge([{"title": "漫长的季节", "shareUrl": "pan.quark.cn/s/a1b2c3", "sharePwd": ""}])
@@ -110,17 +113,30 @@ class PwdTest(unittest.TestCase):
         self.assertEqual(got.items[0]["sharePwd"], "k9m2")
 
 
-class NoLossTest(unittest.TestCase):
-    """模型漏掉的链接必须被正则补回来。"""
+class PureAiPolicyTest(unittest.TestCase):
+    """纯 AI 策略：AI 没覆盖的链接主动丢弃，AI 全失败才整条回规则。"""
 
-    def test_missing_link_still_ingested(self):
-        got = merge([{"title": "漫长的季节", "shareUrl": Q, "sharePwd": "k9m2"}])
-        urls = [i["shareUrl"] for i in got.items]
-        self.assertIn(Q, urls)
-        self.assertIn(B, urls)
+    def test_uncovered_links_dropped(self):
+        """AI 只给了 Q，原文另有 B —— 按策略 B 不入库，但必须留痕。"""
+        with self.assertLogs("pantrace.qq_intake", level="INFO") as cm:
+            got = merge([{"title": "漫长的季节", "shareUrl": Q, "sharePwd": "k9m2"}])
+        self.assertEqual([i["shareUrl"] for i in got.items], [Q])
+        self.assertTrue(
+            any("纯 AI 策略丢弃 1 条" in line for line in cm.output),
+            cm.output,
+        )
+
+    def test_all_rejected_falls_back_to_regex(self):
+        """AI 给的全是编造链接 → 整条退回规则，不能把资源丢光。"""
+        plain = qq_intake.parse_message(TEXT)
+        got = merge([{"title": "瞎编的", "shareUrl": "https://pan.quark.cn/s/zzzzzz"}])
+        self.assertEqual(
+            sorted(i["shareUrl"] for i in got.items),
+            sorted(i["shareUrl"] for i in plain.items),
+        )
 
     def test_empty_ai_result_equals_regex(self):
-        """模型返回空数组时结果应与纯规则解析一致，不能少链接。"""
+        """模型返回空数组时结果应与纯规则解析一致。"""
         plain = qq_intake.parse_message(TEXT)
         got = merge([])
         self.assertEqual(
@@ -135,7 +151,8 @@ class NoLossTest(unittest.TestCase):
             "groupName": "资源群",
             "items": [{"title": "漫长的季节 2023 4K", "shareUrl": Q, "sharePwd": "k9m2"}],
         }])
-        self.assertEqual(len(items), 2)
+        # 纯 AI 策略：只入库 AI 给的那一条，B 被丢弃
+        self.assertEqual(len(items), 1)
         self.assertEqual(dropped, [])
         self.assertTrue(all(i["sourceKind"] == "qq" for i in items))
         self.assertIn("漫长的季节 2023 4K", [i["title"] for i in items])

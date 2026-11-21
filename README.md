@@ -115,11 +115,12 @@ npm run dev
 
 链路是 **NapCat → AstrBot 插件 → `POST /api/ingest/qq` → `qq_intake.py` → `store.ingest()`**。插件只判「哪个群、谁发的、有没有网盘链接」，**链接解析只在后端存在一份**（`qq_intake.py` 复用 `search/clean.py` 的正则）。插件侧如果另写一套正则，两边迟早对不上，而且是那种"群里能认、表格导入认不出"的隐蔽偏差。
 
-标题可以交给 AI：插件会先让 AstrBot 已配置的大模型把消息整理成 `{title, shareUrl, sharePwd}`，随消息一起 POST 上来（`messages[].items`）。但**服务器不信任模型**——
+标题由 AI 定，正则只在 AI 不起作用时兜底。插件先把消息交给 AstrBot 已配置的大模型整理成 `{title, shareUrl, sharePwd}`，随消息一起 POST 上来（`messages[].items`）。但**服务器不信任模型**——
 
 - `shareUrl` 必须能在原文里对出同一个 `platform:pwd_id`，否则整条丢弃（模型补全短链、记错分享 id 是常态，落库就是死链）；
 - `sharePwd` 必须在原文里出现过，否则用正则解析的码（模型会照着"4 位码"的规律瞎猜）；
-- 模型漏掉的链接由正则补回来，**只改善标题，不减少入库数量**。
+- 只有两态，不是"两边掺着来"：AI 有有效条目就**只入库 AI 交的那批**（AI 没覆盖到的链接直接丢弃，后端日志写明丢了几条）；AI 一条都没给对，才整条退回正则。**这是"标题来源统一"的代价——AI 漏一条，这条就不进库。**
+- 单条消息送模型的上限是 **10000 字 / 100 个资源**。合集贴动辄几十个链接，早期 2000 字 / 10 个的上限会把后半段切掉；纯 AI 策略下被切掉的部分等于直接丢失，所以这档必须给够。
 
 不带 `items` 的消息走纯正则，老版本插件不用升级。AI 失败/超时/没配模型全部静默降级。
 
@@ -127,7 +128,7 @@ npm run dev
 # backend/.env
 QQ_INGEST_ENABLED=true
 QQ_INGEST_TOKEN=<随机串>
-QQ_INGEST_MAX_BATCH=50
+QQ_INGEST_MAX_BATCH=0      # 0 = 不限；插件侧另有 200 条内存保护
 ```
 
 - 令牌**必须单独设**，不要复用 `ADMIN_TOKEN`：AstrBot 可能跑在另一台机器或别人的容器里，不该让它拿着能改后台配置的口令。留空会回退到 `ADMIN_TOKEN`，两个都空只允许本机。

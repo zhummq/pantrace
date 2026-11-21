@@ -122,11 +122,18 @@ site_locations() {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
 
+        # Nginx 默认 1MB。QQ 采集是攒批上报（一批可能上百条消息，单条最长
+        # 10000 字），正文轻松超过 1MB，卡在这里就是 413，而插件只会整批
+        # 重试同一个请求。后端本身不限条数，这里必须放开。
+        client_max_body_size 32m;
+
         proxy_connect_timeout 10s;
-        proxy_send_timeout 90s;
+        proxy_send_timeout 150s;
         # 必须大于后端 REQUEST_TIMEOUT（75 秒）。Nginx 默认 60 秒会先断，
         # 用户看到 504，而那时候上游其实已经扣了费。
-        proxy_read_timeout 90s;
+        # 150 秒同时要盖住采集批量上报：插件按「10 + 条数」秒等后端（上限
+        # 120 秒），反向代理必须比它长，否则批越大越容易被这里先掐断。
+        proxy_read_timeout 150s;
     }
 
     gzip on;

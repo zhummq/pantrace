@@ -2315,11 +2315,15 @@ def _ingest_allowed(request: Request) -> bool:
 
 
 @app.post("/api/ingest/qq", include_in_schema=False)
-async def ingest_qq(payload: QqIngestIn, request: Request):
+def ingest_qq(payload: QqIngestIn, request: Request):
     """接收一批 QQ 群消息，解析出网盘链接入库。
 
     成功只代表「收到并处理了」，不代表每条都进了库：`dropped` 里是没解析出
     链接的原因，`links` 是实际提取到的条数。管理端对账看这两个数。
+
+    刻意写成同步 `def` 而不是 `async def`：解析 + 写库全是同步 sqlite 操作，
+    一批上百条消息、上千个链接时能跑几秒。放在 async 函数里会卡住整个事件
+    循环（同一时刻的搜索请求全排队），FastAPI 对同步 def 会自动丢线程池。
     """
     if not QQ_INGEST_ON:
         return JSONResponse(status_code=503, content={"code": 503, "msg": "QQ 采集已关闭"})
@@ -2329,9 +2333,9 @@ async def ingest_qq(payload: QqIngestIn, request: Request):
     msgs = payload.messages
     if not msgs:
         return {"code": 0, "data": {"added": 0, "touched": 0, "links": 0, "dropped": []}}
-    if len(msgs) > settings.qq_ingest_max_batch:
-        # 超量几乎只有一个原因：配置写成了"上报所有消息"。拒掉比慢慢写库好，
-        # 否则半小时就能把库里塞满闲聊。
+    if settings.qq_ingest_max_batch and len(msgs) > settings.qq_ingest_max_batch:
+        # 0 = 不限（默认）。真配了正数才当护栏用——防的是插件那边群白名单
+        # 被留空、把整个 QQ 的闲聊都上报上来的事故。
         return JSONResponse(
             status_code=413,
             content={
