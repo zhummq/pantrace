@@ -3,47 +3,13 @@
     "description": "PanTrace 服务地址",
     "type": "string",
     "default": "https://你的域名",
-    "hint": "后端根地址，不含结尾斜杠，例如 https://pan.example.com。搜索请求 /api/search，采集上报 /api/ingest/qq。"
-  },
-  "result_limit": {
-    "description": "每次显示条数",
-    "type": "int",
-    "default": 6,
-    "slider": {
-      "min": 1,
-      "max": 10,
-      "step": 1
-    },
-    "hint": "QQ 单条消息不宜太长，建议 5-8 条。"
-  },
-  "timeout": {
-    "description": "搜索超时（秒）",
-    "type": "int",
-    "default": 80,
-    "slider": {
-      "min": 10,
-      "max": 120,
-      "step": 5
-    },
-    "hint": "上游慢的时候接近 60 秒，默认 80 秒留余量，别调太低。"
-  },
-  "cache_ttl": {
-    "description": "结果缓存时长（秒）",
-    "type": "int",
-    "default": 300,
-    "hint": "同一关键词在时限内直接返回缓存，减少打上游。建议 300。"
-  },
-  "cache_maxsize": {
-    "description": "缓存条目上限",
-    "type": "int",
-    "default": 200,
-    "hint": "超过后按最久未使用淘汰。默认 200 足够。"
+    "hint": "后端根地址，不含结尾斜杠，例如 https://pan.example.com。本插件只用它调采集上报接口 /api/ingest/qq。"
   },
   "capture_enabled": {
     "description": "群消息采集",
     "type": "bool",
     "default": false,
-    "hint": "开启后静默监听群消息，把群主/管理员发的网盘分享提取后发给后端入库。关掉后 /搜 照常可用。"
+    "hint": "开启后静默监听群消息，把群主/管理员发的网盘分享提取后发给后端入库。不回复、不拦截，群里其他功能不受影响。"
   },
   "capture_groups": {
     "description": "监听的群号",
