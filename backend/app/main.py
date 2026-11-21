@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from . import analytics, check, feedback, group, guard, library_sync, pan, resolver, source_score, store
 from .config import get_settings
 from .search import engine as search_engine
+from .search import library as library_layer
 from .search.cache import SearchCache
 from .search.pool import WorkerPool
 from .search.registry import close_clients as close_source_clients, load_all as load_sources
@@ -633,14 +634,20 @@ def _export_search(body: dict, background: BackgroundTasks, *, page: int) -> dic
     #    越热、并发越高，放大倍数越大。单飞防住了钱，不能漏了账。
     # 缓存命中则照旧记（body 里没有 shared）——那是用户真的又搜了一次，热度要认。
     if LIBRARY_ON and not body.get("shared"):
-        items = body.get("items") or []
-        if items:
-            background.add_task(store.ingest, items, body.get("query") or "")
+        # 库条目不能再回填库：upsert 会刷新 last_seen_at，而新鲜度是库里打分的
+        # 一项。自己搜自己、自己给自己加新，越热的词越显得新鲜——分数立刻失真。
+        fresh = [it for it in (body.get("items") or []) if not it.get("fromLibrary")]
+        if fresh:
+            background.add_task(store.ingest, fresh, body.get("query") or "")
 
     if not CHECK_ON:
         return _public_body(body)
 
     items = body.get("items") or []
+    # annotate 会把实测失效的直接摘掉。回写库之前必须记住"哪些被摘了"：
+    # 摘掉不落库，库里那条就永远停在 unknown，下次搜索再探一遍、再摘一遍，
+    # 白烧一轮外部请求，而库里还是不知道它是死的。
+    lib_ids = [it["resourceId"] for it in items if it.get("resourceId")]
     kept, dropped = check.annotate(items)
     if dropped or kept is not items:
         body = {**body, "items": kept}
@@ -652,6 +659,14 @@ def _export_search(body: dict, background: BackgroundTasks, *, page: int) -> dic
         # BackgroundTasks 在响应发出后才执行；schedule 内部只做一次 SQLite 读
         # 然后丢给线程池，不会拖住这次响应
         background.add_task(check.schedule, kept)
+    # 本轮探活结论写回库。被摘掉的那些必然是 bad（annotate 只在这一种情况下丢弃），
+    # 所以补一条 bad 进去，让库自己知道这条死了，而不是每轮都重新发现一次。
+    if LIBRARY_ON and lib_ids:
+        alive = {it["resourceId"]: it.get("checkState") for it in kept if it.get("resourceId")}
+        marks = [(rid, state) for rid, state in alive.items() if state]
+        marks += [(rid, check.STATE_BAD) for rid in lib_ids if rid not in alive]
+        if marks:
+            background.add_task(store.mark_check_many, marks)
     return _public_body(body)
 
 # 界面用的平台列表。只放上游实测确认过的 key：
@@ -797,7 +812,11 @@ async def search(
     page: int = Query(1, ge=1, le=100),
     page_size: int = Query(20, ge=1, le=settings.max_page_size),
     search_in: str = Query("title", description="title 或 all"),
-    src: str = Query("tg", description="tg/plugin：tg = 只用 TG（默认）；plugin = 只用海搜接口，不自动降级"),
+    src: str = Query(
+        "tg",
+        description="tg/plugin/library：tg = 只用 TG（默认）；plugin = 只用海搜接口；"
+        "library = 只查本地索引，不烧额度、不自动降级",
+    ),
     refresh: bool = Query(
         False,
         description="跳过响应缓存强制回源。**会真实消耗上游额度**，普通查询不要带",
@@ -842,14 +861,20 @@ async def search(
 
     scope = search_in if search_in in ("title", "all") else "title"
 
-    # 来源通道：只有 tg / plugin 两档，各跑各的，没有"搜不到自动换源"。
+    # 来源通道：tg / plugin / library 三档，各跑各的，没有"搜不到自动换源"。
     # 旧的 auto/all 已随降级链路一起移除，传进来回 400 —— 静默当某档处理
     # 会让调用方以为筛了通道，其实没筛，也掩盖了还在用旧参数的客户端。
     source = src
-    if source not in ("tg", "plugin"):
+    if source not in ("tg", "plugin", "library"):
         return JSONResponse(
             status_code=400,
-            content={"code": 400, "msg": f"未知的来源类型：{src}（可用 tg/plugin）"},
+            content={"code": 400, "msg": f"未知的来源类型：{src}（可用 tg/plugin/library）"},
+        )
+    # 库没开就别往下走：单飞锁会为它建键、占配额，最后抛一个本可以在门口挡掉的错。
+    if source == "library" and not LIBRARY_ON:
+        return JSONResponse(
+            status_code=400,
+            content={"code": 400, "msg": "本地库未启用（LIBRARY_ENABLED=0 或初始化失败）"},
         )
 
     # 缓存键必须带通道：两档各查各的，不带的话 src=tg 的结果会顶掉
@@ -917,17 +942,32 @@ async def search(
         要改它必须先 `dict()` 复制。异常原样往外抛：失败也要广播给搭车的请求，
         否则它们各自重试，等于这把锁白加。
         """
-        # engine 只跑用户选的那一档，不做自动降级。
+        # 三档各跑各的，不做自动降级。
         # 每个源自己的窗口负责"别让用户干等"，超时未跑完的源会在后台继续抓并写缓存。
-        result = await search_engine.search(
-            query,
-            platform_list,
-            page,
-            page_size,
-            scope,
-            source=source,
-            force_refresh=force,
-        )
+        if source == "library":
+            # 库检索是同步 SQLite。必须丢线程：80 万行的 FTS + 打分排序跑在事件
+            # 循环线程里，会把整个进程卡住，所有并发请求一起排队。
+            result = await asyncio.to_thread(
+                library_layer.search, query, platform_list, page, page_size
+            )
+            # 命中记录放在这里而不是 library 层：_run_search 只有单飞的 leader 会
+            # 执行，follower 搭车不算"又搜了一次"。channel 单独记成 local，
+            # 否则"库到底在兜什么"这件事永远看不出来。
+            ids = [it["resourceId"] for it in result["items"] if it.get("resourceId")]
+            if ids:
+                background.add_task(
+                    store.record_hits, ids, query, channel=store.CHANNEL_LOCAL
+                )
+        else:
+            result = await search_engine.search(
+                query,
+                platform_list,
+                page,
+                page_size,
+                scope,
+                source=source,
+                force_refresh=force,
+            )
         body = {
             "code": 0,
             "msg": "",

@@ -36,6 +36,9 @@ const PREF_KEY = 'pt_pref_platform'
 const SOURCE_OPTIONS = [
   { key: 'tg', label: '实时', hint: '搜最近分享，更新快；没找到可以换全网' },
   { key: 'plugin', label: '全网', hint: '覆盖更全，冷门资源也容易命中' },
+  // 本地库：站内已收录的索引，不发上游请求、秒回。代价是新鲜度不如前两档，
+  // 而且链接存活要等本次搜索的探活跑完才有角标（几秒后自动刷新那一屏）。
+  { key: 'library', label: '本地库', hint: '站内已收录的索引，秒出结果；链接在本次搜索时实测' },
 ]
 const DEFAULT_SOURCE = 'tg'
 const SOURCE_PREF_KEY = 'pt_pref_source'
@@ -73,6 +76,9 @@ let elapsedTimer = null
 const busy = computed(() => loading.value || refreshing.value)
 
 const resultLabel = computed(() => {
+  // 库这一档必须自己说清楚：叫"实时结果"是假的，叫"缓存结果"也不对——
+  // 它不是缓存，是一份独立的索引。命中进程缓存也照样是本地索引。
+  if (activeSource.value === 'library') return '本地索引'
   if (shared.value) return '并发合并'
   if (cached.value) return '缓存结果'
   return '实时结果'
@@ -764,7 +770,11 @@ onBeforeUnmount(() => {
           <span class="scan-label mono">SCANNING</span>
           <span class="scan-count mono" v-if="elapsed">{{ elapsed }}s</span>
         </div>
-        <p class="loading-hint">正在检索 {{ activePlatformName }}，通常 1–3 秒。</p>
+        <p class="loading-hint">
+          {{ activeSource === 'library'
+            ? `正在翻本地索引（${activePlatformName}）…`
+            : `正在检索 ${activePlatformName}，通常 1–3 秒。` }}
+        </p>
         <div class="scan-track" aria-hidden="true"><i></i></div>
         <div class="skeleton-list">
           <div v-for="i in 4" :key="i" class="skeleton">
@@ -780,6 +790,11 @@ onBeforeUnmount(() => {
         <p class="state-desc">{{ error }}</p>
         <div class="state-actions">
           <button class="retry" @click="retry">重试一次</button>
+          <!-- 上游挂了不等于站上什么都没有：本地索引还在。但这是给用户的一条
+               手动出口，不是自动降级——他不会在不知情的情况下看到旧数据。 -->
+          <button v-if="activeSource !== 'library'" class="link" @click="pickSource('library')">
+            先看本地库
+          </button>
           <button class="link" @click="openFeedback('bug', { error })">上报这个错误</button>
         </div>
       </div>
@@ -790,8 +805,16 @@ onBeforeUnmount(() => {
         <p v-if="filtered > 0" class="state-desc">
           搜到 {{ filtered }} 条，但标题里都没提这个词。换个更短的说法，比如只留片名。
         </p>
+        <!-- 库搜空了要给出口，不能只说"换个关键词"：用户选的是本地库，
+             他真正需要知道的是"去实时源现取"这条路。 -->
+        <p v-else-if="activeSource === 'library'" class="state-desc">
+          {{ activePlatformName }}的本地索引里还没有这个词。换成「实时」或「全网」，那是现去网上取的。
+        </p>
         <p v-else class="state-desc">换个关键词试试，或者换一个网盘再搜。</p>
-        <button class="retry" @click="backToPlatforms">换个网盘</button>
+        <button v-if="activeSource === 'library'" class="retry" @click="pickSource('tg')">
+          换实时源再搜
+        </button>
+        <button v-else class="retry" @click="backToPlatforms">换个网盘</button>
         <p class="state-more">
           都没有？
           <button class="link" @click="openFeedback('request')">告诉我你要找什么</button>

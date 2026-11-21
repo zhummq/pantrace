@@ -105,6 +105,11 @@ SOURCE_LEVEL_SCORE = {1: 300, 2: 150, 3: 0, 4: -100}
 # 新鲜度阶梯：(天数上限, 分数)。按 last_seen_at 算，不看源站时间。
 FRESH_STEPS = ((7, 150), (30, 80), (90, 40), (365, 15))
 
+# 判坏的隐藏期。必须与 `check.py` 的 bad TTL 对齐（6 小时），不能永久隐藏：
+# 永远不出现 = 永远不会被重新探活 = 这条资源死锁在库里，误判也没有自愈的机会。
+# 过期后放出来，下一轮搜索的探活会重新给它下结论。
+BAD_HIDE_TTL = 6 * 3600
+
 # 平台 key 的别名。`sdk/urls.py` 解析 139 云盘返回 `c139`，但项目对外统一叫
 # `yidong`（PLATFORM_NAMES 里就是这个名字），入库前对齐，否则按平台筛选会漏。
 _PLATFORM_ALIAS = {"c139": "yidong", "aliyun": "ali", "mobile": "yidong"}
@@ -649,6 +654,46 @@ def mark_check(resource_id: int, state: str, *, now: int | None = None) -> None:
         )
 
 
+def mark_check_many(pairs: list[tuple[int, str]], *, now: int | None = None) -> int:
+    """批量回写探活结论，返回实际写入条数。
+
+    搜索出口用：一次 annotate 会拿到一页里所有已知结论，逐条 `mark_check`
+    等于一页开 20 次连接。这里一次 executemany 收掉。
+
+    只写库里的条目（带 `resourceId` 的那些）。上游条目的结论归 `link_check`
+    表管——上游结果每轮都可能换一批，库里这条却要长期跟踪，两本账不能互相盖。
+
+    `revive_count` 在 SQL 里用 CASE 算，靠 SQLite 的"SET 右侧读旧值"语义；
+    拆成先查后写会让每页多一轮 RTT，批量回调不值得。
+    """
+    if not pairs:
+        return 0
+    stamp = int(now if now is not None else time.time())
+    # 参数：(新状态, 时间, CASE 里比对的"坏"状态, 新状态是否 ok, id)
+    rows = [
+        (state, stamp, STATE_BAD, 1 if state == STATE_OK else 0, int(rid))
+        for rid, state in pairs
+        if rid
+    ]
+    if not rows:
+        return 0
+    try:
+        with _write_lock, _session() as conn:
+            conn.executemany(
+                "UPDATE resources SET check_state = ?, check_at = ?, "
+                "revive_count = revive_count + "
+                "CASE WHEN check_state = ? AND ? THEN 1 ELSE 0 END "
+                "WHERE id = ?",
+                rows,
+            )
+        return len(rows)
+    except sqlite3.Error as exc:
+        # 探活结论没写回去不影响这次搜索，但必须留痕：静默失败会让"库里的状态
+        # 永远停在 unknown"变成一个查不出原因的谜。
+        log.warning("批量回写探活结论失败：%s", exc)
+        return 0
+
+
 # ---------------------------------------------------------------- 检索
 
 
@@ -678,9 +723,12 @@ def search(
         "  SELECT rowid FROM resources_fts WHERE resources_fts MATCH ?",
         "  ORDER BY bm25(resources_fts) LIMIT ?",
         ") m ON m.rowid = r.id",
-        "WHERE r.archived_at = 0 AND r.check_state NOT IN (%s)" % ",".join("?" * len(HIDDEN_STATES)),
+        # 失效条目只在 TTL 内隐藏。写成 `NOT IN (...)` 是永久隐藏，和探活的
+        # 6 小时自愈对立：藏起来就再也不会被搜到、也就永远等不到重新检测。
+        "WHERE r.archived_at = 0 AND NOT (r.check_state IN (%s) AND r.check_at > ?)"
+        % ",".join("?" * len(HIDDEN_STATES)),
     ]
-    params: list = [expr, limit, *HIDDEN_STATES]
+    params: list = [expr, limit, *HIDDEN_STATES, stamp - BAD_HIDE_TTL]
 
     wanted = [platform_key(p) for p in (platforms or []) if p]
     if wanted:
@@ -758,6 +806,9 @@ def _to_item(row: sqlite3.Row) -> dict:
         "platform": platform,
         "platformName": PLATFORM_NAMES.get(platform, "其他"),
         "title": row["title"],
+        # 分享 id。前端用不到，但跨源合并要靠它判"这条上游结果库里已经有了"。
+        # 身份是 platform:pwd_id，不是 URL —— 同一条分享在不同渠道有不同短链。
+        "pwdId": row["pwd_id"],
         "shareUrl": row["url"],
         "shareCode": "",
         "sharePwd": row["pwd"],

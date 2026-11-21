@@ -71,7 +71,7 @@ npm run dev
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/search?q=关键词&platforms=quark,baidu&page=1&page_size=20` | 搜索。`src=auto\|tg\|plugin` 选通道，`refresh=1`（或 pansou 叫法 `force_refresh=true`）跳过响应缓存强制回源，**会真实消耗额度** |
+| GET | `/api/search?q=关键词&platforms=quark,baidu&page=1&page_size=20` | 搜索。`src=tg\|plugin\|library` 选通道（`library` 只查本地索引，**不烧额度**），`refresh=1`（或 pansou 叫法 `force_refresh=true`）跳过响应缓存强制回源，**会真实消耗额度** |
 | GET | `/api/platforms` | 平台列表（前端筛选用） |
 | GET | `/api/health` | 健康检查 |
 | GET | `/api/ticket` | 领匿名票据（前端进站静默调用，返回 `ticket` + `expiresIn`） |
@@ -97,7 +97,9 @@ npm run dev
 
 取数走 `backend/app/search/`（pansou 的插件机制：每源独立响应窗口、`complete` 语义缓存、失败分类、合并去重）。`providers.py` 现在只负责上游协议（拼请求体 / 鉴权头 / 返回码归一化），**不发请求**。启用哪些源由 `ENABLED_SOURCES` 决定，空 = 全关，默认 `tg_searchers,haisou`。
 
-**通道是分层的，不是并行的**：`tg_searchers` 是基础通道（免费无额度），`haisou` 是按量计费的兜底。同时启用时先跑 TG，拿到可用结果就结束——一次接口都不调；TG 不可达 / 零结果 / 没有用户要的网盘，才去调 haisou。`/api/search?src=` 可以强制单通道：`auto`（默认，分层）、`tg`（零成本）、`plugin`（只走计费）。响应里的 `tier` 告诉你这一轮花的钱是 TG 挣的还是 haisou 换的。
+**通道是三档，各跑各的，没有自动降级**：`src=tg`（只跑 TG 公开频道，零额度，默认）、`src=plugin`（只走 haisou 计费接口）、`src=library`（只查本地资源库索引，秒回、零额度）。**搜不到不会偷偷换源**——换源是用户自己的决定。响应里的 `tier` 告诉你这一轮走的是哪条路。
+
+`library` 这一档不碰上游，也不做统一批量探活：库里的链接有没有失效，走的是搜索时那一次异步探活——`_export_search` 统一 `check.annotate()` 贴结论、`check.schedule()` 后台探，结论写回 `link_check` 与 `resources.check_state`，前端 6s / 16s 后补拉一屏把「可访问 / 已失效」角标刷出来。判坏的隐藏 6 小时（与 `check.py` 的 bad TTL 对齐），过期自动放出来重新检测——**永久隐藏会让误判永远没有自愈的机会**。
 
 **同一条查询同时来多个请求时，只打一次上游**（`search/singleflight.py`，对应 pansou 的 `main_cache_lock.go`）。缓存未命中期间的并发请求里，第一个当 leader 真去取数，其余搭车拿同一份结果（响应带 `shared: true`、`tookMs: 0`）。触发条件是用户连点、首屏多个组件同时发、或者有人拿脚本刷同一个词——正是最容易把额度烧成倍数的地方。leader 失败时搭车的一起失败，不会各自重试（那会把一次失败放大成 N 倍计费）；follower 等超过 30 秒会自己降级跑一遍，不会被 leader 拖死。
 
