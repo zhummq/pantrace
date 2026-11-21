@@ -97,12 +97,43 @@ const searched = ref(false)
 const showEmpty = computed(() => !loading.value && !error.value && searched.value && items.value.length === 0)
 const sourceCount = computed(() => platforms.value.length)
 
+// ---- 空结果时的通道排查 ----
+// 记下这个关键词下已经走过哪几条通道。只在第 1 页记：翻页是同一档的延续，
+// 不算一次新的尝试。换词即清空——上一轮试过什么，跟新词没关系。
+const triedSources = ref([])
+
+// 没试过的通道要摆回用户眼前：他此刻刚被某一条通道否了一次，
+// 这时候让他滚回首屏找开关，等于把"提示"和"动作"拆成两个人完成。
+const untriedSources = computed(() =>
+  SOURCE_OPTIONS.filter((s) => !triedSources.value.includes(s.key))
+)
+// 三档全空：再喊"换来源"就是死路，出口只剩求资源。
+const allSourcesTried = computed(() => triedSources.value.length >= SOURCE_OPTIONS.length)
+
 // 加载文案里点名在查哪个盘：单平台查询时"正在聚合各平台"是假的，
 // 用户也该知道自己这次等的是哪个盘的结果。
 const activePlatformName = computed(() => {
   const p = platforms.value.find((x) => x.key === activePlatform.value)
   return p?.name || '网盘'
 })
+
+// 结果面板顶部那条常驻提示：一句话 + 一个动作，不滚。
+// 三句轮播用户只来得及看一句，不如把最该做的那件事直接做成可点的按钮。
+// 推荐哪一档要看用户还剩哪档没查——已经切到全网了还劝他换全网，等于没看。
+const switchHint = computed(() => {
+  const next = untriedSources.value[0]
+  if (next) {
+    return { text: `这一屏没有想要的？换「${next.label}」再查一次`, cta: `换${next.label}`, key: next.key }
+  }
+  // 三档都查过了，再推换源就是死路，出口只能是求资源
+  return { text: '三条通道都查过了还是没有？把片名告诉我，人工找', cta: '求资源', key: '' }
+})
+
+function actOnHint() {
+  if (busy.value) return
+  if (switchHint.value.key) pickSource(switchHint.value.key)
+  else openFeedback('request')
+}
 
 const totalText = computed(() =>
   total.value > 0 ? total.value.toLocaleString('zh-CN') : String(total.value)
@@ -335,7 +366,13 @@ async function doSearch(targetPage = 1, opts = {}) {
   error.value = ''
   searched.value = true
   page.value = targetPage
+  // 换词 = 一轮新的排查，上一轮试过哪几档不再作数；同一轮里只在第 1 页
+  // 记一次"这一档查过"，翻页不重复记。
+  if (q !== lastKeyword.value) triedSources.value = []
   lastKeyword.value = q
+  if (targetPage === 1 && !triedSources.value.includes(activeSource.value)) {
+    triedSources.value.push(activeSource.value)
+  }
 
   // 刷新不启动秒表：结果面板没消失，没有"等了多久"这一说。
   if (!force) {
@@ -538,6 +575,15 @@ function retry() {
   doSearch(page.value)
 }
 
+// 空结果里"改关键词"的出口：把焦点送进搜索框并全选旧词，
+// 直接敲就是新词，用户不用先找到那个框再手动删。
+function focusSearch() {
+  const el = document.querySelector('.searchbar input')
+  if (!el) return
+  el.focus()
+  el.select()
+}
+
 function quickSearch(word) {
   if (busy.value) return
   keyword.value = word
@@ -548,6 +594,8 @@ function resetHome() {
   keyword.value = ''
   searched.value = false
   activePlatform.value = ''
+  // 回首页等于放弃这一轮排查，痕迹一起清掉
+  triedSources.value = []
   history.replaceState(null, '', '/')
 }
 
@@ -801,23 +849,58 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <div v-else-if="showEmpty" class="state">
+      <div v-else-if="showEmpty" class="state state-empty">
         <div class="state-icon empty">∅</div>
         <p class="state-title">没有找到「{{ lastKeyword }}」</p>
+
+        <!-- 三种空法，解法不一样，别用一句万能话糊过去：
+             标题不含词 → 改说法；本地库没收录 → 换现取的通道；
+             通道没命中 → 换另一条通道。 -->
         <p v-if="filtered > 0" class="state-desc">
           搜到 {{ filtered }} 条，但标题里都没提这个词。换个更短的说法，比如只留片名。
         </p>
-        <!-- 库搜空了要给出口，不能只说"换个关键词"：用户选的是本地库，
-             他真正需要知道的是"去实时源现取"这条路。 -->
         <p v-else-if="activeSource === 'library'" class="state-desc">
-          {{ activePlatformName }}的本地索引里还没有这个词。换成「实时」或「全网」，那是现去网上取的。
+          {{ activePlatformName }}的本地索引没有这个词，下面 {{ untriedSources.length }} 条通道是现去网上取的。
         </p>
-        <p v-else class="state-desc">换个关键词试试，或者换一个网盘再搜。</p>
-        <button v-if="activeSource === 'library'" class="retry" @click="pickSource('tg')">
-          换实时源再搜
-        </button>
-        <button v-else class="retry" @click="backToPlatforms">换个网盘</button>
-        <p class="state-more">
+        <p v-else class="state-desc">
+          先别急着换关键词，问题多半出在通道上。
+        </p>
+
+        <!-- 未试通道：把首屏那排开关复制到事故现场。点一下就是一次真实查询
+             （pickSource 内部会重查），用户不用先滚回去、再记住自己搜的是什么。
+             filtered > 0 时不显示——那种情况换源一样会被标题过滤，正解是改词。 -->
+        <div v-if="filtered === 0 && untriedSources.length" class="alt-sources">
+          <p class="alt-label mono">还有 {{ untriedSources.length }} 条通道没查</p>
+          <div class="alt-list">
+            <button
+              v-for="s in untriedSources"
+              :key="s.key"
+              type="button"
+              class="alt-src"
+              :disabled="busy"
+              @click="pickSource(s.key)"
+            >
+              <span class="alt-src-main">{{ s.label }}</span>
+              <span class="alt-src-hint">{{ s.hint }}</span>
+              <span class="alt-src-go">用这条重查</span>
+            </button>
+          </div>
+        </div>
+
+        <div v-if="filtered > 0" class="state-actions">
+          <button class="retry" @click="focusSearch">改个关键词</button>
+          <button class="link" @click="backToPlatforms">换个网盘</button>
+        </div>
+        <!-- 三档全试过还空：这时候再推"换来源"就是死路，把求资源升成主按钮 -->
+        <div v-else-if="allSourcesTried" class="state-actions">
+          <button class="retry" @click="openFeedback('request')">告诉我你要找什么</button>
+          <button class="link" @click="backToPlatforms">换个网盘</button>
+        </div>
+        <div v-else class="state-actions">
+          <button class="link" @click="backToPlatforms">换个网盘再搜</button>
+        </div>
+
+        <p v-if="filtered > 0 || !allSourcesTried" class="state-more">
           都没有？
           <button class="link" @click="openFeedback('request')">告诉我你要找什么</button>
         </p>
@@ -861,6 +944,23 @@ onBeforeUnmount(() => {
           </svg>
           <span>网盘链接 <b>30 分钟</b>内有效，过期可重新获取。</span>
         </p>
+
+        <!-- 常驻提示：一句话 + 一个动作，整行可点。不滚动——三句轮播
+             用户只来得及看半句，不如把该做的那件事直接做成按钮。
+             摆在列表正上方：开始往下扫之前正好扫到。 -->
+        <button type="button" class="switch-hint" :disabled="busy" @click="actOnHint">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 16v-4M12 8h.01" />
+          </svg>
+          <span class="sh-text">{{ switchHint.text }}</span>
+          <span class="sh-cta">
+            {{ switchHint.cta }}
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m9 6 6 6-6 6" />
+            </svg>
+          </span>
+        </button>
 
         <div class="result-list">
           <ResultCard
@@ -1615,6 +1715,75 @@ onBeforeUnmount(() => {
   color: var(--ink-2);
 }
 
+/* 常驻换源提示：整行可点，不用去瞄一个小按钮。
+   和 ttl-note 同构（通栏 + 底边框），但它是动作不是说明——静止态保持
+   同一档视觉重量，hover 才给底色，免得面板头上摞两块灰。 */
+.switch-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px var(--sp-5);
+  border: none;
+  border-bottom: 1px solid var(--line);
+  background: transparent;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--muted);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-2) var(--ease),
+    color var(--dur-2) var(--ease);
+}
+
+/* 图标压到 faint：这一行只能有一个亮点，留给右侧的动作，
+   否则左边的图标和 CTA 一起发光，用户反倒不知道该点哪 */
+.switch-hint > svg {
+  flex: none;
+  color: var(--faint);
+}
+
+.switch-hint:hover:not(:disabled) {
+  background: rgb(var(--a-rgb) / 0.06);
+  color: var(--ink-2);
+}
+
+.switch-hint:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--brand-ring);
+}
+
+.switch-hint:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.sh-text {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 动作单独成块：整行可点，但得让"点了会发生什么"看得见 */
+.sh-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--brand-ink);
+  white-space: nowrap;
+}
+
+.sh-cta svg {
+  transition: transform var(--dur-2) var(--ease);
+}
+
+.switch-hint:hover:not(:disabled) .sh-cta svg {
+  transform: translateX(2px);
+}
+
 .result-list {
   display: flex;
   flex-direction: column;
@@ -1812,7 +1981,9 @@ onBeforeUnmount(() => {
 }
 
 .state-icon.empty {
-  color: var(--faint);
+  border-color: var(--brand-ring);
+  background: rgb(var(--a-rgb) / 0.08);
+  color: var(--brand-ink);
 }
 
 .error-state .state-icon {
@@ -1848,6 +2019,94 @@ onBeforeUnmount(() => {
   margin-top: var(--sp-4);
   font-size: var(--text-base);
   color: var(--muted);
+}
+
+/* ---------- 空状态：未试通道 ---------- */
+
+/* 搜不到不是错误，是"这条路走不通、旁边还有两条"。所以整块用品牌青，
+   不用红橙——橙色只表示警示，把"没搜到"染成警告色会让用户以为站挂了。
+   底色停在 4%：要抢眼，但不能抢过下面真正有结果时的面板。 */
+.state-empty {
+  padding: var(--sp-7) var(--sp-5);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgb(var(--a-rgb) / 0.04);
+}
+
+.alt-sources {
+  max-width: 560px;
+  margin: var(--sp-6) auto 0;
+}
+
+.alt-label {
+  margin-bottom: var(--sp-3);
+  font-size: var(--text-2xs);
+  letter-spacing: 0.14em;
+  color: var(--brand-ink);
+}
+
+.alt-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+/* 每条通道一行：名字在前、说明居中、动作在右。
+   静止态只给淡青描边，hover 才填——和结果列表的主操作同一套规矩，
+   一屏摞两三个实心亮绿按钮会变成糖豆墙。 */
+.alt-src {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  padding: 11px 14px;
+  border: 1px solid var(--brand-ring);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  text-align: left;
+  transition:
+    background-color var(--dur-2) var(--ease),
+    border-color var(--dur-2) var(--ease);
+}
+
+.alt-src:hover:not(:disabled) {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.alt-src:focus-visible {
+  outline: none;
+  box-shadow: var(--ring);
+}
+
+.alt-src:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.alt-src-main {
+  /* 定宽对齐：「本地库」三字比「实时」宽一格，不撑开的话
+     换档时说明文字的起点会跟着跳 */
+  min-width: 3em;
+  font-size: var(--text-base);
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.alt-src-hint {
+  overflow: hidden;
+  font-size: var(--text-xs);
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alt-src-go {
+  font-size: var(--text-xs);
+  color: var(--brand-ink);
+  white-space: nowrap;
 }
 
 .retry {
@@ -2117,6 +2376,29 @@ onBeforeUnmount(() => {
 
   .pg-info {
     display: none;
+  }
+
+  /* 通道卡在手机上收成两行：说明独占第二行，别被挤成一串省略号 */
+  .alt-src {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 3px;
+    padding: 10px 12px;
+  }
+
+  .alt-src-main {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  .alt-src-go {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .alt-src-hint {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    white-space: normal;
   }
 
   .intro {
