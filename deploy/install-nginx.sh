@@ -18,6 +18,10 @@
 #                                                       # 申请 Let's Encrypt 证书 + 强制跳 HTTPS
 #   sudo ./deploy/install-nginx.sh --print              # 只打印配置，不动系统
 #
+# 注意：现有配置里已经有 listen 443 时，不带 --domain/--ssl 直接跑会被拒绝——
+# 那样会把手上的 HTTPS 站点覆盖成纯 HTTP。真要从 HTTPS 退回 HTTP 得显式
+# 加 --allow-downgrade。
+#
 # 日常更新（前端或后端都一样，不再需要任何同步步骤）：
 #   cd /opt/pantrace && sudo -u pantrace git pull
 #   sudo systemctl restart pantrace
@@ -30,6 +34,7 @@ ROOT_ARG=""
 PRINT_ONLY=0
 SSL=0
 EMAIL=""
+ALLOW_DOWNGRADE=0
 
 usage() {
   cat <<'EOF'
@@ -42,6 +47,7 @@ usage() {
   --name NAME      站点名，决定配置文件名（默认 pantrace）
   --port PORT      后端监听端口（默认 8000）
   --root DIR       项目根目录（默认：本脚本的上一级目录）
+  --allow-downgrade 允许把手上的 HTTPS 站点覆盖成纯 HTTP（默认拒绝）
   --print          只输出 nginx 配置到屏幕，不写入、不 reload
   -h, --help       显示本帮助
 EOF
@@ -55,6 +61,7 @@ while [ $# -gt 0 ]; do
     --name)    SITE_NAME="${2:?--name 需要参数}"; shift ;;
     --port)    BACKEND_PORT="${2:?--port 需要参数}"; shift ;;
     --root)    ROOT_ARG="${2:?--root 需要参数}"; shift ;;
+    --allow-downgrade) ALLOW_DOWNGRADE=1 ;;
     --print)   PRINT_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数: $1" >&2; usage; exit 1 ;;
@@ -73,6 +80,22 @@ ACME_DIR="/var/www/letsencrypt-acme"
 if [ "$SSL" != "1" ] && [ "$DOMAIN" != "_" ] && [ -f "$LE_DIR/fullchain.pem" ]; then
   SSL=1
   echo "检测到 $DOMAIN 已有证书，继续启用 HTTPS（不想的话先删掉 $LE_DIR 或手动改配置）"
+fi
+
+# ---- 降级保护：别把线上 HTTPS 站点悄悄改成纯 HTTP ----
+# 踩过的坑：线上已经跑着 443，有人为了改 client_max_body_size 直接跑了一次
+# `./deploy/install-nginx.sh`（没带 --domain/--ssl），脚本按默认值写了一份
+# 只有 listen 80 的配置，443 的 server 块被覆盖，证书还在但没人引用，
+# 浏览器直接连不上。这种"参数少写一个就断站"的行为不能留在脚本里。
+# 位置必须放在上面的自动启用 HTTPS 之后：`--domain` 单独给时那一步会把
+# SSL 打开，这里再拦就误伤了。
+if [ "$PRINT_ONLY" != "1" ] && [ "$SSL" != "1" ] && [ "$ALLOW_DOWNGRADE" != "1" ] && [ -f "$CONF" ]; then
+  if grep -q "listen 443" "$CONF"; then
+    echo "!! $CONF 里已有 HTTPS 配置，这次要写的是纯 HTTP，会把 443 覆盖掉。" >&2
+    echo "   要保留 HTTPS：加上 --domain <域名> --ssl 重跑（证书已存在会直接复用）。" >&2
+    echo "   确实要降级成 HTTP：加 --allow-downgrade。" >&2
+    exit 1
+  fi
 fi
 
 # ---- 前置检查 ----
