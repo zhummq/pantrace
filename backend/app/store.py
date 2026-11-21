@@ -165,6 +165,11 @@ CREATE TABLE IF NOT EXISTS resources (
     size_bytes    INTEGER NOT NULL DEFAULT 0,
     source_name   TEXT    NOT NULL DEFAULT '',
     source_level  INTEGER NOT NULL DEFAULT 3,
+    -- 这条资源是从哪个入口进来的：qq / tg / doc / plugin / upstream。
+    -- 和 resource_hits.channel 不是一回事：那个记的是"通过哪条通道被搜到"，
+    -- 会随每次搜索变化；这个是"第一次入库时从哪来"，一条资源只有一次。
+    -- 分开命名（origin）就是为了不让两个口径混在一个字段里。
+    origin        TEXT    NOT NULL DEFAULT 'upstream',
     check_state   TEXT    NOT NULL DEFAULT 'unknown',
     check_at      INTEGER NOT NULL DEFAULT 0,
     first_seen_at INTEGER NOT NULL,
@@ -180,6 +185,8 @@ CREATE INDEX IF NOT EXISTS idx_res_seen     ON resources(last_seen_at DESC);
 CREATE INDEX IF NOT EXISTS idx_res_hot      ON resources(hit_count DESC);
 -- 按天统计新增要按 first_seen_at 过滤。不加这条，每次打开面板都要全表扫 38 万行
 CREATE INDEX IF NOT EXISTS idx_res_first    ON resources(first_seen_at);
+-- 今日更新的"按来源分组"和按来源筛选都走这条
+CREATE INDEX IF NOT EXISTS idx_res_origin   ON resources(origin, first_seen_at);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS resources_fts USING fts5(
     title, tk, tokenize='unicode61'
@@ -235,6 +242,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_doc_sources ON doc_sources(pad_id, tab_id);
 CHANNEL_UPSTREAM = "upstream"  # 上游结果带出来的（现在唯一在用的）
 CHANNEL_LOCAL = "local"        # 本地库自己检索出来的（P1 起使用）
 
+# 资源来源（resources.origin）。白名单，不认自由字段：写错一个值，
+# 今日更新页的分组里就会凭空多出一个没人认识的来源。
+ORIGIN_UPSTREAM = "upstream"   # 搜索影子回填
+ORIGIN_PLUGIN = "plugin"       # 海搜接口带回来的上游结果
+ORIGIN_TG = "tg"               # TG 频道采集
+ORIGIN_DOC = "doc"             # 腾讯文档订阅
+ORIGIN_QQ = "qq"               # QQ 群采集（AstrBot）
+
+ORIGIN_NAMES = {
+    ORIGIN_UPSTREAM: "上游回填",
+    ORIGIN_PLUGIN: "全网搜索",
+    ORIGIN_TG: "TG 频道",
+    ORIGIN_DOC: "表格订阅",
+    ORIGIN_QQ: "QQ 群",
+}
+# 展示顺序：人工筛过的排前面，爬来的排后面
+ORIGIN_ORDER = (ORIGIN_QQ, ORIGIN_TG, ORIGIN_DOC, ORIGIN_PLUGIN, ORIGIN_UPSTREAM)
+
+
+def normalize_origin(raw: object) -> str:
+    """把调用方给的 sourceKind / origin 归一成白名单值。
+
+    `unknown`（adapter 对不认识的上游给的标记）和空值都落到 upstream：
+    它们是"从搜索链路进来的"，归到上游回填没有错。
+    """
+    value = str(raw or "").strip().lower()
+    return value if value in ORIGIN_NAMES else ORIGIN_UPSTREAM
+
 
 def _has_table(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute(
@@ -257,6 +292,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """
     _migrate_hits_channel(conn)
     _migrate_doc_columns(conn)
+    _migrate_res_origin(conn)
+
+
+def _migrate_res_origin(conn: sqlite3.Connection) -> None:
+    """给老库补 `origin` 列。
+
+    老数据没有这个信息，一律标成 upstream —— 这是**事实**：那时候只有一个
+    入口（搜索影子回填）。不要试图用 source_level 反推：level=1 既可能是
+    TG 自建频道也可能是 QQ 群，猜出来的分组比没有更糟。
+    """
+    if not _has_table(conn, "resources"):
+        return
+    if _has_column(conn, "resources", "origin"):
+        return
+    conn.execute(
+        "ALTER TABLE resources ADD COLUMN origin TEXT NOT NULL DEFAULT 'upstream'"
+    )
 
 
 def _migrate_hits_channel(conn: sqlite3.Connection) -> None:
@@ -432,6 +484,9 @@ def _prepare(rows: list[dict], now: int) -> list[dict]:
         level = _int(row.get("source_level") or row.get("sourceLevel"), default=3) or 3
         level = min(max(level, 1), 4)
         source_name = (row.get("source_name") or row.get("sourceName") or "").strip()
+        origin = normalize_origin(
+            row.get("origin") or row.get("source_kind") or row.get("sourceKind")
+        )
 
         cur = merged.get(key)
         if cur is None:
@@ -447,6 +502,7 @@ def _prepare(rows: list[dict], now: int) -> list[dict]:
                 "size_bytes": size_bytes,
                 "source_name": source_name,
                 "source_level": level,
+                "origin": origin,
                 "now": now,
             }
             continue
@@ -464,6 +520,10 @@ def _prepare(rows: list[dict], now: int) -> list[dict]:
         cur["size_bytes"] = cur["size_bytes"] or size_bytes
         cur["source_level"] = min(cur["source_level"], level)
         cur["source_name"] = cur["source_name"] or source_name
+        # 同批撞车时留更"靠前"的来源（人工筛过的优先）：一条资源被群里发过、
+        # 又被搜索爬到，记成 QQ 群比记成上游回填更有信息量。
+        if ORIGIN_ORDER.index(origin) < ORIGIN_ORDER.index(cur["origin"]):
+            cur["origin"] = origin
 
     return list(merged.values())
 
@@ -514,15 +574,15 @@ def upsert_many(rows: list[dict], *, now: int | None = None) -> dict:
                     """
                     INSERT INTO resources
                       (dedup_key, platform, pwd_id, title, aliases, url, pwd,
-                       file_count, size_bytes, source_name, source_level,
+                       file_count, size_bytes, source_name, source_level, origin,
                        first_seen_at, last_seen_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         p["dedup_key"], p["platform"], p["pwd_id"], p["title"],
                         json.dumps(p["aliases"], ensure_ascii=False) if p["aliases"] else "",
                         p["url"], p["pwd"], p["file_count"], p["size_bytes"],
-                        p["source_name"], p["source_level"], stamp, stamp,
+                        p["source_name"], p["source_level"], p["origin"], stamp, stamp,
                     ),
                 )
                 rid = int(cur.lastrowid)
@@ -817,8 +877,123 @@ def _to_item(row: sqlite3.Row) -> dict:
         "indexedTime": "",
         "fromLibrary": True,
         "checkState": row["check_state"],
+        # 入库入口（qq / tg / doc / plugin / upstream）。管理端和今日更新页
+        # 都靠它分组；老库补齐后是 upstream。
+        "origin": row["origin"],
+        "originName": ORIGIN_NAMES.get(row["origin"], "上游回填"),
         "resourceId": int(row["id"]),
     }
+
+
+# ---------------------------------------------------------------- 今日更新
+
+
+def recent(
+    *,
+    since: int,
+    until: int | None = None,
+    limit: int = 30,
+    offset: int = 0,
+    origin: str = "",
+    now: int | None = None,
+) -> dict:
+    """按入库时间倒序列出新增资源。今日更新页用。
+
+    和 `search()` 是两件不同的事：那个按相关性和热度排序，是"找东西"；
+    这个就是**最新的在前**，是"看看今天进了什么"。混用会让人以为今天的
+    更新被某种算法排过序，其实没有。
+
+    失效条目的隐藏规则和 search 保持一致（同一套 HIDDEN_STATES + TTL），
+    否则同一个链接在搜索结果里看不见、在今日更新里却摆着，用户会以为
+    是两套数据。
+    """
+    if not _inited:
+        return {"items": [], "total": 0}
+
+    stamp = int(now if now is not None else time.time())
+    end = int(until if until is not None else stamp)
+    limit = min(max(1, _int(limit, 30)), 100)
+    offset = max(0, _int(offset, 0))
+
+    where = [
+        "first_seen_at >= ?",
+        # 上界用 <=：until 就是"到现在为止"，边界必须算进去。写成 < 时，
+        # 和入库同一秒内发生的查询会看不到刚刚入库的那条——页面上表现为
+        # "刚发的资源不出现"，刷新一次才出来。
+        "first_seen_at <= ?",
+        "archived_at = 0",
+        "NOT (check_state IN (%s) AND check_at > ?)" % ",".join("?" * len(HIDDEN_STATES)),
+    ]
+    params: list = [since, end, *HIDDEN_STATES, stamp - BAD_HIDE_TTL]
+    if origin:
+        where.append("origin = ?")
+        params.append(normalize_origin(origin))
+    clause = " AND ".join(where)
+
+    with _session() as conn:
+        total = int(
+            conn.execute(f"SELECT COUNT(*) FROM resources WHERE {clause}", params).fetchone()[0]
+        )
+        rows = conn.execute(
+            f"SELECT * FROM resources WHERE {clause}"
+            " ORDER BY first_seen_at DESC, id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+
+    return {"items": [_to_item(row) for row in rows], "total": total}
+
+
+def day_summary(
+    since: int,
+    until: int | None = None,
+    *,
+    origin: str = "",
+    now: int | None = None,
+) -> dict:
+    """一段时间内新增的分布：总数、按入口、按平台。
+
+    `origin` 给了就只统计这一路（今日更新页固定只看 QQ 群），不给就是全库。
+    """
+    out = {"total": 0, "byOrigin": [], "byPlatform": []}
+    if not _inited:
+        return out
+
+    stamp = int(now if now is not None else time.time())
+    end = int(until if until is not None else stamp)
+    where = "first_seen_at >= ? AND first_seen_at <= ? AND archived_at = 0"
+    params: list = [since, end]
+    if origin:
+        where += " AND origin = ?"
+        params.append(normalize_origin(origin))
+
+    with _session() as conn:
+        out["total"] = int(
+            conn.execute(f"SELECT COUNT(*) FROM resources WHERE {where}", params).fetchone()[0]
+        )
+        counts = {
+            row["origin"]: int(row["c"])
+            for row in conn.execute(
+                f"SELECT origin, COUNT(*) c FROM resources WHERE {where} GROUP BY origin", params
+            )
+        }
+        # 按固定顺序输出，不按数量排：来源顺序本身是稳定的信息，
+        # 每天因为数量变动换一次顺序，看着像分组错了。
+        for key in ORIGIN_ORDER:
+            if counts.get(key):
+                out["byOrigin"].append(
+                    {"key": key, "name": ORIGIN_NAMES[key], "count": counts[key]}
+                )
+        for row in conn.execute(
+            f"SELECT platform, COUNT(*) c FROM resources WHERE {where}"
+            " GROUP BY platform ORDER BY c DESC LIMIT 10",
+            params,
+        ):
+            out["byPlatform"].append({
+                "key": row["platform"],
+                "name": PLATFORM_NAMES.get(row["platform"], "其他"),
+                "count": int(row["c"]),
+            })
+    return out
 
 
 # ---------------------------------------------------------------- 回填
@@ -855,6 +1030,9 @@ def ingest(
                 # 不指定时沿用老规则，保证已接入的通道行为不变。
                 "source_level": _int(item.get("sourceLevel"))
                 or (1 if item.get("sourceKind") == "tg" else 2),
+                # 入口来源。一条资源只在第一次入库时定下来，后续不管又被谁
+                # 发过都不改——"今天新增"的口径要靠它，改一次分组就漂一次。
+                "source_kind": item.get("sourceKind") or "",
             })
 
         result = upsert_many(rows, now=now)

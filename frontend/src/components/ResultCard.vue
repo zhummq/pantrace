@@ -8,6 +8,9 @@ const props = defineProps({
   // 为 true 时「打开链接」的点击交给父组件决定（群弹窗拦截一次）。
   // Ctrl/Cmd/中键不受影响，直接走浏览器默认行为。
   intercept: { type: Boolean, default: false },
+  // 隐藏「大小未知」。群分享采集不到体积，一列 20 行全是「大小未知」等于噪声；
+  // 搜索页保持原样（那里的体积多数是有的，没有也该明说）。
+  hideUnknownSize: { type: Boolean, default: false },
 })
 
 const emit = defineEmits(['feedback', 'open'])
@@ -67,7 +70,7 @@ const titleHtml = computed(() => {
 
 const sizeText = computed(() => {
   const bytes = Number(props.item.sizeBytes) || 0
-  if (bytes <= 0) return '大小未知'
+  if (bytes <= 0) return props.hideUnknownSize ? '' : '大小未知'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let n = bytes
   let i = 0
@@ -194,7 +197,9 @@ async function onCopyPwd() {
         <div class="meta">
           <span v-if="fileCountText">{{ fileCountText }}</span>
           <i v-if="fileCountText" class="dot"></i>
-          <span>{{ sizeText }}</span>
+          <!-- sizeText 可能为空（今日更新里隐藏了「大小未知」），空 span 会在
+               元信息行里留一段莫名的间隙，所以这里也要 v-if -->
+          <span v-if="sizeText">{{ sizeText }}</span>
           <!-- 存活检测结论：ok 给绿色对勾，失效/需提取码给红/橙，
                没有任何结论（未检、unsupported）就不出现 -->
           <span

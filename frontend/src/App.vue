@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import ResultCard from './components/ResultCard.vue'
+import TodayPanel from './components/TodayPanel.vue'
 import FeedbackDialog from './components/FeedbackDialog.vue'
 import QqGroupDialog from './components/QqGroupDialog.vue'
 import ThemePicker from './components/ThemePicker.vue'
@@ -18,6 +19,10 @@ const keyword = ref('')
 const lastKeyword = ref('')
 const activePlatform = ref('')
 const platforms = ref([])
+// 视图：搜索页 / 今日更新。同一份 SPA，靠 `?view=today` 区分，
+// 不新开一个入口——顶栏、主题、群弹窗、页脚全都只有一份，复制一份出来
+// 迟早两边长得不一样。
+const view = ref('search')
 // 没选网盘就去点搜索时置 true：搜索框不动，把提示打到平台行上，
 // 让用户看见"缺的是这一步"，而不是弹一个说完就没的 tostring。
 const needPlatform = ref(false)
@@ -298,6 +303,12 @@ const pageWindow = computed(() => {
 })
 
 function syncUrl() {
+  // 今日更新是独立视图，不带搜索参数：把 q/platform 拼在后面，
+  // 分享出去的链接会让对方以为能搜，其实那一页没有搜索框。
+  if (view.value === 'today') {
+    history.replaceState(null, '', '?view=today')
+    return
+  }
   const params = new URLSearchParams()
   if (keyword.value.trim()) params.set('q', keyword.value.trim())
   if (activePlatform.value) params.set('platform', activePlatform.value)
@@ -591,12 +602,27 @@ function quickSearch(word) {
 }
 
 function resetHome() {
+  view.value = 'search'
   keyword.value = ''
   searched.value = false
   activePlatform.value = ''
   // 回首页等于放弃这一轮排查，痕迹一起清掉
   triedSources.value = []
   history.replaceState(null, '', '/')
+}
+
+// 今日更新：只读的一页，进来不做任何搜索请求。
+function openToday() {
+  if (view.value === 'today') return
+  view.value = 'today'
+  syncUrl()
+  window.scrollTo({ top: 0 })
+}
+
+function openSearch() {
+  resetHome()
+  // 从今日更新回到搜索，落点是搜索首屏而不是空白页：用户来这里多半是想找东西
+  document.querySelector('.searchbar input')?.focus()
 }
 
 onMounted(async () => {
@@ -661,7 +687,11 @@ onMounted(async () => {
   }
 
   const q = params.get('q')
-  if (q) {
+  const wantToday = params.get('view') === 'today'
+  if (wantToday) {
+    // 今日更新页没有搜索框，URL 里带着 q 也不该发请求——那是上一个视图的残留。
+    view.value = 'today'
+  } else if (q) {
     keyword.value = q
     doSearch(Number(params.get('page')) || 1)
   }
@@ -682,13 +712,20 @@ onBeforeUnmount(() => {
     <header class="topbar">
       <div class="wrap topbar-inner">
         <nav class="topnav" aria-label="主导航">
-          <a class="tn on" href="/" @click.prevent="resetHome">
+          <a class="tn" :class="{ on: view === 'search' }" href="/" @click.prevent="openSearch">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
               <circle cx="11" cy="11" r="7" />
               <path d="m20 20-3.6-3.6" />
             </svg>
             搜资源
           </a>
+          <button class="tn" :class="{ on: view === 'today' }" type="button" @click="openToday">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="3.5" y="5" width="17" height="16" rx="2.5" />
+              <path d="M8 3v4M16 3v4M3.5 10h17" />
+            </svg>
+            今日更新
+          </button>
           <button class="tn" type="button" @click="openFeedback('request')">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M12 5v14M5 12h14" />
@@ -712,7 +749,30 @@ onBeforeUnmount(() => {
       </div>
     </header>
 
-    <section class="hero" :class="{ compact: searched }">
+    <template v-if="view === 'today'">
+      <section class="today-hero">
+        <div class="wrap">
+          <a class="lockup row" href="/" @click.prevent="resetHome">
+            <h1 class="title">盘迹</h1>
+            <span class="domain mono">PANTRACE</span>
+          </a>
+        </div>
+      </section>
+
+      <main class="wrap content">
+        <TodayPanel
+          :intercept="groupIntercept"
+          @open="handleOpen"
+          @feedback="openFeedback('result', { item: $event })"
+          @search="openSearch"
+          @group="showGroupManual"
+        />
+      </main>
+    </template>
+
+    <!-- 搜索视图。用 v-if 而不是再包一层 <template v-else>：hero 和 main 是
+         两个兄弟节点，各自挂条件比多包一层少一次缩进重排，出问题也更容易定位。 -->
+    <section v-if="view === 'search'" class="hero" :class="{ compact: searched }">
       <div class="wrap hero-inner">
         <a class="lockup" href="/" @click.prevent="resetHome">
           <h1 class="title">盘迹</h1>
@@ -814,7 +874,7 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <main class="wrap content">
+    <main v-if="view === 'search'" class="wrap content">
       <div v-if="loading" class="scan-state">
         <div class="scan-head">
           <span class="scan-label mono">SCANNING</span>
@@ -1534,6 +1594,25 @@ onBeforeUnmount(() => {
 .pchip.on .pchip-ic.all {
   background: var(--brand);
   color: var(--on-brand);
+}
+
+/* ---------- 今日更新 ---------- */
+
+.today-hero {
+  padding: var(--sp-6) 0 var(--sp-2);
+}
+
+/* 复用品牌锁版，但横排：这一页不需要搜索框撑起首屏，标题一行就够。
+   改的是 .lockup 的排列方向，字号和字距仍来自同一处，不会跑味。 */
+.lockup.row {
+  flex-direction: row;
+  align-items: baseline;
+  gap: var(--sp-3);
+}
+
+.today-hero .title {
+  font-size: var(--text-2xl);
+  letter-spacing: 0.02em;
 }
 
 /* ---------- 首屏收窄（已有结果时） ---------- */

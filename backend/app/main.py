@@ -2187,6 +2187,76 @@ async def admin_library_jobs(request: Request):
     return {"code": 0, "data": library_sync.status()}
 
 
+# ---------------------------------------------------------------- 今日更新
+#
+# 主站「今日更新」页的数据源。排序口径和搜索不同：这里只按入库时间倒序，
+# 不做相关性打分——它回答的是"今天进了什么"，不是"帮我找什么"。
+
+
+def _day_start(now: float, back_days: int = 0) -> int:
+    """本地时区某天 0 点的时间戳，再往前退 back_days 天。
+
+    不能拿 `now - n*86400` 当"昨天 0 点"：那是"此刻往前推 N 天"，同一天内
+    不同时刻算出来的区间宽度都不一样，页面上会出现"10 点看 320 条、11 点看
+    280 条"这种没法解释的漂移。按日历日切才是"今日"。
+    """
+    y, m, d = time.localtime(now)[:3]
+    midnight = time.mktime((y, m, d, 0, 0, 0, 0, 0, -1))
+    return int(midnight - back_days * 86400)
+
+
+@app.get("/api/today", include_in_schema=False)
+async def today_feed(page: int = 1, page_size: int = 30, days: int = 1):
+    """今天（或近 N 天）**从 QQ 群采集进来的**资源。
+
+    只放 origin=qq，不做"全来源大杂烩"：
+    - 上游回填和表格订阅是机器爬来的，天天几千条，铺在首页上等于把"今天群里
+      有人分享了什么"这件事淹掉，那正是这个页面唯一的用处；
+    - 上游结果还涉及链接是否外露、是否该被索引，范围越小越不容易出事。
+
+    不带令牌：这些数据本来就会出现在搜索结果里，多加一道锁只是让页面打不开。
+    但**真实链接照样不外露**——出口和搜索共用 `_public_body`，链接换成
+    `/go/<token>` 再下发。
+    """
+    if not LIBRARY_ON:
+        return _library_off()
+
+    days = max(1, min(30, int(days)))
+    page = max(1, min(200, int(page)))
+    page_size = max(1, min(60, int(page_size)))
+    now = time.time()
+
+    since = _day_start(now, days - 1)
+    got = store.recent(
+        since=since,
+        limit=page_size,
+        offset=(page - 1) * page_size,
+        origin=store.ORIGIN_QQ,
+        now=int(now),
+    )
+    items = _public_body({"items": got["items"]})["items"]
+    summary = store.day_summary(since, origin=store.ORIGIN_QQ, now=int(now))
+    # 平铺返回，和 /api/search、/api/platforms 一致——公开 GET 不套 data 壳。
+    # 前端 request() 拆完 code 之后直接读 data.items，多包一层就是"接口 200、
+    # 页面说没数据"，而且不报错，最难查。
+    return {
+        "code": 0,
+        "msg": "",
+        "date": time.strftime("%Y-%m-%d", time.localtime(since)),
+        "days": days,
+        "origin": store.ORIGIN_QQ,
+        "updatedAt": int(now),
+        "items": items,
+        "pagination": {
+            "page": page,
+            "pageSize": page_size,
+            "total": got["total"],
+            "totalPages": (got["total"] + page_size - 1) // page_size,
+        },
+        "summary": summary,
+    }
+
+
 # ---------------------------------------------------------------- QQ 群采集
 #
 # AstrBot + NapCat 把指定群里群主/管理员发的分享消息原样 POST 过来，这里解析

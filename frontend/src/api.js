@@ -67,6 +67,13 @@ export function fetchPlatforms() {
   return request('/api/platforms')
 }
 
+// 今日更新：后端固定只返回 QQ 群采集进来的资源（origin=qq），
+// 前端不传来源参数——这个页面的定义就是"群里今天发了什么"，
+// 加一个来源选择器只会让它变成又一个搜索结果页。
+export function fetchToday({ page = 1, pageSize = 30, days = 1 } = {}) {
+  return request('/api/today', { page, page_size: pageSize, days })
+}
+
 // 群入口配置（二维码 / 群号 / 弹窗策略）。拉不到不影响搜索，前端只当没有。
 export function fetchGroup() {
   return request('/api/group')
