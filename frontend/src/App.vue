@@ -46,6 +46,11 @@ const SOURCE_OPTIONS = [
   // 而且链接存活要等本次搜索的探活跑完才有角标（几秒后自动刷新那一屏）。
   { key: 'library', label: '本地库', hint: '站内已收录的索引，秒出结果；链接在本次搜索时实测' },
 ]
+// 来源相关的提示语全站只有这一句：不按"你还没查哪档"轮换文案，也不管当前
+// 选的是实时 / 全网 / 本地库——换不换来源是看结果的人自己的判断。
+// 首屏来源行和结果面板顶部那条共用它，避免两处说法不一致。
+const SOURCE_HINT = '如果当前来源没有满意的结果，请尝试其他来源'
+
 const DEFAULT_SOURCE = 'tg'
 const SOURCE_PREF_KEY = 'pt_pref_source'
 const activeSource = ref(DEFAULT_SOURCE)
@@ -90,8 +95,6 @@ const resultLabel = computed(() => {
   return '实时结果'
 })
 
-const sourceMeta = computed(() => SOURCE_OPTIONS.find((s) => s.key === activeSource.value) || SOURCE_OPTIONS[0])
-
 // 序号用于丢弃过期请求：用户连搜两次时，先发那次的后台补拉不能覆盖新结果
 let searchSeq = 0
 let checkTimers = []
@@ -121,24 +124,6 @@ const activePlatformName = computed(() => {
   const p = platforms.value.find((x) => x.key === activePlatform.value)
   return p?.name || '网盘'
 })
-
-// 结果面板顶部那条常驻提示：一句话 + 一个动作，不滚。
-// 三句轮播用户只来得及看一句，不如把最该做的那件事直接做成可点的按钮。
-// 推荐哪一档要看用户还剩哪档没查——已经切到全网了还劝他换全网，等于没看。
-const switchHint = computed(() => {
-  const next = untriedSources.value[0]
-  if (next) {
-    return { text: `这一屏没有想要的？换「${next.label}」再查一次`, cta: `换${next.label}`, key: next.key }
-  }
-  // 三档都查过了，再推换源就是死路，出口只能是求资源
-  return { text: '三条通道都查过了还是没有？把片名告诉我，人工找', cta: '求资源', key: '' }
-})
-
-function actOnHint() {
-  if (busy.value) return
-  if (switchHint.value.key) pickSource(switchHint.value.key)
-  else openFeedback('request')
-}
 
 const totalText = computed(() =>
   total.value > 0 ? total.value.toLocaleString('zh-CN') : String(total.value)
@@ -848,7 +833,9 @@ onBeforeUnmount(() => {
                 {{ s.label }}
               </button>
             </div>
-            <span class="source-hint mono">{{ sourceMeta.hint }}</span>
+            <!-- 来源行不再给每档写各不相同的说明：那句话只解释"查不到怎么办"，
+                 和选的是实时还是本地库无关。各档的差别留在 chip 的 title 里。 -->
+            <span class="source-hint">{{ SOURCE_HINT }}</span>
           </div>
           <div class="frow">
             <span class="frow-label platform-label">{{ needPlatform ? '先选一个' : '云盘' }}</span>
@@ -913,17 +900,14 @@ onBeforeUnmount(() => {
         <div class="state-icon empty">∅</div>
         <p class="state-title">没有找到「{{ lastKeyword }}」</p>
 
-        <!-- 三种空法，解法不一样，别用一句万能话糊过去：
-             标题不含词 → 改说法；本地库没收录 → 换现取的通道；
-             通道没命中 → 换另一条通道。 -->
+        <!-- 空法只有两类：标题不含词（该改说法）和通道没命中（该换来源）。
+             后者不再按当前是实时 / 全网 / 本地库各写一套说法——
+             一样是"这档没查到"，就用全站那一句，下面通道列表接得上。 -->
         <p v-if="filtered > 0" class="state-desc">
           搜到 {{ filtered }} 条，但标题里都没提这个词。换个更短的说法，比如只留片名。
         </p>
-        <p v-else-if="activeSource === 'library'" class="state-desc">
-          {{ activePlatformName }}的本地索引没有这个词，下面 {{ untriedSources.length }} 条通道是现去网上取的。
-        </p>
         <p v-else class="state-desc">
-          先别急着换关键词，问题多半出在通道上。
+          {{ SOURCE_HINT }}
         </p>
 
         <!-- 未试通道：把首屏那排开关复制到事故现场。点一下就是一次真实查询
@@ -1005,22 +989,15 @@ onBeforeUnmount(() => {
           <span>网盘链接 <b>30 分钟</b>内有效，过期可重新获取。</span>
         </p>
 
-        <!-- 常驻提示：一句话 + 一个动作，整行可点。不滚动——三句轮播
-             用户只来得及看半句，不如把该做的那件事直接做成按钮。
-             摆在列表正上方：开始往下扫之前正好扫到。 -->
-        <button type="button" class="switch-hint" :disabled="busy" @click="actOnHint">
+        <!-- 常驻提示：只做说明，不承载动作。换不换来源由看了这一屏的人自己定，
+             替他点下去等于替他挑片。摆在列表正上方：开始往下扫之前正好扫到。 -->
+        <p class="switch-hint">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <circle cx="12" cy="12" r="9" />
             <path d="M12 16v-4M12 8h.01" />
           </svg>
-          <span class="sh-text">{{ switchHint.text }}</span>
-          <span class="sh-cta">
-            {{ switchHint.cta }}
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="m9 6 6 6-6 6" />
-            </svg>
-          </span>
-        </button>
+          <span class="sh-text">{{ SOURCE_HINT }}</span>
+        </p>
 
         <div class="result-list">
           <ResultCard
@@ -1498,12 +1475,13 @@ onBeforeUnmount(() => {
 }
 
 /* 说明文字跟在 chip 下方、对齐内容列（grid 第 2 列），独占一行。
-   三个档各一句话，用户切换时不用猜 auto/plugin 是什么意思。 */
+   全站只有一句，且不随来源变——它答的是"这一档查不到怎么办"，不是"这一档是什么"。
+   颜色从 faint 提到 muted：一句完整的话压在 faint 上，浅色主题几乎读不清。 */
 .source-hint {
   grid-column: 2;
   margin-top: calc(-1 * var(--sp-1));
   font-size: var(--text-xs);
-  color: var(--faint);
+  color: var(--muted);
 }
 
 .frow-label {
@@ -1794,73 +1772,29 @@ onBeforeUnmount(() => {
   color: var(--ink-2);
 }
 
-/* 常驻换源提示：整行可点，不用去瞄一个小按钮。
-   和 ttl-note 同构（通栏 + 底边框），但它是动作不是说明——静止态保持
-   同一档视觉重量，hover 才给底色，免得面板头上摞两块灰。 */
+/* 常驻提示：纯说明，不承载动作。和 ttl-note 同构（通栏 + 底边框），
+   视觉重量压到最低——面板头上不该摞两块同等重量的灰。 */
 .switch-hint {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
+  margin: 0;
   padding: 8px var(--sp-5);
-  border: none;
   border-bottom: 1px solid var(--line);
-  background: transparent;
   font-size: var(--text-sm);
   line-height: 1.5;
   color: var(--muted);
-  text-align: left;
-  cursor: pointer;
-  transition:
-    background-color var(--dur-2) var(--ease),
-    color var(--dur-2) var(--ease);
 }
 
-/* 图标压到 faint：这一行只能有一个亮点，留给右侧的动作，
-   否则左边的图标和 CTA 一起发光，用户反倒不知道该点哪 */
+/* 图标压到 faint：这一行没有动作，全靠文字传达，图标只是收个边 */
 .switch-hint > svg {
   flex: none;
   color: var(--faint);
 }
 
-.switch-hint:hover:not(:disabled) {
-  background: rgb(var(--a-rgb) / 0.06);
-  color: var(--ink-2);
-}
-
-.switch-hint:focus-visible {
-  outline: none;
-  box-shadow: inset 0 0 0 2px var(--brand-ring);
-}
-
-.switch-hint:disabled {
-  opacity: 0.55;
-  cursor: not-allowed;
-}
-
 .sh-text {
   flex: 1;
   min-width: 0;
-}
-
-/* 动作单独成块：整行可点，但得让"点了会发生什么"看得见 */
-.sh-cta {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  flex: none;
-  font-size: var(--text-xs);
-  font-weight: 600;
-  color: var(--brand-ink);
-  white-space: nowrap;
-}
-
-.sh-cta svg {
-  transition: transform var(--dur-2) var(--ease);
-}
-
-.switch-hint:hover:not(:disabled) .sh-cta svg {
-  transform: translateX(2px);
 }
 
 .result-list {
