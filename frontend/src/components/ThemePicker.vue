@@ -45,8 +45,14 @@ onBeforeUnmount(() => {
       title="配色主题"
       @click="open = !open"
     >
-      <span class="tp-dot" :style="{ background: active.accent }" />
-      <svg class="tp-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <!-- 图标：半明半暗的圆（明暗/主题的通用符号）。
+           别用调色板——16px 下它的镂空和缺口全糊掉，读出来像张笑脸 -->
+      <svg class="tp-ic" width="15" height="15" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="8.3" fill="none" stroke="currentColor" stroke-width="1.9" />
+        <path d="M12 3.7a8.3 8.3 0 0 1 0 16.6Z" fill="currentColor" />
+      </svg>
+      <span class="tp-label">配色</span>
+      <svg class="tp-caret" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="m6 9 6 6 6-6" />
       </svg>
     </button>
@@ -89,19 +95,20 @@ onBeforeUnmount(() => {
 .tp-btn {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   height: 26px;
-  padding: 0 8px 0 7px;
-  border: 1px solid var(--line);
+  padding: 0 9px 0 8px;
+  border: 1px solid var(--line-2);
   border-radius: var(--radius-pill);
   background: var(--surface-2);
-  color: var(--muted);
+  font-size: var(--text-sm);
+  color: var(--ink-2);
 }
 
 .tp-btn:hover {
-  border-color: var(--line-2);
+  border-color: var(--line-strong);
   background: var(--surface-3);
-  color: var(--ink-2);
+  color: var(--ink);
 }
 
 .tp-btn[aria-expanded='true'] {
@@ -110,15 +117,31 @@ onBeforeUnmount(() => {
   color: var(--brand-ink);
 }
 
-.tp-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  box-shadow: 0 0 0 2px var(--brand-soft);
+/* 图标跟着主题走：换一套配色，这个图标立刻跟着变色，等于给自己做了个预览 */
+.tp-ic {
+  flex: none;
+  color: var(--brand);
+}
+
+.tp-label {
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .tp-caret {
-  opacity: 0.7;
+  flex: none;
+  opacity: 0.55;
+}
+
+/* 手机上省掉文字，图标本身能认出来；不省就会把顶栏右侧挤满 */
+@media (max-width: 560px) {
+  .tp-label {
+    display: none;
+  }
+
+  .tp-btn {
+    padding: 0 7px;
+  }
 }
 
 /* 浮层：贴按钮右侧对齐，箭头朝上，不抢视线。
