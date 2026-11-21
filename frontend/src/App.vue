@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import ResultCard from './components/ResultCard.vue'
 import FeedbackDialog from './components/FeedbackDialog.vue'
 import QqGroupDialog from './components/QqGroupDialog.vue'
+import ThemePicker from './components/ThemePicker.vue'
 import { fetchPlatforms, fetchGroup, searchResources } from './api.js'
 import { ensureTicket } from './ticket.js'
 import { initTracking, track } from './track.js'
@@ -654,6 +655,7 @@ onBeforeUnmount(() => {
           </button>
         </nav>
         <div class="topbar-right">
+          <ThemePicker />
           <span class="status mono">
             <i class="status-dot"></i>
             {{ sourceCount ? `${sourceCount} SOURCES` : 'SYNC' }}
@@ -971,8 +973,8 @@ onBeforeUnmount(() => {
   z-index: -1;
   pointer-events: none;
   background:
-    radial-gradient(1040px 620px at 4% -12%, var(--glow-mint), transparent 66%),
-    radial-gradient(1080px 660px at 96% -4%, var(--glow-cyan), transparent 68%),
+    radial-gradient(1040px 620px at 4% -12%, var(--glow-primary), transparent 66%),
+    radial-gradient(1080px 660px at 96% -4%, var(--glow-secondary), transparent 68%),
     linear-gradient(112deg, transparent 46%, var(--glow-sheen) 60%, transparent 76%);
 }
 
@@ -1039,7 +1041,9 @@ onBeforeUnmount(() => {
 
 .topbar-right {
   position: absolute;
-  right: 0;
+  /* 绝对定位认的是内边距盒的边，right:0 会顶到容器最外沿——比左导航多出
+     一整个内边距，手机上直接贴屏幕边。这里跟 .wrap 对齐，左右对称 */
+  right: var(--sp-6);
   display: flex;
   align-items: center;
   gap: var(--sp-3);
@@ -1951,6 +1955,11 @@ onBeforeUnmount(() => {
 @media (max-width: 860px) {
   .wrap {
     padding: 0 var(--sp-5);
+  }
+
+  /* 跟着 .wrap 的内边距走，否则右侧控件会比左边多露出 4px */
+  .topbar-right {
+    right: var(--sp-5);
   }
 
   .hero {

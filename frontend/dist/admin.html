@@ -4,12 +4,27 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="robots" content="noindex,nofollow" />
-    <meta name="color-scheme" content="light" />
-    <meta name="theme-color" content="#f5f7fb" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#060b12" />
+    <script>
+      /* 与主站同一套主题：管理端跟主站共用 localStorage 键，换一次两边都变 */
+      (function () {
+        var bg = { mint: '#060b12', azure: '#06101c', violet: '#0a0716', amber: '#120c07', light: '#f4f6fa' }
+        try {
+          var t = localStorage.getItem('pantrace:theme')
+          if (!t || !bg[t]) return
+          document.documentElement.dataset.theme = t
+          var m = document.querySelector('meta[name="theme-color"]')
+          if (m) m.setAttribute('content', bg[t])
+          var c = document.querySelector('meta[name="color-scheme"]')
+          if (c) c.setAttribute('content', t === 'light' ? 'light' : 'dark light')
+        } catch (e) {}
+      })()
+    </script>
     <title>盘迹 · 看板</title>
-    <script type="module" crossorigin src="/assets/admin-C7Bo5aWY.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/style-BaGRdtf9.js">
-    <link rel="stylesheet" crossorigin href="/assets/style-D0sMcnNj.css">
+    <script type="module" crossorigin src="/assets/admin-cDJ86KDW.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/style-zdQj4QyG.js">
+    <link rel="stylesheet" crossorigin href="/assets/style-DevtUvTK.css">
     <link rel="stylesheet" crossorigin href="/assets/admin-B8hEP1gQ.css">
   </head>
   <body>

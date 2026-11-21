@@ -14,6 +14,7 @@ import ClicksPanel from './components/ClicksPanel.vue'
 import LinkCheckPanel from './components/LinkCheckPanel.vue'
 import LibraryPanel from './components/LibraryPanel.vue'
 import SourceRankPanel from './components/SourceRankPanel.vue'
+import ThemePicker from '../components/ThemePicker.vue'
 import * as api from './api'
 import { ms, pct, platformName } from './format'
 
@@ -410,6 +411,7 @@ onUnmounted(() => {
           </div>
           <button class="ghost" @click="loadAll">刷新</button>
           <button class="ghost" @click="logout">改口令</button>
+          <ThemePicker />
         </div>
       </header>
 
