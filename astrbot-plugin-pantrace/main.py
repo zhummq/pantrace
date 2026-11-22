@@ -143,6 +143,8 @@ class PanTraceCollector(Star):
         self._roles: dict[str, tuple[str, float]] = {}        # (群:人) -> (角色, 时间)
         self._warned_no_group = False          # 「没配群号」只提醒一次
         self._warned_no_llm = False            # 「没取到大模型」只提醒一次
+        # 配了具体的人、但这个群没开采集的群号。按群只提醒一次。
+        self._warned_cold_group: set[str] = set()
         # 最近一条群消息的会话标识。结构化在后台任务里跑，手上没有 event，
         # 只能借用它去问 AstrBot「这个会话该用哪个模型」。空串就退回全局默认。
         self._last_umo = ""
@@ -617,6 +619,18 @@ class PanTraceCollector(Star):
                     self._warned_no_group = True
                 return
             if group_id not in watched:
+                # 只给某个群的人配了白名单、却没把这个群放进 capture_groups：
+                # 两处配置是「与」，人不比群大，一条都不会采。这属于配了等于
+                # 没配，静默吞掉最坑，所以撞上就明说一次。
+                _, senders_by_group = self._watched_senders()
+                if senders_by_group.get(group_id) and group_id not in self._warned_cold_group:
+                    logger.warning(
+                        "pantrace: capture_senders 里配了群 %s 的人，但这个群不在 "
+                        "capture_groups 里，该群一条都不会采集。把群号补进 capture_groups "
+                        "才生效——注意群一旦开启采集，群里群主/管理员的分享也会照收。",
+                        group_id,
+                    )
+                    self._warned_cold_group.add(group_id)
                 return
 
             sender_id = str(event.get_sender_id() or "")
