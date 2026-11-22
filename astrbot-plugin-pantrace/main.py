@@ -190,6 +190,32 @@ class PanTraceCollector(Star):
         roles = {r.lower() for r in self._list_conf("capture_roles", ["owner", "admin"])}
         return {r for r in roles if r in _VALID_ROLES} or {"owner", "admin"}
 
+    def _watched_senders(self) -> tuple[set[str], dict[str, set[str]]]:
+        """指定还要采集哪些人。返回 (全局 QQ 号, {群号: QQ 号集合})。
+
+        **按 QQ 号而不是昵称**：昵称随时改、还能重名，QQ 号是唯一且稳定的。
+        和身份白名单取**并集**——名单里的人不看身份照收，群主/管理员照旧，
+        所以它只做"再多收一个人"，不会把现有采集面缩窄。
+
+        两种写法：
+          `123456789`        这个人在所有被监听的群里都收
+          `987654321:123456789` / `987654321@123456789`
+                             只在这个群里收（同一个人在不同群身份不同时用）
+        """
+        every: set[str] = set()
+        by_group: dict[str, set[str]] = {}
+        for token in self._list_conf("capture_senders", []):
+            group, sep, uid = token.replace("：", ":").partition(":")
+            if not sep:
+                group, sep, uid = token.partition("@")
+            if sep:
+                group, uid = group.strip(), uid.strip()
+                if group and uid:
+                    by_group.setdefault(group, set()).add(uid)
+            elif token:
+                every.add(token)
+        return every, by_group
+
     def _raw_role(self, event: AstrMessageEvent) -> str:
         """从 OneBot 原始事件里读发送者身份。NapCat 的群消息 event.sender.role
         就是权威值，比额外查一次群成员接口快且省。
@@ -598,9 +624,18 @@ class PanTraceCollector(Star):
             if sender_id and sender_id == str(event.get_self_id() or ""):
                 return
 
-            role = await self._role_of(event, group_id, sender_id)
-            if role not in self._watched_roles():
-                return
+            # 指定的人先放行：名单命中的不论群身份，也不再查群成员接口——
+            # 群里刷屏时那次请求是实打实的延迟。拿不到原始 role 就记 member。
+            senders_all, senders_by_group = self._watched_senders()
+            named = bool(sender_id) and (
+                sender_id in senders_all or sender_id in senders_by_group.get(group_id, ())
+            )
+            if named:
+                role = self._raw_role(event) or "member"
+            else:
+                role = await self._role_of(event, group_id, sender_id)
+                if role not in self._watched_roles():
+                    return
 
             text = (event.message_str or "").strip()
             cards = self._harvest_card(event)
