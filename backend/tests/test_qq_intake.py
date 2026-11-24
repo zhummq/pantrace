@@ -188,6 +188,33 @@ class BatchTest(unittest.TestCase):
         items, _ = qq_intake.parse_batch([{"id": "m", "text": f"三体 {Q}", "groupId": "123456"}])
         self.assertEqual(items[0]["sourceName"], "QQ群123456")
 
+    def test_baidu_init_link_is_ingestable(self):
+        """百度 `/share/init?surl=` 必须能入库。
+
+        2026-11 那次「采集 1 条 → 入库 0 条、AI 提交 2」就是这条形态：清洗层只认
+        `/s/<id>`，整条消息被判「没有网盘链接」，AI 抽出的条目连校验都进不去。
+        """
+        text = (
+            "八方网域-网络安全大师课2025版\n"
+            "https://pan.baidu.com/share/init?surl=zFQTi5S786kRuHQR9Iyoew&pwd=lidu"
+        )
+        items, dropped = qq_intake.parse_batch([{"id": "m1", "text": text}])
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "八方网域-网络安全大师课2025版")
+        self.assertEqual(items[0]["sharePwd"], "lidu")
+        self.assertTrue(items[0]["shareUrl"].startswith("https://pan.baidu.com/share/init?surl="))
+
+    def test_ai_repeating_same_link_collapses(self):
+        """模型把同一条链接写两遍时只入库一条——正是那次日志里「AI 提交 2」的形态。"""
+        url = "https://pan.baidu.com/share/init?surl=zFQTi5S786kRuHQR9Iyoew&pwd=lidu"
+        text = f"八方网域-网络安全大师课2025版\n{url}"
+        ai = [{"title": "八方网域-网络安全大师课2025版", "shareUrl": url, "sharePwd": "lidu"}] * 2
+        items, dropped = qq_intake.parse_batch([{"id": "m1", "text": text, "items": ai}])
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["sharePwd"], "lidu")
+
 
 if __name__ == "__main__":
     unittest.main()

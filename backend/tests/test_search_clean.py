@@ -167,6 +167,43 @@ class ExtractLinksTest(unittest.TestCase):
         text = "https://123pan.com/s/abc123 https://123pan.com/s/abc123"
         self.assertEqual(clean.extract_net_disk_links(text), ["https://123pan.com/s/abc123"])
 
+    def test_baidu_init_share_link(self):
+        """百度旧版 `/share/init?surl=` 必须认出来。
+
+        群里这类链接很常见（也是 2026-11 那条「采集 1 条 → 入库 0 条」的真凶）：
+        清洗层原来只认 `/s/<id>`，整条被判「没有网盘链接」。`qq_intake` 的纯 AI
+        策略要先有 base.items 才做校验，base 一空，AI 抽出的条目全被静默丢掉。
+        `sdk/urls.py` 早就支持这一形态，清洗层落后，两边必须一起认。
+        """
+        cases = (
+            "https://pan.baidu.com/share/init?surl=zFQTi5S786kRuHQR9Iyoew&pwd=lidu",
+            # 微信/QQ 复制出来的全角问号与和号
+            "https://pan.baidu.com/share/init？surl=zFQTi5S786kRuHQR9Iyoew＆pwd=lidu",
+            # 没有提取码也要收，最少是个可打开的分享页
+            "https://pan.baidu.com/share/init?surl=zFQTi5S786kRuHQR9Iyoew",
+        )
+        for url in cases:
+            with self.subTest(url=url):
+                got = clean.extract_net_disk_links(url)
+                self.assertEqual(len(got), 1, url)
+                # 全角必须归一，否则 parse() 拿不到 pwd
+                self.assertNotIn("？", got[0])
+                self.assertNotIn("＆", got[0])
+                self.assertTrue(clean.is_supported_link(got[0]))
+
+    def test_baidu_init_password_survives_parse(self):
+        """清洗层收下来的 init 链接要能在解析层拿到分享 id 和提取码。"""
+        from app.sdk import urls
+
+        text = "https://pan.baidu.com/share/init?surl=zFQTi5S786kRuHQR9Iyoew&pwd=lidu"
+        link = clean.extract_net_disk_links(text)[0]
+        parsed = urls.parse(link)
+        self.assertTrue(parsed.ok, link)
+        self.assertEqual(parsed.platform, "baidu")
+        # urls.py 的规则给 init 的 surl 补前导 1，这是百度的惯例写法
+        self.assertEqual(parsed.pwd_id, "1zFQTi5S786kRuHQR9Iyoew")
+        self.assertEqual(parsed.passcode, "lidu")
+
 
 class Pan115AndPikPakTest(unittest.TestCase):
     """115 / PikPak 必须走专属正则，不能只靠末尾的通用兜底。

@@ -585,6 +585,20 @@ class PanTraceCollector(Star):
             "pantrace: 采集 %s 条消息（AI 结构化 %s 条）→ 入库 %s 条%s，新增 %s / 更新 %s",
             len(batch), ai_done, links, extra, data.get("added"), data.get("touched"),
         )
+        if links == 0:
+            # 零入库是最难查的一种：上报成功、AI 也跑通了，日志里却看不出为什么。
+            # 真正的原因（原文没有网盘链接 / AI 条目对不上）都在后端的 `dropped` 里，
+            # 以前这个字段拿到了就丢。这里必须抬成 WARNING：一次全丢等于这批消息白采。
+            reasons = [
+                str(d.get("reason") or "")
+                for d in (data.get("dropped") or [])
+                if isinstance(d, dict)
+            ]
+            detail = "；".join(dict.fromkeys(r for r in reasons if r)) or "后端未给出原因"
+            logger.warning(
+                "pantrace: 这批 %s 条消息全部没入库（AI 提交 %s）。后端原因：%s",
+                len(batch), ai_items, detail,
+            )
 
     async def _delayed_flush(self, delay: float = 1.5) -> None:
         """攒一小会儿再发。一条消息发一次请求，群里连着发十条就是十次 HTTP。"""

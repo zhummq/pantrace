@@ -5,6 +5,7 @@
 | 本文件 | pansou 源码 |
 |---|---|
 | 正则常量 | `regex_util.go:10-65` |
+| `BAIDU_INIT` | 无（**本项目新增**：pansou 只认 `/s/<id>`，百度旧版 `share/init?surl=` 整条漏掉） |
 | `get_link_type` | `regex_util.go:68-128` `GetLinkType` |
 | `clean_*_url` | `regex_util.go:131-477` 七个 Clean 函数 |
 | `normalize_*_url` | `parser_util.go:80-139` 五个 normalize 函数 |
@@ -59,6 +60,17 @@ ALL_PAN_LINKS = re.compile(
 )
 
 BAIDU_PAN = re.compile(r"https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(?:\?pwd=[a-zA-Z0-9]{4})?", _AI)
+# 百度旧版短链：`/share/init?surl=<id>&pwd=<码>`。**不能并进 BAIDU_PAN**：
+# 那条要求 `/s/`，而 init 形态的分享 id 在 `surl=` 里，路径段完全不同；`clean_baidu_pan_url`
+# 也只从 `https://pan.baidu.com/s/` 起截，拿它处理 init 链接会原样返回，等于没洗。
+# `sdk/urls.py` 的 baidu 规则早就认这一形态（fid 补前导 1），但清洗层不认，后果是
+# QQ 群里这类链接整条消息被判「没有网盘链接」——`qq_intake.merge_ai_items` 要先拿到
+# `base.items` 才有得校验，base 一空，AI 结构化抽出的条目连对账的机会都没有，直接静默丢光。
+BAIDU_INIT = re.compile(
+    r"https?://pan\.baidu\.com/share/init[?？]surl=[a-zA-Z0-9_-]+"
+    r"(?:[&＆](?:pwd|password)=[a-zA-Z0-9]{4})?",
+    _AI,
+)
 QUARK_PAN = re.compile(r"https?://pan\.quark\.cn/s/[a-zA-Z0-9_-]+", _AI)
 XUNLEI_PAN = re.compile(r"https?://pan\.xunlei\.com/s/[a-zA-Z0-9_-]+(?:\?pwd=[a-zA-Z0-9]{4})?(?:#)?", _AI)
 TIANYI_PAN = re.compile(
@@ -181,7 +193,7 @@ def is_supported_link(url: str) -> bool:
     """parser_util.go:27 `isSupportedLink`。"""
     lower = url.lower()
     for pat in (
-        BAIDU_PAN, TIANYI_PAN, UC_PAN, PAN123, GUANGYA_PAN,
+        BAIDU_PAN, BAIDU_INIT, TIANYI_PAN, UC_PAN, PAN123, GUANGYA_PAN,
         QUARK_PAN, XUNLEI_PAN, PAN115, PIKPAK_PAN, MOBILE_PAN,
     ):
         if pat.search(lower):
@@ -592,6 +604,11 @@ def extract_net_disk_links(text: str) -> list[str]:
 
     for match in BAIDU_PAN.findall(text):
         _append(clean_baidu_pan_url(match))
+
+    # init 短链自带 `?pwd=`，原样收；全角问号/和号在微信、QQ 复制出来的文案里常见，
+    # 先换回半角再入库，否则 `parse()` 的 query 解析拿不到提取码。
+    for match in BAIDU_INIT.findall(text):
+        _append(match.replace("？", "?").replace("＆", "&"))
 
     for match in TIANYI_PAN.findall(text):
         _append(clean_tianyi_pan_url(match))
