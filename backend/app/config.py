@@ -74,6 +74,16 @@ class Settings(BaseSettings):
     ticket_secret: str = ""
     ticket_ttl: int = 300             # 票据有效期秒数，前端会提前自动续
 
+    # ---- 防刷：自建客户端通道（小程序云函数）----
+    # 云函数的出口 IP 是 NAT 池随机分配的，票据"绑 IP"在那儿永远对不上：
+    # 领票走一个出口、搜索走另一个，就是必现的 403「票据无效」。
+    # 这里发一张长期服务端凭证替代票据：带对了 X-App-Token 就不验票、不比 IP。
+    # 留空 = 通道关闭，所有调用方仍走票据（浏览器站点、QQ 机器人不受影响）。
+    # 生成：python scripts/gen_app_token.py
+    app_token: str = ""
+    app_rate_limit_per_minute: int = 40   # 单客户端（openid 摘要）每分钟次数
+    app_global_per_minute: int = 600      # 通道总闸，令牌泄露时的止损线
+
     # ---- 埋点 ----
     # 只存本地 SQLite，不外发。data 目录跟着 backend/ 走，备份时一起打包即可。
     analytics_enabled: bool = True

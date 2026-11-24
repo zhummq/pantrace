@@ -52,8 +52,22 @@ guard.init(
     secret=settings.ticket_secret or f"{settings.api_key}|{settings.idr_sign}",
     ttl=settings.ticket_ttl,
     rate_limit=settings.rate_limit_per_minute,
+    app_token=settings.app_token,
+    app_rate_limit=settings.app_rate_limit_per_minute,
+    app_global_limit=settings.app_global_per_minute,
 )
 log.info("防刷已启用：单 IP %s 次/分钟，票据 %s 秒", settings.rate_limit_per_minute, settings.ticket_ttl)
+if settings.app_token:
+    # 只报长度和前缀，令牌本身不进日志——日志会被人拷来拷去
+    log.info(
+        "小程序通道已开启：令牌 %s…（%s 位），单客户端 %s 次/分钟，总闸 %s 次/分钟",
+        settings.app_token[:10],
+        len(settings.app_token),
+        settings.app_rate_limit_per_minute,
+        settings.app_global_per_minute,
+    )
+else:
+    log.info("小程序通道未配置（APP_TOKEN 为空）：云函数会走票据，出口 IP 漂移时会 403")
 
 # 启动即自检：配置不对时提前吼一声，别等用户搜一次才发现
 _KEY_PROBLEM = settings.api_key_problem
@@ -838,25 +852,45 @@ async def search(
     force = refresh or force_refresh
 
     # ---- 防刷：先限流，再验票 ----
-    # 两道闸门共用一个 IP 计数池（领票接口也计数），无票探测也会消耗配额。
     # 顺序不能反：先验票的话，脚本可以无限发无票请求而不占配额。
     ip = client_ip(request)
-    # refresh 绕过缓存直接回源，是真花钱的：按 3 份配额计。默认 30 次/分钟时
-    # 等于最多刷 10 次/分钟，普通搜索不受影响。
-    allowed, wait = guard.allow(ip, cost=3 if force else 1)
+    cost = 3 if force else 1
+
+    # 小程序通道。两个头要同时齐：
+    #   X-App-Token   —— 这是我们自己的端（服务端凭证，不下发到前端）
+    #   X-Client-Hash —— 是哪一个用户（openid 的摘要，后端看不到身份本身）
+    # 只有令牌没有身份 → 不当小程序处理，退回 IP 限流 + 验票，跟普通浏览器一视同仁。
+    # 令牌泄露时这条规则是护栏：光有钥匙不能无限刷，每次还得自报一个身份，
+    # 而每个身份都受单客户端配额约束。
+    client_hash = (request.headers.get("x-client-hash") or "").strip()[:64]
+    via_app = bool(client_hash) and guard.app_token_ok(request.headers.get("x-app-token", ""))
+
+    if via_app:
+        # 先单客户端，再总闸。反过来的话，一个正在刷的人也能把总闸吃满，
+        # 挤掉的却是后面那些正常用户。
+        allowed, wait = guard.allow_client(client_hash, cost)
+        if allowed:
+            allowed, wait = guard.allow_global(cost)
+    else:
+        # refresh 绕过缓存直接回源，是真花钱的：按 3 份配额计。默认 30 次/分钟时
+        # 等于最多刷 10 次/分钟，普通搜索不受影响。
+        allowed, wait = guard.allow(ip, cost)
+
     if not allowed:
         return JSONResponse(
             status_code=429,
             content={"code": 429, "msg": f"操作太频繁了，{wait} 秒后再试"},
         )
-    ticket = request.headers.get("x-ticket", "")
-    if not guard.verify(ticket, ip):
-        # 403 = 票据无效/缺失。前端收到后会自动重领一次再重试，
-        # 所以正常用户几乎感知不到；挡掉的是不带票直接打接口的脚本。
-        return JSONResponse(
-            status_code=403,
-            content={"code": 403, "msg": "票据无效，请重试"},
-        )
+
+    if not via_app:
+        ticket = request.headers.get("x-ticket", "")
+        if not guard.verify(ticket, ip):
+            # 403 = 票据无效/缺失。前端收到后会自动重领一次再重试，
+            # 所以正常用户几乎感知不到；挡掉的是不带票直接打接口的脚本。
+            return JSONResponse(
+                status_code=403,
+                content={"code": 403, "msg": "票据无效，请重试"},
+            )
 
     query = q.strip()
     requested = [p.strip() for p in platforms.split(",") if p.strip()]
@@ -1257,23 +1291,58 @@ class ResolveIn(BaseModel):
     t: str = ""
 
 
-# 单 IP 打开频率。正常用户一分钟点不了十次；脚本扫这个接口是在试我们的账号额度。
+# 打开频率。正常用户一分钟点不了十次；脚本扫这个接口是在试我们的账号额度。
+#
+# 三个桶，对应两条身份路径：
+#   IP 桶   —— 浏览器、爬虫、没带令牌的一切调用方，维持原来的 60 次/10 分钟。
+#   用户桶  —— 小程序里的一个人。云函数出口 IP 是共享的，按 IP 计等于全站用户
+#             挤在同一个 60 次里，几十个人就把"取链接"点到 429。
+#   通道桶  —— 小程序总量。令牌是全局共享的，用户暴涨或令牌泄露时，
+#             不能让转存任务无限堆积。
 _resolve_hits: dict[str, tuple[float, int]] = {}
-RESOLVE_PER_10MIN = 60
+_resolve_user_hits: dict[str, tuple[float, int]] = {}
+_resolve_app_hits: dict[str, tuple[float, int]] = {}
+
+RESOLVE_PER_10MIN = 60         # 单 IP
+RESOLVE_USER_PER_10MIN = 10    # 单个小程序用户
+RESOLVE_APP_PER_10MIN = 300    # 小程序通道总量
 
 
-def _resolve_allowed(ip: str) -> bool:
+def _hit_allowed(store: dict[str, tuple[float, int]], key: str, limit: int) -> bool:
+    """固定窗口计数：从第一次命中起算 600 秒，窗口内超过 limit 就拒绝。
+
+    顺手清一次过期键，防止海量 IP / 摘要把字典撑爆。
+    """
     now = time.time()
-    window, count = _resolve_hits.get(ip, (now, 0))
+    window, count = store.get(key, (now, 0))
     if now - window > 600:
         window, count = now, 0
     count += 1
-    _resolve_hits[ip] = (window, count)
-    if len(_resolve_hits) > 4096:
-        for key, (started, _) in list(_resolve_hits.items()):
+    store[key] = (window, count)
+    if len(store) > 4096:
+        for k, (started, _) in list(store.items()):
             if now - started > 600:
-                _resolve_hits.pop(key, None)
-    return count <= RESOLVE_PER_10MIN
+                store.pop(k, None)
+    return count <= limit
+
+
+def _resolve_gate(request: Request) -> bool:
+    """取链接的频率闸门。True = 放行。
+
+    身份规则跟 /api/search 完全一致：令牌 + 客户端摘要都齐才算"我们自己的端"。
+    只有摘要没有令牌不算——摘要谁都能编，没有令牌背书的分桶等于没分桶。
+    """
+    client_hash = (request.headers.get("x-client-hash") or "").strip()[:64]
+    via_app = bool(client_hash) and guard.app_token_ok(request.headers.get("x-app-token", ""))
+
+    if not via_app:
+        return _hit_allowed(_resolve_hits, client_ip(request), RESOLVE_PER_10MIN)
+
+    # 先单用户，再通道总量。反过来的话，一个正在刷的人能把总闸吃满，
+    # 被挤掉的却是后面那些正常点链接的人。
+    if not _hit_allowed(_resolve_user_hits, client_hash, RESOLVE_USER_PER_10MIN):
+        return False
+    return _hit_allowed(_resolve_app_hits, "app", RESOLVE_APP_PER_10MIN)
 
 
 @app.post("/api/resolve", include_in_schema=False)
@@ -1288,7 +1357,7 @@ async def api_resolve(
     """
     if not MIRROR_ON:
         return JSONResponse(status_code=404, content={"code": 404, "msg": "功能未启用"})
-    if not _resolve_allowed(client_ip(request)):
+    if not _resolve_gate(request):
         return JSONResponse(status_code=429, content={"code": 429, "msg": "打开太频繁，过几分钟再试"})
 
     info = resolver.read_token(payload.t)
