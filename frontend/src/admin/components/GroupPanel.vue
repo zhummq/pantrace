@@ -75,8 +75,10 @@ function removeGroup(i) {
   cfg.groups.splice(i, 1)
 }
 
+// 别按 parentElement 找输入框：DOM 一包一层就不灵了，用最近的容器兜住
 function pickFile(e) {
-  const input = e.currentTarget.parentElement.querySelector('input[type="file"]')
+  const box = e.currentTarget.closest('.grp-line') || e.currentTarget.parentElement
+  const input = box && box.querySelector('input[type="file"]')
   if (input) input.click()
 }
 
@@ -87,6 +89,7 @@ async function upload(i, event) {
   flash('上传中…')
   try {
     const d = await api.uploadGroupQr(file)
+    if (!d || !d.url) throw new Error('服务端没有返回图片地址')
     cfg.groups[i].qr = d.url
     flash('上传成功，记得点保存')
   } catch (e) {

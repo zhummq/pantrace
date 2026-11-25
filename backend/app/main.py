@@ -2495,7 +2495,10 @@ async def admin_group_upload(request: Request):
     name = f"qr-{int(time.time())}-{secrets.token_hex(4)}.{ext}"
     (UPLOADS_DIR / name).write_bytes(data)
     log.info("group qr uploaded: %s (%sKB)", name, len(data) // 1024)
-    return {"code": 0, "url": f"/uploads/{name}"}
+    url = f"/uploads/{name}"
+    # data 是看板统一约定（api.js 只认 json.data）；顶层的 url 留给旧版
+    # admin.legacy.html 的 b.url，两边都不能少，否则上传成功前端也读不到地址。
+    return {"code": 0, "url": url, "data": {"url": url}}
 
 
 class GroupConfigIn(BaseModel):
