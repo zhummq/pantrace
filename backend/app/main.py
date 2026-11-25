@@ -1489,6 +1489,19 @@ async def submit_feedback(payload: FeedbackIn, request: Request) -> JSONResponse
     )
 
 
+def _token_eq(got: str, want: str) -> bool:
+    """定时安全口令比较。
+
+    `hmac.compare_digest` 对 str 只接受纯 ASCII——请求头里塞进中文或 emoji 时
+    它会抛 `TypeError`，把"口令不对"变成 500（实测：`x-ingest-token` 填
+    `<你的token>` 直接把采集口打成 500）。统一编码成 bytes 再比，任意
+    UTF-8 输入都只返回 True/False，鉴权失败就该老老实实是 401。
+    """
+    if not got or not want:
+        return False
+    return hmac.compare_digest(got.encode("utf-8"), want.encode("utf-8"))
+
+
 def _admin_allowed(request: Request) -> bool:
     """看板鉴权：配了口令就核对口令；没配口令只允许本机直连。
 
@@ -1497,7 +1510,7 @@ def _admin_allowed(request: Request) -> bool:
     """
     if settings.admin_token:
         token = request.headers.get("x-admin-token") or request.query_params.get("token") or ""
-        return hmac.compare_digest(token, settings.admin_token)
+        return _token_eq(token, settings.admin_token)
     return client_ip(request) in ("127.0.0.1", "::1")
 
 
@@ -2379,7 +2392,7 @@ def _ingest_allowed(request: Request) -> bool:
     token = settings.qq_ingest_token or settings.admin_token
     if token:
         got = request.headers.get("x-ingest-token") or ""
-        return hmac.compare_digest(got, token)
+        return _token_eq(got, token)
     return client_ip(request) in ("127.0.0.1", "::1")
 
 
